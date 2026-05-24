@@ -28,3 +28,41 @@ def test_indexed_sandwich_multi_matches_torch_reference_if_cuda_available():
     expected = _segment_reference(pair.reshape(-1, 5), ptr.cpu(), weight).reshape(11, 2, 4)
 
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_indexed_sandwich_multi_block_gemm_matches_raw_finish_if_cuda_available():
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 block GEMM correctness requires CUDA")
+
+    from so2_cuda_ops import indexed_sandwich_multi_block_gemm, indexed_sandwich_multi_gemm
+
+    torch.manual_seed(20260525)
+    pair = torch.randn(13, 2, 6, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(1, 8, 6, device="cuda", dtype=torch.float32, requires_grad=True)
+    ptr_pair_rows = torch.tensor([0, 13], dtype=torch.long)
+    ptr_raw_rows = torch.tensor([0, 26], dtype=torch.long)
+
+    raw = indexed_sandwich_multi_gemm([pair], ptr_raw_rows, [weight])[0]
+    raw_r = raw[:, :, :4]
+    raw_i = raw[:, :, 4:]
+    expected = torch.cat(
+        (
+            raw_r.narrow(1, 0, 1) - raw_i.narrow(1, 1, 1),
+            raw_r.narrow(1, 1, 1) + raw_i.narrow(1, 0, 1),
+        ),
+        dim=1,
+    )
+    actual = indexed_sandwich_multi_block_gemm([pair], ptr_pair_rows, [weight])[0]
+
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+    grad = torch.randn_like(expected)
+    expected.backward(grad, retain_graph=True)
+    pair_grad_expected = pair.grad.detach().clone()
+    weight_grad_expected = weight.grad.detach().clone()
+    pair.grad = None
+    weight.grad = None
+    actual.backward(grad)
+
+    torch.testing.assert_close(pair.grad, pair_grad_expected, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(weight.grad, weight_grad_expected, atol=3e-5, rtol=3e-5)

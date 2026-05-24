@@ -23,6 +23,12 @@ def indexed_sandwich_multi_gemm(*args, **kwargs):
     return _indexed_sandwich_multi_gemm(*args, **kwargs)
 
 
+def indexed_sandwich_multi_block_gemm(*args, **kwargs):
+    from .grouped_gemm import indexed_sandwich_multi_block_gemm as _indexed_sandwich_multi_block_gemm
+
+    return _indexed_sandwich_multi_block_gemm(*args, **kwargs)
+
+
 def indexed_sandwich_multi(*args, **kwargs):
     return indexed_sandwich_multi_gemm(*args, **kwargs)
 
@@ -45,6 +51,7 @@ __all__ = [
     "grouped_gemm",
     "grouped_gemm_multi",
     "indexed_sandwich_multi",
+    "indexed_sandwich_multi_block_gemm",
     "indexed_sandwich_multi_gemm",
     "is_available",
     "materialized_scheduler",
