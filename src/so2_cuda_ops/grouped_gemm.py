@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 
 def grouped_gemm(
@@ -89,16 +90,36 @@ def indexed_sandwich_multi_block_gemm(
     """SO2 m>0 middle GEMM using a larger real/imag block matrix."""
     ptr_list = [ptrs] * len(pair_inputs) if isinstance(ptrs, torch.Tensor) else list(ptrs)
     block_weights = so2_block_complex_weights(weights)
+    if len(ptr_list) != len(pair_inputs) or len(block_weights) != len(pair_inputs):
+        raise RuntimeError("SO2 block-complex inputs, ptrs, and weights must have the same length")
     flat_inputs = []
-    for pair in pair_inputs:
+    full_single_group = permute_idx is None and unpermute_idx is None
+    for pair, ptr, weight in zip(pair_inputs, ptr_list, block_weights):
         if pair.dim() != 3 or pair.size(1) != 2:
             raise RuntimeError("SO2 block-complex inputs must be [N, 2, Cin]")
         flat = pair.reshape(pair.shape[0], 2 * pair.shape[2])
+        if (
+            full_single_group
+            and weight.size(0) == 1
+            and not ptr.is_cuda
+            and ptr.numel() == 2
+            and int(ptr[0].item()) == 0
+            and int(ptr[1].item()) == int(pair.shape[0])
+        ):
+            pass
+        else:
+            full_single_group = False
         if permute_idx is not None:
             flat = flat.index_select(0, permute_idx)
         flat_inputs.append(flat.contiguous())
 
-    flat_outputs = grouped_gemm_multi(flat_inputs, ptr_list, block_weights, fast_tf32=fast_tf32)
+    if full_single_group:
+        flat_outputs = [
+            F.linear(flat, weight.squeeze(0))
+            for flat, weight in zip(flat_inputs, block_weights)
+        ]
+    else:
+        flat_outputs = grouped_gemm_multi(flat_inputs, ptr_list, block_weights, fast_tf32=fast_tf32)
     outputs = []
     for flat_out, pair in zip(flat_outputs, pair_inputs):
         if unpermute_idx is not None:
@@ -106,5 +127,5 @@ def indexed_sandwich_multi_block_gemm(
         if flat_out.size(1) % 2 != 0:
             raise RuntimeError("SO2 block-complex output feature count must be even")
         cout = flat_out.size(1) // 2
-        outputs.append(torch.stack((flat_out[:, :cout], flat_out[:, cout:]), dim=1).contiguous())
+        outputs.append(flat_out.reshape(flat_out.shape[0], 2, cout).contiguous())
     return outputs
