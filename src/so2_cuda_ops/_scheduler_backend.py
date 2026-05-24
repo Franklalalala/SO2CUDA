@@ -14,7 +14,7 @@ The backend deliberately keeps strict safety gates:
 
 The default forward mainloop is warp-collective: a warp owns one row of a
 route/m/output tile, lanes split the K dimension, and lane 0 runs the custom
-SO2 epilogue. ``DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=cute_tiled`` switches to a
+SO2 epilogue. ``SO2_CUDA_SCHEDULER_MAINLOOP=cute_tiled`` switches to a
 CuTe-backed shared-memory tiled prototype: the tile mainloop reads raw
 ``x + compact Wigner + SO2 maps`` through a custom A-loader and keeps the SO2
 output epilogue in-kernel. ``scalar`` keeps the older thread-per-output
@@ -47,9 +47,14 @@ def _flag(name: str, default: str = "0") -> bool:
     return truthy_env(name, default)
 
 
+def _env(name: str, default: str) -> str:
+    sync_legacy_env_aliases()
+    return os.environ.get(name, default)
+
+
 def _int_env(name: str, default: int) -> int:
     try:
-        return int(os.environ.get(name, str(default)))
+        return int(_env(name, str(default)))
     except ValueError:
         return int(default)
 
@@ -121,7 +126,7 @@ def _select_cutlass_native_tile(
     in_ptr: torch.Tensor,
     out_ptr: torch.Tensor,
 ) -> tuple[int, int]:
-    spec = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_TILE", "auto")
+    spec = _env("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_TILE", "auto")
     if spec == "auto":
         block_m, block_n = 64, 32
     else:
@@ -145,7 +150,7 @@ def _select_cutlass_native_tile(
 
 
 def _mainloop_kind(name: Optional[str] = None) -> int:
-    mode = name or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    mode = name or _env("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
     if mode in ("scalar", "thread", "thread_scalar"):
         return 0
     if mode in ("warp", "warp_collective", "collective"):
@@ -176,7 +181,8 @@ def _load_extension():
     if _flag("DPTB_SO2_MOE_PERSISTENT_P1_LINEINFO"):
         cuda_flags.append("-lineinfo")
     cutlass_root = (
-        os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT")
+        os.environ.get("SO2_CUDA_CUTLASS_ROOT")
+        or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT")
         or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
         or os.environ.get("DPTB_CUTLASS_ROOT")
     )
@@ -697,9 +703,9 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
                 raise RuntimeError("empty graph_index sentinel is only valid for single-route SO2 scheduler backward")
             graph_index = torch.zeros((x.shape[0],), dtype=torch.long, device=x.device)
 
-        backward_mode = os.environ.get(
+        backward_mode = _env(
             "DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE",
-            os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented"),
+            _env("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented"),
         )
         grad_x = torch.zeros_like(x)
         grad_weight_flat = torch.zeros_like(weight_flat)
@@ -871,7 +877,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
         if include_m0_override is not None
         else _flag("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", "1")
     )
-    mainloop_name = mainloop_override or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    mainloop_name = mainloop_override or _env("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
     mainloop_kind = _mainloop_kind(mainloop_name)
     if (
         int(mainloop_kind) == 3
@@ -886,7 +892,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
         )
         return None
     if int(mainloop_kind) == 3 and include_m0:
-        m0_policy = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY", "fallback")
+        m0_policy = _env("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY", "fallback")
         if m0_policy == "warp_all":
             _warn_once(
                 "cutlass_native_m0_warp_all",

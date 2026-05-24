@@ -23,6 +23,11 @@ def _flag(name: str, default: str = "0") -> bool:
     return truthy_env(name, default)
 
 
+def _env(name: str, default: str) -> str:
+    sync_legacy_env_aliases()
+    return os.environ.get(name, default)
+
+
 def _warn_once(key: str, message: str) -> None:
     if key in _WARNED:
         return
@@ -42,7 +47,11 @@ def _load_extension():
     include_paths = []
     if _flag("DPTB_SO2_MOE_FUSED_P0_LINEINFO"):
         cuda_flags.append("-lineinfo")
-    cutlass_root = os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
+    cutlass_root = (
+        os.environ.get("SO2_CUDA_CUTLASS_ROOT")
+        or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
+        or os.environ.get("DPTB_CUTLASS_ROOT")
+    )
     if cutlass_root:
         cutlass_root_path = Path(cutlass_root)
         include_paths.extend([
@@ -1382,7 +1391,7 @@ class _FusedM0Function(torch.autograd.Function):
             wigner_mode,
             wigner_stride,
         ) = ctx.meta
-        backward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
+        backward_mode = _env("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
         grad_x, grad_mixed_weight, grad_mixed_bias, grad_radial = _segmented_m0_backward(
             grad_out.contiguous(),
             x,
@@ -1897,7 +1906,7 @@ class _FusedPairFunction(torch.autograd.Function):
         wigner_stride: int,
     ):
         ext = _load_extension()
-        forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+        forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
         forward_fn = ext.fused_pair_forward_fp32
         tiled_forward_fns = {
             "cutlass_tiled2": "fused_pair_forward_tiled2_fp32",
@@ -1998,7 +2007,7 @@ class _FusedPairFunction(torch.autograd.Function):
             wigner_mode,
             wigner_stride,
         ) = ctx.meta
-        backward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
+        backward_mode = _env("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
         if backward_mode == "atomic":
             grad_x, grad_mixed_weight, grad_radial = _load_extension().fused_pair_backward_fp32(
                 grad_out.contiguous(),
@@ -2241,7 +2250,7 @@ def _fused_pairs_indexed_sandwich_multi(
             f"MOLE graph_index has {graph_index.numel()} rows, but fused multi-m input has {x.shape[0]} rows."
         )
 
-    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
     use_native_multi = forward_mode in ("indexed_sandwich_multi_grouped", "cublas_multi_sandwich_grouped")
     use_grouped_pack = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_PACK", "0")
     use_grouped_epilogue = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE", "0")
@@ -2418,7 +2427,7 @@ def _fused_pairs_indexed_sandwich_multi(
             cout_prefix.append(cout_prefix[-1] + int(cout))
         cout_prefix_t = torch.tensor(cout_prefix, dtype=torch.long, device=x.device).contiguous()
         m_values_t = torch.tensor(m_values_host, dtype=torch.long, device=x.device).contiguous()
-        epilogue_schedule = os.environ.get("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE", "output_major")
+        epilogue_schedule = _env("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE", "output_major")
         if epilogue_schedule == "output_major":
             entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
                 module,
@@ -2533,7 +2542,7 @@ def _fused_pair_contribution(
         _warn_once("pair_bias_fallback", "streamed_m_major_fused_p0 expects bias-free m>0 MoE linears; falling back.")
         return None
 
-    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
     if forward_mode in ("indexed_sandwich", "cueq_sandwich", "cueq_compatible"):
         return _fused_pair_indexed_sandwich(
             module,
@@ -2717,7 +2726,7 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         return None
     wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
-    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
     if forward_mode in (
         "indexed_sandwich_multi_direct_warp",
         "route_m_direct_warp",

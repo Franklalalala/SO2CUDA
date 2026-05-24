@@ -84,7 +84,7 @@ def grouped_gemm(x: torch.Tensor, ptr: torch.Tensor, weight: torch.Tensor, *, fa
         ptr: CPU or CUDA int64 offsets with shape ``[num_groups + 1]``.
         weight: CUDA fp32 tensor with shape ``[num_groups, out_features, in_features]``.
         fast_tf32: Optional override for Tensor Core TF32 math. Defaults to the
-            ``DPTB_CUBLAS_GROUPED_FAST_TF32`` environment flag.
+            ``SO2_CUDA_FAST_TF32`` environment flag.
     """
     if fast_tf32 is None:
         fast_tf32 = _fast_tf32_enabled()

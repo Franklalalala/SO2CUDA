@@ -5,25 +5,28 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
+
+from so2_cuda_ops._extension_loader import load_cuda_extension, truthy_env
+from so2_cuda_ops.config import sync_legacy_env_aliases
 
 _EXT = None
-_FALSE = {"", "0", "false", "False", "FALSE", "off", "OFF", "no", "No"}
 
 
 def _flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default) not in _FALSE
+    sync_legacy_env_aliases()
+    return truthy_env(name, default)
 
 
 def _cutlass_root() -> Path:
+    sync_legacy_env_aliases()
     root = (
-        os.environ.get("DPTB_CUTLASS_ROOT")
+        os.environ.get("SO2_CUDA_CUTLASS_ROOT")
+        or os.environ.get("DPTB_CUTLASS_ROOT")
         or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
     )
     if not root:
         raise RuntimeError(
-            "CUTLASS grouped GEMM backend requires DPTB_CUTLASS_ROOT or "
-            "DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT."
+            "CUTLASS grouped GEMM backend requires SO2_CUDA_CUTLASS_ROOT."
         )
     root_path = Path(root)
     if not (root_path / "include" / "cutlass").exists():
@@ -36,32 +39,26 @@ def _load_extension():
     if _EXT is not None:
         return _EXT
 
+    sync_legacy_env_aliases()
     here = Path(__file__).resolve().parent
     root = _cutlass_root()
-    build_dir = Path(
-        os.environ.get(
-            "DPTB_CUTLASS_GROUPED_BUILD_DIR",
-            Path.home() / ".cache" / "dptb_cutlass_grouped_gemm",
-        )
-    )
-    build_dir.mkdir(parents=True, exist_ok=True)
 
     cuda_flags = ["-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda"]
     if _flag("DPTB_CUTLASS_GROUPED_LINEINFO"):
         cuda_flags.append("-lineinfo")
 
-    _EXT = load(
-        name="dptb_cutlass_grouped_gemm",
-        sources=[str(here / "csrc" / "cutlass_grouped_gemm.cu")],
+    _EXT = load_cuda_extension(
+        name="so2_cuda_ops_cutlass_grouped_gemm",
+        source_files=[here / "csrc" / "cutlass_grouped_gemm.cu"],
+        build_dir_env="SO2_CUDA_CUTLASS_GROUPED_BUILD_DIR",
+        default_build_dir=Path.home() / ".cache" / "so2_cuda_ops" / "cutlass_grouped",
         extra_cflags=["-O3"],
         extra_cuda_cflags=cuda_flags,
         extra_include_paths=[
             str(root / "include"),
             str(root / "tools" / "util" / "include"),
         ],
-        build_directory=str(build_dir),
-        with_cuda=True,
-        verbose=_flag("DPTB_CUTLASS_GROUPED_VERBOSE"),
+        verbose_env="SO2_CUDA_CUTLASS_GROUPED_VERBOSE",
     )
     return _EXT
 

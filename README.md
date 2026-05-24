@@ -26,6 +26,7 @@ The CUDA extension is JIT-built on first use with `torch.utils.cpp_extension`.
 - PyTorch with CUDA support
 - NVIDIA CUDA toolkit with `nvcc`
 - cuBLAS development libraries
+- Ninja, installed automatically by this package for JIT extension builds
 - Optional CUTLASS checkout for experimental CUTLASS/CuTe kernels
 
 Set `CUDA_HOME` or `CUDA_PATH` if PyTorch cannot find the toolkit.
@@ -81,6 +82,8 @@ DeePTB keeps the old `DPTB_SO2_*` configuration surface for compatibility, while
 - `SO2_CUDA_PACK_SCATTER_BUILD_DIR`: pack/scatter JIT build directory
 - `SO2_CUDA_SCHEDULER_BUILD_DIR`: scheduler JIT build directory
 - `SO2_CUDA_CUTLASS_ROOT`: optional CUTLASS checkout root
+- `SO2_CUDA_SCHEDULER_MAINLOOP`: scheduler mainloop, such as `warp_collective` or `cutlass_native`
+- `SO2_CUDA_LINEINFO`: add CUDA line info to JIT builds
 
 ## Tests And Smoke Benchmarks
 

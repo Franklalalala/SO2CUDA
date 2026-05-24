@@ -61,17 +61,63 @@ def set_backend_config(
 
 
 def sync_legacy_env_aliases() -> None:
-    """Bridge new public env names to historical backend knobs when unset."""
+    """Bridge public SO2CUDA env names to historical DeePTB aliases.
+
+    New code and documentation should use ``SO2_CUDA_*``. The legacy names are
+    populated only so migrated DeePTB call paths can keep working while their
+    internal wrappers are thin adapters.
+    """
 
     aliases = {
-        "SO2_CUDA_FAST_TF32": "DPTB_CUBLAS_GROUPED_FAST_TF32",
-        "SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR": "DPTB_CUBLAS_GROUPED_BUILD_DIR",
-        "SO2_CUDA_PACK_SCATTER_BUILD_DIR": "DPTB_SO2_MOE_FUSED_P0_BUILD_DIR",
-        "SO2_CUDA_PACK_SCATTER_VERBOSE": "DPTB_SO2_MOE_FUSED_P0_VERBOSE",
-        "SO2_CUDA_SCHEDULER_BUILD_DIR": "DPTB_SO2_MOE_PERSISTENT_P1_BUILD_DIR",
-        "SO2_CUDA_SCHEDULER_VERBOSE": "DPTB_SO2_MOE_PERSISTENT_P1_VERBOSE",
-        "SO2_CUDA_CUTLASS_ROOT": "DPTB_CUTLASS_ROOT",
+        "SO2_CUDA_FAST_TF32": ("DPTB_CUBLAS_GROUPED_FAST_TF32",),
+        "SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR": ("DPTB_CUBLAS_GROUPED_BUILD_DIR",),
+        "SO2_CUDA_CUBLAS_GROUPED_VERBOSE": ("DPTB_CUBLAS_GROUPED_VERBOSE",),
+        "SO2_CUDA_CUTLASS_GROUPED_BUILD_DIR": ("DPTB_CUTLASS_GROUPED_BUILD_DIR",),
+        "SO2_CUDA_CUTLASS_GROUPED_VERBOSE": ("DPTB_CUTLASS_GROUPED_VERBOSE",),
+        "SO2_CUDA_CUTLASS_GEMM_SMOKE_BUILD_DIR": ("DPTB_CUTLASS_SO2_GEMM_SMOKE_BUILD_DIR",),
+        "SO2_CUDA_CUTLASS_GEMM_SMOKE_VERBOSE": ("DPTB_CUTLASS_SO2_GEMM_SMOKE_VERBOSE",),
+        "SO2_CUDA_PACK_SCATTER_BUILD_DIR": ("DPTB_SO2_MOE_FUSED_P0_BUILD_DIR",),
+        "SO2_CUDA_PACK_SCATTER_VERBOSE": ("DPTB_SO2_MOE_FUSED_P0_VERBOSE",),
+        "SO2_CUDA_SCHEDULER_BUILD_DIR": ("DPTB_SO2_MOE_PERSISTENT_P1_BUILD_DIR",),
+        "SO2_CUDA_SCHEDULER_VERBOSE": ("DPTB_SO2_MOE_PERSISTENT_P1_VERBOSE",),
+        "SO2_CUDA_CUTLASS_ROOT": (
+            "DPTB_CUTLASS_ROOT",
+            "DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT",
+            "DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT",
+        ),
+        "SO2_CUDA_LINEINFO": (
+            "DPTB_CUTLASS_GROUPED_LINEINFO",
+            "DPTB_CUTLASS_SO2_GEMM_SMOKE_LINEINFO",
+            "DPTB_SO2_MOE_FUSED_P0_LINEINFO",
+            "DPTB_SO2_MOE_PERSISTENT_P1_LINEINFO",
+        ),
+        "SO2_CUDA_FORWARD_MODE": ("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE",),
+        "SO2_CUDA_BACKWARD_MODE": (
+            "DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE",
+            "DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE",
+        ),
+        "SO2_CUDA_STRICT_FORWARD_MODE": ("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE",),
+        "SO2_CUDA_ASSUME_SORTED": (
+            "DPTB_SO2_MOE_FUSED_P0_ASSUME_SORTED",
+            "DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED",
+        ),
+        "SO2_CUDA_LOG_ONCE": (
+            "DPTB_SO2_MOE_FUSED_P0_LOG_ONCE",
+            "DPTB_SO2_MOE_PERSISTENT_P1_LOG_ONCE",
+        ),
+        "SO2_CUDA_LOG_SCHEDULE": ("DPTB_SO2_MOE_FUSED_P0_LOG_SCHEDULE",),
+        "SO2_CUDA_SCHEDULER_MAINLOOP": ("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP",),
+        "SO2_CUDA_SCHEDULER_BLOCK_M": ("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M",),
+        "SO2_CUDA_SCHEDULER_BLOCK_N": ("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N",),
+        "SO2_CUDA_SCHEDULER_ACTIVE_BLOCKS": ("DPTB_SO2_MOE_PERSISTENT_P1_ACTIVE_BLOCKS",),
+        "SO2_CUDA_SCHEDULER_INCLUDE_M0": ("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0",),
+        "SO2_CUDA_SCHEDULER_NOSYNC_LAYOUT": ("DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT",),
+        "SO2_CUDA_SCHEDULER_VALIDATE_ROUTE_IDS": ("DPTB_SO2_MOE_PERSISTENT_P1_VALIDATE_ROUTE_IDS",),
+        "SO2_CUDA_SCHEDULER_CUTLASS_TILE": ("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_TILE",),
     }
-    for public, legacy in aliases.items():
-        if public in os.environ and legacy not in os.environ:
-            os.environ[legacy] = os.environ[public]
+    for public, legacy_names in aliases.items():
+        if public not in os.environ:
+            continue
+        for legacy in legacy_names:
+            if legacy not in os.environ:
+                os.environ[legacy] = os.environ[public]

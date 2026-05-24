@@ -11,3 +11,5 @@ The public API is intentionally small:
 - `grouped_gemm_multi(...)`
 
 Direct callers should prefer `SO2_CUDA_*` environment variables. DeePTB's adapter keeps `DPTB_SO2_*` compatibility.
+
+Install with `pip install -e .` or `pip install git+https://github.com/Franklalalala/SO2CUDA.git` so the JIT build dependency `ninja` is present before the first CUDA extension load.
