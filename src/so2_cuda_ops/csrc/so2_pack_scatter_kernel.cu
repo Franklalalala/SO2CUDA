@@ -2513,10 +2513,9 @@ torch::Tensor scatter_raw_pairs_multi_output_major_forward_fp32_cuda(
   std::vector<int64_t> raw_ptr_host;
   raw_ptr_host.reserve(n_m);
   for (int64_t i = 0; i < n_m; ++i) {
-    const int64_t cout = cout_prefix[i + 1].item<int64_t>() - cout_prefix[i].item<int64_t>();
     TORCH_CHECK(raws[i].is_cuda() && raws[i].is_contiguous(), "raw tensors must be contiguous CUDA");
     TORCH_CHECK(raws[i].scalar_type() == torch::kFloat32, "raw tensors must be fp32");
-    TORCH_CHECK(raws[i].dim() == 3 && raws[i].size(0) == n_edges && raws[i].size(1) == 2 && raws[i].size(2) == 2 * cout,
+    TORCH_CHECK(raws[i].dim() == 3 && raws[i].size(0) == n_edges && raws[i].size(1) == 2 && raws[i].size(2) % 2 == 0,
                 "raw tensor shape must be [N, 2, 2*Cout]");
     raw_ptr_host.push_back(reinterpret_cast<int64_t>(raws[i].data_ptr<float>()));
   }
@@ -2580,10 +2579,9 @@ torch::Tensor scatter_pairs_multi_output_major_forward_fp32_cuda(
   std::vector<int64_t> pair_ptr_host;
   pair_ptr_host.reserve(n_m);
   for (int64_t i = 0; i < n_m; ++i) {
-    const int64_t cout = cout_prefix[i + 1].item<int64_t>() - cout_prefix[i].item<int64_t>();
     TORCH_CHECK(pairs[i].is_cuda() && pairs[i].is_contiguous(), "pair tensors must be contiguous CUDA");
     TORCH_CHECK(pairs[i].scalar_type() == torch::kFloat32, "pair tensors must be fp32");
-    TORCH_CHECK(pairs[i].dim() == 3 && pairs[i].size(0) == n_edges && pairs[i].size(1) == 2 && pairs[i].size(2) == cout,
+    TORCH_CHECK(pairs[i].dim() == 3 && pairs[i].size(0) == n_edges && pairs[i].size(1) == 2,
                 "pair tensor shape must be [N, 2, Cout]");
     pair_ptr_host.push_back(reinterpret_cast<int64_t>(pairs[i].data_ptr<float>()));
   }
@@ -2679,7 +2677,6 @@ std::vector<torch::Tensor> raw_pairs_multi_output_grad_fp32_cuda(
   TORCH_CHECK(n_m > 0, "out_bases must be non-empty");
   const int64_t n_edges = grad_out.size(0);
   const int64_t out_dim = grad_out.size(1);
-  const int64_t total_cout = cout_prefix[n_m].item<int64_t>();
   const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
 
   std::vector<torch::Tensor> grad_raws;
@@ -2690,10 +2687,11 @@ std::vector<torch::Tensor> raw_pairs_multi_output_grad_fp32_cuda(
   grad_raw_ptr_host.reserve(n_m);
   out_base_ptr_host.reserve(n_m);
   out_l_ptr_host.reserve(n_m);
+  int64_t total_cout = 0;
   for (int64_t i = 0; i < n_m; ++i) {
-    const int64_t cout = cout_prefix[i + 1].item<int64_t>() - cout_prefix[i].item<int64_t>();
-    TORCH_CHECK(out_bases[i].numel() == cout && out_ls[i].numel() == cout,
-                "cout_prefix must match output maps");
+    const int64_t cout = out_bases[i].numel();
+    TORCH_CHECK(out_ls[i].numel() == cout, "output maps must be aligned");
+    total_cout += cout;
     auto grad_raw = torch::empty({n_edges, 2, 2 * cout}, grad_out.options());
     grad_raws.push_back(grad_raw);
     grad_raw_ptr_host.push_back(reinterpret_cast<int64_t>(grad_raw.data_ptr<float>()));
