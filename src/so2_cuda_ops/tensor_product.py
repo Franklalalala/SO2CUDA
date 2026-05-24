@@ -718,6 +718,34 @@ def _raw_pair_output_grad_cuda(
     )
 
 
+def _raw_pairs_multi_output_grad_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_bases: list[torch.Tensor],
+    out_ls: list[torch.Tensor],
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> list[torch.Tensor]:
+    return _load_extension().raw_pairs_multi_output_grad_fp32(
+        grad_out.contiguous(),
+        wigner,
+        [out_base.contiguous() for out_base in out_bases],
+        [out_l.contiguous() for out_l in out_ls],
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def _scatter_pair_grad_radial_input_cuda(
     grad_pair_eff: torch.Tensor,
     pair_no_radial: torch.Tensor,
@@ -1876,27 +1904,24 @@ class _ScatterRawPairsMultiOutputMajorFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         tensors = ctx.saved_tensors
-        wigner, offsets, compact_offsets, _cout_prefix, m_values = tensors[:5]
+        wigner, offsets, compact_offsets, cout_prefix, m_values = tensors[:5]
         n = ctx.raw_count
         out_bases = tensors[5:5 + n]
         out_ls = tensors[5 + n:5 + 2 * n]
         _out_dim, rotate_out, wigner_mode, wigner_stride = ctx.meta
-        grad_raws = []
-        for i in range(n):
-            grad_raws.append(
-                _raw_pair_output_grad_cuda(
-                    grad_out.contiguous(),
-                    wigner,
-                    out_bases[i],
-                    out_ls[i],
-                    offsets,
-                    compact_offsets,
-                    int(m_values[i].item()),
-                    bool(rotate_out),
-                    int(wigner_mode),
-                    int(wigner_stride),
-                )
-            )
+        grad_raws = _raw_pairs_multi_output_grad_cuda(
+            grad_out,
+            wigner,
+            list(out_bases),
+            list(out_ls),
+            offsets,
+            compact_offsets,
+            cout_prefix,
+            m_values,
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
         return (
             None,
             None,

@@ -66,3 +66,62 @@ def test_indexed_sandwich_multi_block_gemm_matches_raw_finish_if_cuda_available(
 
     torch.testing.assert_close(pair.grad, pair_grad_expected, atol=3e-5, rtol=3e-5)
     torch.testing.assert_close(weight.grad, weight_grad_expected, atol=3e-5, rtol=3e-5)
+
+
+def test_raw_pairs_multi_output_grad_matches_per_m_reference_if_cuda_available():
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 raw multi output grad correctness requires CUDA")
+
+    from so2_cuda_ops.tensor_product import (
+        _raw_pair_output_grad_cuda,
+        _raw_pairs_multi_output_grad_cuda,
+    )
+
+    torch.manual_seed(20260525)
+    grad_out = torch.randn(17, 9, device="cuda", dtype=torch.float32)
+    wigner = torch.empty(0, device="cuda", dtype=torch.float32)
+    offsets = torch.zeros(3, device="cuda", dtype=torch.long)
+    compact_offsets = torch.empty(0, device="cuda", dtype=torch.long)
+    out_bases = [
+        torch.tensor([0, 3], device="cuda", dtype=torch.long),
+        torch.tensor([3], device="cuda", dtype=torch.long),
+    ]
+    out_ls = [
+        torch.tensor([1, 2], device="cuda", dtype=torch.long),
+        torch.tensor([2], device="cuda", dtype=torch.long),
+    ]
+    cout_prefix = torch.tensor([0, 2, 3], device="cuda", dtype=torch.long)
+    m_values = torch.tensor([1, 2], device="cuda", dtype=torch.long)
+
+    expected = [
+        _raw_pair_output_grad_cuda(
+            grad_out,
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(m),
+            False,
+            0,
+            0,
+        )
+        for m, out_base, out_l in zip((1, 2), out_bases, out_ls)
+    ]
+    actual = _raw_pairs_multi_output_grad_cuda(
+        grad_out,
+        wigner,
+        out_bases,
+        out_ls,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        False,
+        0,
+        0,
+    )
+
+    assert len(actual) == len(expected)
+    for actual_grad, expected_grad in zip(actual, expected):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
