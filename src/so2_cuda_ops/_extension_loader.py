@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import site
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -59,6 +60,34 @@ def _ensure_cuda_toolkit() -> None:
         return
 
 
+def _ensure_ninja_on_path() -> None:
+    if shutil.which("ninja"):
+        return
+    try:
+        import ninja  # type: ignore[import-not-found]
+    except Exception:
+        return
+
+    candidate_dirs = []
+    bin_dir = getattr(ninja, "BIN_DIR", None)
+    if bin_dir:
+        candidate_dirs.append(Path(bin_dir))
+    module_dir = Path(getattr(ninja, "__file__", "")).resolve().parent
+    candidate_dirs.extend([
+        module_dir,
+        module_dir / "data" / "bin",
+    ])
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    for candidate in candidate_dirs:
+        exe = candidate / ("ninja.exe" if os.name == "nt" else "ninja")
+        if not exe.is_file():
+            continue
+        candidate_str = str(candidate)
+        if candidate_str not in path_parts:
+            os.environ["PATH"] = candidate_str + os.pathsep + os.environ.get("PATH", "")
+        return
+
+
 def _env_cuda_paths() -> tuple[list[str], list[str]]:
     include_paths = []
     library_paths = []
@@ -100,6 +129,7 @@ def load_cuda_extension(
     """Load one CUDA extension using the repo's standard build conventions."""
 
     _ensure_cuda_toolkit()
+    _ensure_ninja_on_path()
     build_dir = Path(os.environ.get(build_dir_env, str(default_build_dir)))
     build_dir.mkdir(parents=True, exist_ok=True)
     env_include_paths, env_library_paths = _env_cuda_paths()
