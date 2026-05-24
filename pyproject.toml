@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so2-cuda-ops"
+version = "0.1.0"
+description = "CUDA backend operators for SO2 tensor-product style workloads"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "DeePTB contributors" }]
+dependencies = [
+  "torch",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+cutlass = []
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+so2_cuda_ops = ["csrc/*"]
