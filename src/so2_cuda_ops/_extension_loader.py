@@ -40,16 +40,30 @@ def _candidate_toolkit_roots() -> list[Path]:
     return deduped
 
 
+def _is_usable_toolkit_root(root: Path) -> bool:
+    bin_dir = root / "bin"
+    if not (bin_dir / "nvcc").is_file():
+        return False
+    if (bin_dir / "cudafe++").is_file():
+        return True
+    # Some deployment shims expose an nvcc wrapper plus CUDA headers/libs, while
+    # forwarding compiler internals to the host toolkit.  Treat those as usable
+    # so their newer headers stay ahead of stale /usr/local/cuda installs.
+    return (root / "include" / "cuda_runtime.h").is_file()
+
+
 def _ensure_cuda_toolkit() -> None:
     current = Path(str(getattr(torch_cpp_extension, "CUDA_HOME", "") or os.environ.get("CUDA_HOME", "")))
-    current_bin = current / "bin"
-    if (current_bin / "nvcc").is_file() and (current_bin / "cudafe++").is_file():
+    if _is_usable_toolkit_root(current):
+        os.environ["CUDA_HOME"] = str(current)
+        os.environ["CUDA_PATH"] = str(current)
+        torch_cpp_extension.CUDA_HOME = str(current)
         return
 
     for root in _candidate_toolkit_roots():
-        bin_dir = root / "bin"
-        if not ((bin_dir / "nvcc").is_file() and (bin_dir / "cudafe++").is_file()):
+        if not _is_usable_toolkit_root(root):
             continue
+        bin_dir = root / "bin"
         os.environ["CUDA_HOME"] = str(root)
         os.environ["CUDA_PATH"] = str(root)
         path = os.environ.get("PATH", "")
