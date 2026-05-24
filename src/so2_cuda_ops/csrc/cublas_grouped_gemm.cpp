@@ -36,6 +36,81 @@ static void configure_math(cublasHandle_t handle, bool fast_tf32) {
       handle, fast_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
 }
 
+static void run_grouped_or_loop_gemm_fp32(
+    cublasHandle_t handle,
+    const std::vector<cublasOperation_t>& transa,
+    const std::vector<cublasOperation_t>& transb,
+    const std::vector<int>& m,
+    const std::vector<int>& n,
+    const std::vector<int>& k,
+    const std::vector<float>& alpha,
+    const std::vector<int64_t>& a_array,
+    const std::vector<int>& lda,
+    const std::vector<int64_t>& b_array,
+    const std::vector<int>& ldb,
+    const std::vector<float>& beta,
+    const std::vector<int64_t>& c_array,
+    const std::vector<int>& ldc,
+    const std::vector<int>& group_size,
+    cublasComputeType_t compute_type,
+    const torch::Tensor& like) {
+  const int active_groups = static_cast<int>(group_size.size());
+  if (active_groups == 0) {
+    return;
+  }
+
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12050
+  auto a_dev = copy_pointer_array_to_device(a_array, like);
+  auto b_dev = copy_pointer_array_to_device(b_array, like);
+  auto c_dev = copy_pointer_array_to_device(c_array, like);
+  check_cublas(cublasGemmGroupedBatchedEx(
+      handle,
+      transa.data(),
+      transb.data(),
+      m.data(),
+      n.data(),
+      k.data(),
+      static_cast<const void*>(alpha.data()),
+      reinterpret_cast<const void* const*>(a_dev.data_ptr<int64_t>()),
+      CUDA_R_32F,
+      lda.data(),
+      reinterpret_cast<const void* const*>(b_dev.data_ptr<int64_t>()),
+      CUDA_R_32F,
+      ldb.data(),
+      static_cast<const void*>(beta.data()),
+      reinterpret_cast<void* const*>(c_dev.data_ptr<int64_t>()),
+      CUDA_R_32F,
+      ldc.data(),
+      active_groups,
+      group_size.data(),
+      compute_type));
+#else
+  for (int group = 0; group < active_groups; ++group) {
+    TORCH_CHECK(group_size[group] == 1, "fallback grouped GEMM only supports singleton groups");
+    check_cublas(cublasGemmEx(
+        handle,
+        transa[group],
+        transb[group],
+        m[group],
+        n[group],
+        k[group],
+        static_cast<const void*>(&alpha[group]),
+        reinterpret_cast<const void*>(a_array[group]),
+        CUDA_R_32F,
+        lda[group],
+        reinterpret_cast<const void*>(b_array[group]),
+        CUDA_R_32F,
+        ldb[group],
+        static_cast<const void*>(&beta[group]),
+        reinterpret_cast<void*>(c_array[group]),
+        CUDA_R_32F,
+        ldc[group],
+        compute_type,
+        CUBLAS_GEMM_DEFAULT));
+  }
+#endif
+}
+
 torch::Tensor grouped_gemm_forward_fp32(
     torch::Tensor x,
     torch::Tensor ptr,
@@ -109,33 +184,12 @@ torch::Tensor grouped_gemm_forward_fp32(
     return y;
   }
 
-  auto a_dev = copy_pointer_array_to_device(a_array, x);
-  auto b_dev = copy_pointer_array_to_device(b_array, x);
-  auto c_dev = copy_pointer_array_to_device(c_array, x);
   const cublasComputeType_t compute_type =
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
-  check_cublas(cublasGemmGroupedBatchedEx(
-      handle,
-      transa.data(),
-      transb.data(),
-      m.data(),
-      n.data(),
-      k.data(),
-      static_cast<const void*>(alpha.data()),
-      reinterpret_cast<const void* const*>(a_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      lda.data(),
-      reinterpret_cast<const void* const*>(b_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldb.data(),
-      static_cast<const void*>(beta.data()),
-      reinterpret_cast<void* const*>(c_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldc.data(),
-      active_groups,
-      group_size.data(),
-      compute_type));
+  run_grouped_or_loop_gemm_fp32(
+      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      c_array, ldc, group_size, compute_type, x);
 
   return y;
 }
@@ -212,33 +266,12 @@ torch::Tensor grouped_gemm_backward_weight_fp32(
     return grad_weight;
   }
 
-  auto a_dev = copy_pointer_array_to_device(a_array, x);
-  auto b_dev = copy_pointer_array_to_device(b_array, x);
-  auto c_dev = copy_pointer_array_to_device(c_array, x);
   const cublasComputeType_t compute_type =
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
-  check_cublas(cublasGemmGroupedBatchedEx(
-      handle,
-      transa.data(),
-      transb.data(),
-      m.data(),
-      n.data(),
-      k.data(),
-      static_cast<const void*>(alpha.data()),
-      reinterpret_cast<const void* const*>(a_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      lda.data(),
-      reinterpret_cast<const void* const*>(b_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldb.data(),
-      static_cast<const void*>(beta.data()),
-      reinterpret_cast<void* const*>(c_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldc.data(),
-      active_groups,
-      group_size.data(),
-      compute_type));
+  run_grouped_or_loop_gemm_fp32(
+      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      c_array, ldc, group_size, compute_type, x);
 
   return grad_weight;
 }
@@ -350,33 +383,12 @@ std::vector<torch::Tensor> grouped_gemm_multi_forward_fp32(
     }
   }
 
-  auto a_dev = copy_pointer_array_to_device(a_array, xs[0]);
-  auto b_dev = copy_pointer_array_to_device(b_array, xs[0]);
-  auto c_dev = copy_pointer_array_to_device(c_array, xs[0]);
   const cublasComputeType_t compute_type =
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
-  check_cublas(cublasGemmGroupedBatchedEx(
-      handle,
-      transa.data(),
-      transb.data(),
-      m.data(),
-      n.data(),
-      k.data(),
-      static_cast<const void*>(alpha.data()),
-      reinterpret_cast<const void* const*>(a_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      lda.data(),
-      reinterpret_cast<const void* const*>(b_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldb.data(),
-      static_cast<const void*>(beta.data()),
-      reinterpret_cast<void* const*>(c_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldc.data(),
-      static_cast<int>(group_size.size()),
-      group_size.data(),
-      compute_type));
+  run_grouped_or_loop_gemm_fp32(
+      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      c_array, ldc, group_size, compute_type, xs[0]);
 
   return outputs;
 }
@@ -487,33 +499,12 @@ std::vector<torch::Tensor> grouped_gemm_multi_backward_weight_fp32(
     }
   }
 
-  auto a_dev = copy_pointer_array_to_device(a_array, xs[0]);
-  auto b_dev = copy_pointer_array_to_device(b_array, xs[0]);
-  auto c_dev = copy_pointer_array_to_device(c_array, xs[0]);
   const cublasComputeType_t compute_type =
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
-  check_cublas(cublasGemmGroupedBatchedEx(
-      handle,
-      transa.data(),
-      transb.data(),
-      m.data(),
-      n.data(),
-      k.data(),
-      static_cast<const void*>(alpha.data()),
-      reinterpret_cast<const void* const*>(a_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      lda.data(),
-      reinterpret_cast<const void* const*>(b_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldb.data(),
-      static_cast<const void*>(beta.data()),
-      reinterpret_cast<void* const*>(c_dev.data_ptr<int64_t>()),
-      CUDA_R_32F,
-      ldc.data(),
-      static_cast<int>(group_size.size()),
-      group_size.data(),
-      compute_type));
+  run_grouped_or_loop_gemm_fp32(
+      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      c_array, ldc, group_size, compute_type, xs[0]);
 
   return grad_weights;
 }
