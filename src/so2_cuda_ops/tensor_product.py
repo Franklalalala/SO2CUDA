@@ -805,6 +805,74 @@ def _raw_pairs_multi_output_grad_cuda(
     )
 
 
+def _m0_raw_pairs_multi_output_grad_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    m0_out_base: torch.Tensor,
+    m0_out_l: torch.Tensor,
+    out_bases: list[torch.Tensor],
+    out_ls: list[torch.Tensor],
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    outputs = _load_extension().m0_raw_pairs_multi_output_grad_fp32(
+        grad_out.contiguous(),
+        wigner,
+        m0_out_base.contiguous(),
+        m0_out_l.contiguous(),
+        [out_base.contiguous() for out_base in out_bases],
+        [out_l.contiguous() for out_l in out_ls],
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    return outputs[0], list(outputs[1:])
+
+
+def _m0_raw_pairs_multi_output_grad_flat_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    m0_out_base: torch.Tensor,
+    m0_out_l: torch.Tensor,
+    out_base_all: torch.Tensor,
+    out_l_all: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    cout_values: tuple[int, ...],
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    outputs = _load_extension().m0_raw_pairs_multi_output_grad_flat_fp32(
+        grad_out.contiguous(),
+        wigner,
+        m0_out_base.contiguous(),
+        m0_out_l.contiguous(),
+        out_base_all.contiguous(),
+        out_l_all.contiguous(),
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        [int(v) for v in cout_values],
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    return outputs[0], list(outputs[1:])
+
+
 def _scatter_pair_grad_radial_input_cuda(
     grad_pair_eff: torch.Tensor,
     pair_no_radial: torch.Tensor,
@@ -2309,27 +2377,14 @@ class _ScatterM0RawPairsMultiOutputMajorFunction(torch.autograd.Function):
         out_bases = tensors[7:7 + n]
         out_ls = tensors[7 + n:7 + 2 * n]
         rotate_out, wigner_mode, wigner_stride = ctx.meta
-        grad_y_m0 = record_cuda_span(
-            "so2.backward.m0_scatter",
+        grad_y_m0, grad_raws = record_cuda_span(
+            "so2.backward.fused_output_major_scatter",
             grad_out,
-            lambda: _output_m0_grad_cuda(
+            lambda: _m0_raw_pairs_multi_output_grad_cuda(
                 grad_out,
                 wigner,
                 m0_out_base,
                 m0_out_l,
-                offsets,
-                compact_offsets,
-                bool(rotate_out),
-                int(wigner_mode),
-                int(wigner_stride),
-            ),
-        )
-        grad_raws = record_cuda_span(
-            "so2.backward.output_major_scatter",
-            grad_out,
-            lambda: _raw_pairs_multi_output_grad_cuda(
-                grad_out,
-                wigner,
                 list(out_bases),
                 list(out_ls),
                 offsets,
@@ -2362,6 +2417,149 @@ class _ScatterM0RawPairsMultiOutputMajorFunction(torch.autograd.Function):
             None,
             *grad_raws,
             *([None] * (2 * n)),
+        )
+
+
+class _ScatterM0RawPairsMultiOutputMajorFlatFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        y_m0,
+        wigner,
+        m0_out_base,
+        m0_out_l,
+        m0_offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        out_base_all,
+        out_l_all,
+        entry_offsets,
+        entry_m,
+        entry_channel,
+        entry_d,
+        entry_l,
+        out_dim: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+        raw_count: int,
+        cout_values: tuple[int, ...],
+        *raws,
+    ):
+        raw_count = int(raw_count)
+        raw_tensors = list(raws[:raw_count])
+        out = record_cuda_span(
+            "so2.forward.m0_scatter",
+            y_m0,
+            lambda: _scatter_m0_forward_cuda(
+                y_m0,
+                wigner,
+                m0_out_base,
+                m0_out_l,
+                m0_offsets,
+                compact_offsets,
+                int(out_dim),
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        out = record_cuda_span(
+            "so2.forward.output_major_scatter",
+            wigner,
+            lambda: _scatter_raw_pairs_multi_output_major_add_forward_cuda(
+                raw_tensors,
+                wigner,
+                m0_offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values,
+                entry_offsets,
+                entry_m,
+                entry_channel,
+                entry_d,
+                entry_l,
+                out,
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        ctx.raw_count = raw_count
+        ctx.cout_values = tuple(int(v) for v in cout_values)
+        ctx.save_for_backward(
+            wigner,
+            m0_out_base,
+            m0_out_l,
+            m0_offsets,
+            compact_offsets,
+            cout_prefix,
+            m_values,
+            out_base_all,
+            out_l_all,
+        )
+        ctx.meta = (bool(rotate_out), int(wigner_mode), int(wigner_stride))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        tensors = ctx.saved_tensors
+        (
+            wigner,
+            m0_out_base,
+            m0_out_l,
+            offsets,
+            compact_offsets,
+            cout_prefix,
+            m_values,
+            out_base_all,
+            out_l_all,
+        ) = tensors
+        rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_y_m0, grad_raws = record_cuda_span(
+            "so2.backward.fused_output_major_scatter_flat",
+            grad_out,
+            lambda: _m0_raw_pairs_multi_output_grad_flat_cuda(
+                grad_out,
+                wigner,
+                m0_out_base,
+                m0_out_l,
+                out_base_all,
+                out_l_all,
+                offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values,
+                ctx.cout_values,
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        return (
+            grad_y_m0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *grad_raws,
         )
 
 
