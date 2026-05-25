@@ -68,6 +68,16 @@ torch::Tensor pack_pairs_multi_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor pack_pairs_multi_desc_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor desc,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
 torch::Tensor output_pair_grad_fp32_cuda(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -221,6 +231,15 @@ std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor block_complex_forward_fp32_cuda(
+    torch::Tensor pair,
+    torch::Tensor weight);
+
+std::vector<torch::Tensor> block_complex_backward_fp32_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor pair,
+    torch::Tensor weight);
+
 torch::Tensor fused_m0_forward_fp32_cuda(
     torch::Tensor x,
     torch::Tensor wigner,
@@ -249,6 +268,18 @@ torch::Tensor pack_m0_fp32_cuda(
     torch::Tensor offsets,
     torch::Tensor compact_offsets,
     bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor scatter_m0_forward_fp32_cuda(
+    torch::Tensor y_m0,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t out_dim,
+    bool rotate_out,
     int64_t wigner_mode,
     int64_t wigner_stride);
 
@@ -809,6 +840,33 @@ torch::Tensor pack_pairs_multi_fp32(
       cin_prefix, m_values, rotate_in, wigner_mode, wigner_stride);
 }
 
+torch::Tensor pack_pairs_multi_desc_fp32(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor desc,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(x, "x");
+  check_cuda_contiguous(desc, "desc");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be fp32");
+  TORCH_CHECK(desc.scalar_type() == torch::kInt64, "desc must be int64");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(x.dim() == 2, "x must be [N, in_dim]");
+  TORCH_CHECK(desc.dim() == 2 && desc.size(1) == 3, "desc must be [total_cin, 3]");
+  if (rotate_in) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return pack_pairs_multi_desc_fp32_cuda(
+      x, wigner, desc, offsets, compact_offsets, rotate_in, wigner_mode, wigner_stride);
+}
+
 torch::Tensor output_pair_grad_fp32(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -1297,6 +1355,41 @@ torch::Tensor pack_m0_fp32(
       rotate_in, wigner_mode, wigner_stride);
 }
 
+torch::Tensor scatter_m0_forward_fp32(
+    torch::Tensor y_m0,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(y_m0, "y_m0");
+  check_cuda_contiguous(out_base, "out_base");
+  check_cuda_contiguous(out_l, "out_l");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(y_m0.scalar_type() == torch::kFloat32, "y_m0 must be fp32");
+  TORCH_CHECK(out_base.scalar_type() == torch::kInt64, "out_base must be int64");
+  TORCH_CHECK(out_l.scalar_type() == torch::kInt64, "out_l must be int64");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(y_m0.dim() == 2, "y_m0 must be [N, Cout]");
+  TORCH_CHECK(out_base.dim() == 1 && out_l.dim() == 1 && out_base.numel() == out_l.numel(),
+              "output maps must be 1D and aligned");
+  TORCH_CHECK(y_m0.size(1) == out_base.numel(), "y_m0 Cout mismatch");
+  TORCH_CHECK(out_dim > 0, "out_dim must be positive");
+  if (rotate_out) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return scatter_m0_forward_fp32_cuda(
+      y_m0, wigner, out_base, out_l, offsets, compact_offsets,
+      out_dim, rotate_out, wigner_mode, wigner_stride);
+}
+
 torch::Tensor output_m0_grad_fp32(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -1406,6 +1499,41 @@ std::vector<torch::Tensor> scatter_m0_grad_radial_input_fp32(
       in_dim, rotate_in, wigner_mode, wigner_stride);
 }
 
+torch::Tensor block_complex_forward_fp32(
+    torch::Tensor pair,
+    torch::Tensor weight) {
+  check_cuda_contiguous(pair, "pair");
+  check_cuda_contiguous(weight, "weight");
+  TORCH_CHECK(pair.scalar_type() == torch::kFloat32, "pair must be fp32");
+  TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be fp32");
+  TORCH_CHECK(pair.dim() == 3 && pair.size(1) == 2, "pair must be [N, 2, Cin]");
+  TORCH_CHECK(weight.dim() == 3 && weight.size(0) == 1, "weight must be [1, 2*Cout, Cin]");
+  TORCH_CHECK(weight.size(1) % 2 == 0, "weight output dimension must be even");
+  TORCH_CHECK(weight.size(2) == pair.size(2), "weight Cin must match pair Cin");
+  return block_complex_forward_fp32_cuda(pair, weight);
+}
+
+std::vector<torch::Tensor> block_complex_backward_fp32(
+    torch::Tensor grad_out,
+    torch::Tensor pair,
+    torch::Tensor weight) {
+  check_cuda_contiguous(grad_out, "grad_out");
+  check_cuda_contiguous(pair, "pair");
+  check_cuda_contiguous(weight, "weight");
+  TORCH_CHECK(grad_out.scalar_type() == torch::kFloat32, "grad_out must be fp32");
+  TORCH_CHECK(pair.scalar_type() == torch::kFloat32, "pair must be fp32");
+  TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be fp32");
+  TORCH_CHECK(pair.dim() == 3 && pair.size(1) == 2, "pair must be [N, 2, Cin]");
+  TORCH_CHECK(weight.dim() == 3 && weight.size(0) == 1, "weight must be [1, 2*Cout, Cin]");
+  TORCH_CHECK(weight.size(1) % 2 == 0, "weight output dimension must be even");
+  const int64_t cout = weight.size(1) / 2;
+  TORCH_CHECK(weight.size(2) == pair.size(2), "weight Cin must match pair Cin");
+  TORCH_CHECK(grad_out.dim() == 3 && grad_out.size(0) == pair.size(0) &&
+              grad_out.size(1) == 2 && grad_out.size(2) == cout,
+              "grad_out must be [N, 2, Cout]");
+  return block_complex_backward_fp32_cuda(grad_out, pair, weight);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_pair_forward_fp32", &fused_pair_forward_fp32, "SO2 MoE fused P0 pair forward fp32");
   m.def("fused_m0_forward_fp32", &fused_m0_forward_fp32, "SO2 MoE fused P0 m0 forward fp32");
@@ -1416,6 +1544,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scatter_m0_grad_radial_input_fp32", &scatter_m0_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter m0 grad fp32");
   m.def("pack_pair_fp32", &pack_pair_fp32, "SO2 MoE fused P0 pack pair fp32");
   m.def("pack_pairs_multi_fp32", &pack_pairs_multi_fp32, "SO2 MoE fused P0 grouped pack pair fp32");
+  m.def("pack_pairs_multi_desc_fp32", &pack_pairs_multi_desc_fp32, "SO2 descriptor-based grouped pack pair fp32");
+  m.def("scatter_m0_forward_fp32", &scatter_m0_forward_fp32, "SO2 m0 output scatter forward fp32");
   m.def("output_pair_grad_fp32", &output_pair_grad_fp32, "SO2 MoE fused P0 output pair grad fp32");
   m.def("scatter_pair_forward_fp32", &scatter_pair_forward_fp32, "SO2 MoE fused P0 scatter pair forward fp32");
   m.def("scatter_raw_pair_forward_fp32", &scatter_raw_pair_forward_fp32, "SO2 MoE fused P0 scatter raw pair forward fp32");
@@ -1427,6 +1557,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scatter_pair_grad_fp32", &scatter_pair_grad_fp32, "SO2 MoE fused P0 scatter pair grad fp32");
   m.def("scatter_pairs_multi_grad_fp32", &scatter_pairs_multi_grad_fp32, "SO2 MoE fused P0 grouped scatter pair grad fp32");
   m.def("scatter_pair_grad_radial_input_fp32", &scatter_pair_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter pair grad fp32");
+  m.def("block_complex_forward_fp32", &block_complex_forward_fp32, "SO2 compact block-complex pair GEMM forward fp32");
+  m.def("block_complex_backward_fp32", &block_complex_backward_fp32, "SO2 compact block-complex pair GEMM backward fp32");
 #ifdef DPTB_SO2_MOE_FUSED_P0_CUTLASS
   m.def("cutlass_cute_probe", &cutlass_cute_probe_cuda, "Compile-only CuTe dot-mainloop probe");
   m.def("fused_pair_forward_tiled2_fp32", &fused_pair_forward_tiled2_fp32, "CuTe-indexed tiled SO2 MoE fused P0 pair forward fp32, tile2");

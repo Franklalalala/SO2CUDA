@@ -31,3 +31,28 @@ def test_backend_config_round_trip(monkeypatch):
     assert after.min_edges == 128
     assert after.materialized_min_edges == 256
     assert after.gemm_strategy == "scheduler"
+
+
+def test_profiler_records_host_spans_without_cuda(monkeypatch):
+    import so2_cuda_ops
+    from so2_cuda_ops.profiler import (
+        get_profile_summary,
+        profile_enabled,
+        record_host_span,
+        reset_profile_summary,
+    )
+
+    assert callable(so2_cuda_ops.get_profile_summary)
+    assert callable(so2_cuda_ops.reset_profile_summary)
+
+    monkeypatch.setenv("SO2_CUDA_PROFILE", "1")
+    monkeypatch.setenv("SO2_CUDA_PROFILE_PRINT_EVERY", "0")
+    reset_profile_summary()
+
+    result = record_host_span("metadata_plan", lambda: "ok")
+    summary = get_profile_summary(reset=True)
+
+    assert result == "ok"
+    assert profile_enabled()
+    assert summary["host_ms"]["metadata_plan"]["count"] == 1
+    assert summary["host_ms"]["metadata_plan"]["total"] >= 0.0

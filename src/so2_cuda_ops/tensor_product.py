@@ -10,6 +10,7 @@ import torch
 from so2_cuda_ops._compat import MOLEGlobals, SO2WignerBlocks, _mole_graph_index, is_wigner_blocks
 from so2_cuda_ops._extension_loader import load_cuda_extension, truthy_env
 from so2_cuda_ops.config import sync_legacy_env_aliases
+from so2_cuda_ops.profiler import record_cuda_span
 from so2_cuda_ops.segments import repeated_segment_layout
 from so2_cuda_ops.so2_sandwich_common import so2_pair_maps
 
@@ -275,6 +276,28 @@ def _pack_pairs_multi_cuda(
         compact_offsets,
         cin_prefix,
         m_values,
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _pack_pairs_multi_desc_cuda(
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    desc: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().pack_pairs_multi_desc_fp32(
+        x.contiguous(),
+        wigner,
+        desc,
+        offsets,
+        compact_offsets,
         bool(rotate_in),
         int(wigner_mode),
         int(wigner_stride),
@@ -798,6 +821,32 @@ def _pack_m0_cuda(
         offsets,
         compact_offsets,
         bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _scatter_m0_forward_cuda(
+    y_m0: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    out_dim: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_m0_forward_fp32(
+        y_m0.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(out_dim),
+        bool(rotate_out),
         int(wigner_mode),
         int(wigner_stride),
     )
@@ -1504,6 +1553,119 @@ class _FusedM0Function(torch.autograd.Function):
         )
 
 
+class _PackM0Function(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        rotate_in: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        packed = record_cuda_span(
+            "so2.forward.m0_pack",
+            x,
+            lambda: _pack_m0_cuda(
+                x,
+                wigner,
+                in_base,
+                in_l,
+                offsets,
+                compact_offsets,
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        ctx.save_for_backward(wigner, in_base, in_l, offsets, compact_offsets)
+        ctx.meta = (int(x.shape[1]), bool(rotate_in), int(wigner_mode), int(wigner_stride))
+        return packed
+
+    @staticmethod
+    def backward(ctx, grad_m0):
+        wigner, in_base, in_l, offsets, compact_offsets = ctx.saved_tensors
+        in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
+        grad_x = record_cuda_span(
+            "so2.backward.m0_pack",
+            grad_m0,
+            lambda: _scatter_m0_grad_cuda(
+                grad_m0.contiguous(),
+                wigner,
+                in_base,
+                in_l,
+                offsets,
+                compact_offsets,
+                int(in_dim),
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        return grad_x, None, None, None, None, None, None, None, None
+
+
+class _ScatterM0OutputFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        y_m0,
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        out_dim: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        out = record_cuda_span(
+            "so2.forward.m0_scatter",
+            y_m0,
+            lambda: _scatter_m0_forward_cuda(
+                y_m0,
+                wigner,
+                out_base,
+                out_l,
+                offsets,
+                compact_offsets,
+                int(out_dim),
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        ctx.save_for_backward(wigner, out_base, out_l, offsets, compact_offsets)
+        ctx.meta = (bool(rotate_out), int(wigner_mode), int(wigner_stride))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        wigner, out_base, out_l, offsets, compact_offsets = ctx.saved_tensors
+        rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_y = record_cuda_span(
+            "so2.backward.m0_scatter",
+            grad_out,
+            lambda: _output_m0_grad_cuda(
+                grad_out.contiguous(),
+                wigner,
+                out_base,
+                out_l,
+                offsets,
+                compact_offsets,
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        return grad_y, None, None, None, None, None, None, None, None, None
+
+
 class _PackPairFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1577,18 +1739,22 @@ class _PackPairsMultiFunction(torch.autograd.Function):
         wigner_mode: int,
         wigner_stride: int,
     ):
-        packed = _pack_pairs_multi_cuda(
+        packed = record_cuda_span(
+            "so2.forward.pack_all_m",
             x,
-            wigner,
-            in_bases,
-            in_ls,
-            offsets,
-            compact_offsets,
-            cin_prefix,
-            m_values,
-            bool(rotate_in),
-            int(wigner_mode),
-            int(wigner_stride),
+            lambda: _pack_pairs_multi_cuda(
+                x,
+                wigner,
+                in_bases,
+                in_ls,
+                offsets,
+                compact_offsets,
+                cin_prefix,
+                m_values,
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
         )
         use_multi_backward = _flag("DPTB_SO2_MOE_FUSED_P0_PACK_MULTI_BACKWARD", "1")
         if use_multi_backward:
@@ -1622,8 +1788,95 @@ class _PackPairsMultiFunction(torch.autograd.Function):
         in_ls = tensors[7 + n:7 + 2 * n]
         in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
         if ctx.use_multi_backward:
-            grad_x = _scatter_pairs_multi_grad_cuda(
+            grad_x = record_cuda_span(
+                "so2.backward.pack_all_m",
                 grad_packed,
+                lambda: _scatter_pairs_multi_grad_cuda(
+                    grad_packed,
+                    wigner,
+                    in_base_all,
+                    in_l_all,
+                    offsets,
+                    compact_offsets,
+                    cin_prefix,
+                    m_values,
+                    int(in_dim),
+                    bool(rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                ),
+            )
+            return grad_x, None, None, None, None, None, None, None, None, None, None
+        grad_x = None
+        for i in range(n):
+            start = int(cin_prefix[i].item())
+            end = int(cin_prefix[i + 1].item())
+            grad_pair = grad_packed[:, :, start:end].contiguous()
+            part = record_cuda_span(
+                "so2.backward.pack_all_m",
+                grad_pair,
+                lambda: _scatter_pair_grad_cuda(
+                    grad_pair,
+                    wigner,
+                    in_bases[i],
+                    in_ls[i],
+                    offsets,
+                    compact_offsets,
+                    int(in_dim),
+                    int(m_values[i].item()),
+                    bool(rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                ),
+            )
+            grad_x = part if grad_x is None else grad_x + part
+        return grad_x, None, None, None, None, None, None, None, None, None, None
+
+
+class _PackPairsMultiDescFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        wigner,
+        pack_desc,
+        in_base_all,
+        in_l_all,
+        offsets,
+        compact_offsets,
+        cin_prefix,
+        m_values,
+        rotate_in: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        packed = record_cuda_span(
+            "so2.forward.pack_all_m",
+            x,
+            lambda: _pack_pairs_multi_desc_cuda(
+                x,
+                wigner,
+                pack_desc,
+                offsets,
+                compact_offsets,
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
+        )
+        ctx.save_for_backward(wigner, offsets, compact_offsets, cin_prefix, m_values, in_base_all, in_l_all)
+        ctx.meta = (int(x.shape[1]), bool(rotate_in), int(wigner_mode), int(wigner_stride))
+        return packed
+
+    @staticmethod
+    def backward(ctx, grad_packed):
+        wigner, offsets, compact_offsets, cin_prefix, m_values, in_base_all, in_l_all = ctx.saved_tensors
+        in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
+        grad_x = record_cuda_span(
+            "so2.backward.pack_all_m",
+            grad_packed,
+            lambda: _scatter_pairs_multi_grad_cuda(
+                grad_packed.contiguous(),
                 wigner,
                 in_base_all,
                 in_l_all,
@@ -1635,28 +1888,9 @@ class _PackPairsMultiFunction(torch.autograd.Function):
                 bool(rotate_in),
                 int(wigner_mode),
                 int(wigner_stride),
-            )
-            return grad_x, None, None, None, None, None, None, None, None, None, None
-        grad_x = None
-        for i in range(n):
-            start = int(cin_prefix[i].item())
-            end = int(cin_prefix[i + 1].item())
-            grad_pair = grad_packed[:, :, start:end].contiguous()
-            part = _scatter_pair_grad_cuda(
-                grad_pair,
-                wigner,
-                in_bases[i],
-                in_ls[i],
-                offsets,
-                compact_offsets,
-                int(in_dim),
-                int(m_values[i].item()),
-                bool(rotate_in),
-                int(wigner_mode),
-                int(wigner_stride),
-            )
-            grad_x = part if grad_x is None else grad_x + part
-        return grad_x, None, None, None, None, None, None, None, None, None, None
+            ),
+        )
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None
 
 
 class _ScatterPairOutputFunction(torch.autograd.Function):
@@ -1879,22 +2113,26 @@ class _ScatterRawPairsMultiOutputMajorFunction(torch.autograd.Function):
         raws = list(raws_and_maps[:raw_count])
         out_bases = list(raws_and_maps[raw_count:2 * raw_count])
         out_ls = list(raws_and_maps[2 * raw_count:3 * raw_count])
-        out = _scatter_raw_pairs_multi_output_major_forward_cuda(
-            raws,
+        out = record_cuda_span(
+            "so2.forward.output_major_scatter",
             wigner,
-            offsets,
-            compact_offsets,
-            cout_prefix,
-            m_values,
-            entry_offsets,
-            entry_m,
-            entry_channel,
-            entry_d,
-            entry_l,
-            int(out_dim),
-            bool(rotate_out),
-            int(wigner_mode),
-            int(wigner_stride),
+            lambda: _scatter_raw_pairs_multi_output_major_forward_cuda(
+                raws,
+                wigner,
+                offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values,
+                entry_offsets,
+                entry_m,
+                entry_channel,
+                entry_d,
+                entry_l,
+                int(out_dim),
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
         )
         ctx.raw_count = raw_count
         ctx.save_for_backward(wigner, offsets, compact_offsets, cout_prefix, m_values, *out_bases, *out_ls)
@@ -1909,18 +2147,22 @@ class _ScatterRawPairsMultiOutputMajorFunction(torch.autograd.Function):
         out_bases = tensors[5:5 + n]
         out_ls = tensors[5 + n:5 + 2 * n]
         _out_dim, rotate_out, wigner_mode, wigner_stride = ctx.meta
-        grad_raws = _raw_pairs_multi_output_grad_cuda(
+        grad_raws = record_cuda_span(
+            "so2.backward.output_major_scatter",
             grad_out,
-            wigner,
-            list(out_bases),
-            list(out_ls),
-            offsets,
-            compact_offsets,
-            cout_prefix,
-            m_values,
-            bool(rotate_out),
-            int(wigner_mode),
-            int(wigner_stride),
+            lambda: _raw_pairs_multi_output_grad_cuda(
+                grad_out,
+                wigner,
+                list(out_bases),
+                list(out_ls),
+                offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values,
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
         )
         return (
             None,
@@ -1968,22 +2210,26 @@ class _ScatterPairsMultiOutputMajorFunction(torch.autograd.Function):
         pairs = list(pairs_and_maps[:pair_count])
         out_bases = list(pairs_and_maps[pair_count:2 * pair_count])
         out_ls = list(pairs_and_maps[2 * pair_count:3 * pair_count])
-        out = _scatter_pairs_multi_output_major_forward_cuda(
-            pairs,
+        out = record_cuda_span(
+            "so2.forward.output_major_scatter",
             wigner,
-            offsets,
-            compact_offsets,
-            cout_prefix,
-            m_values,
-            entry_offsets,
-            entry_m,
-            entry_channel,
-            entry_d,
-            entry_l,
-            int(out_dim),
-            bool(rotate_out),
-            int(wigner_mode),
-            int(wigner_stride),
+            lambda: _scatter_pairs_multi_output_major_forward_cuda(
+                pairs,
+                wigner,
+                offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values,
+                entry_offsets,
+                entry_m,
+                entry_channel,
+                entry_d,
+                entry_l,
+                int(out_dim),
+                bool(rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            ),
         )
         ctx.pair_count = pair_count
         ctx.save_for_backward(wigner, offsets, compact_offsets, cout_prefix, m_values, *out_bases, *out_ls)
@@ -2001,17 +2247,21 @@ class _ScatterPairsMultiOutputMajorFunction(torch.autograd.Function):
         grad_pairs = []
         for i in range(n):
             grad_pairs.append(
-                _output_pair_grad_cuda(
-                    grad_out.contiguous(),
-                    wigner,
-                    out_bases[i],
-                    out_ls[i],
-                    offsets,
-                    compact_offsets,
-                    int(m_values[i].item()),
-                    bool(rotate_out),
-                    int(wigner_mode),
-                    int(wigner_stride),
+                record_cuda_span(
+                    "so2.backward.output_major_scatter",
+                    grad_out,
+                    lambda: _output_pair_grad_cuda(
+                        grad_out.contiguous(),
+                        wigner,
+                        out_bases[i],
+                        out_ls[i],
+                        offsets,
+                        compact_offsets,
+                        int(m_values[i].item()),
+                        bool(rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    ),
                 )
             )
         return (

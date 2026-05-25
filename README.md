@@ -84,6 +84,9 @@ DeePTB keeps the old `DPTB_SO2_*` configuration surface for compatibility, while
 - `SO2_CUDA_CUTLASS_ROOT`: optional CUTLASS checkout root
 - `SO2_CUDA_SCHEDULER_MAINLOOP`: scheduler mainloop, such as `warp_collective` or `cutlass_native`
 - `SO2_CUDA_LINEINFO`: add CUDA line info to JIT builds
+- `SO2_CUDA_PROFILE`: enable lightweight CUDA-event profiling for SO2 pack/linear/scatter segments
+- `SO2_CUDA_PROFILE_PRINT_EVERY`: print a cumulative profile every N SO2 forward calls; `0` disables printing
+- `SO2_CUDA_PROFILE_DETAIL`: reserved for more verbose per-route/per-m labels
 
 ## Tests And Smoke Benchmarks
 
@@ -93,3 +96,9 @@ python -c "import so2_cuda_ops; print(so2_cuda_ops.is_available())"
 ```
 
 CUDA correctness tests skip automatically when CUDA is unavailable. A minimal benchmark is available in `examples/minimal_so2_tp.py`.
+
+For DeePTB module profiling, enable the profile in the benchmark wrapper:
+
+```bash
+python tools/bench_so2_non_moe_cublas.py --variants indexed_sandwich_cuda_multi:output_major:raw_cached --so2-profile
+```

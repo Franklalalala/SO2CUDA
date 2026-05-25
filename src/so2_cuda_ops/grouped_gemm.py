@@ -129,3 +129,45 @@ def indexed_sandwich_multi_block_gemm(
         cout = flat_out.size(1) // 2
         outputs.append(flat_out.reshape(flat_out.shape[0], 2, cout).contiguous())
     return outputs
+
+
+class _BlockComplexDirectFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, pair: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        from so2_cuda_ops.tensor_product import _load_extension
+
+        pair_c = pair.contiguous()
+        weight_c = weight.contiguous()
+        out = _load_extension().block_complex_forward_fp32(pair_c, weight_c)
+        ctx.save_for_backward(pair_c, weight_c)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        from so2_cuda_ops.tensor_product import _load_extension
+
+        pair, weight = ctx.saved_tensors
+        grad_pair, grad_weight = _load_extension().block_complex_backward_fp32(
+            grad_out.contiguous(),
+            pair,
+            weight,
+        )
+        return grad_pair, grad_weight
+
+
+def block_complex_direct(pair: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Direct SO2 block-complex pair GEMM without materializing W_block."""
+    return _BlockComplexDirectFunction.apply(pair, weight)
+
+
+def indexed_sandwich_multi_block_direct_gemm(
+    pair_inputs: list[torch.Tensor],
+    weights: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Apply compact W1/W2 block-complex GEMM for each m without W_block."""
+    if len(pair_inputs) != len(weights):
+        raise RuntimeError("SO2 direct block-complex inputs and weights must have the same length")
+    return [
+        block_complex_direct(pair, weight)
+        for pair, weight in zip(pair_inputs, weights)
+    ]
