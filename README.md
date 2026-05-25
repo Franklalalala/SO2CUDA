@@ -1,8 +1,6 @@
 # SO2 CUDA Ops
 
-`so2-cuda-ops` is a small CUDA backend package for SO2 tensor-product style workloads. It provides reusable grouped GEMM, indexed sandwich pack/scatter, and materialized scheduler helpers without depending on DeePTB package paths.
-
-It is not DeePTB. DeePTB remains the model/training package; this repository only owns backend operators and low-level scheduling helpers.
+`so2-cuda-ops` is a compact CUDA acceleration-ops package for SO2 tensor-product style workloads. It provides reusable grouped GEMM, indexed sandwich pack/scatter, and materialized scheduler helpers for backend acceleration.
 
 ## Install
 
