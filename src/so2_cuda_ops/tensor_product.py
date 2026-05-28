@@ -3050,15 +3050,15 @@ def _fused_pairs_indexed_sandwich_multi(
 
     for m in range(1, module.m_max + 1):
         fc = module.m_linear[m - 1].fc
-        if not hasattr(fc, "_mix_expert_parameters") or getattr(fc, "mole_linear_mode", None) != "cublas_grouped":
+        if not hasattr(fc, "_mix_expert_parameters"):
             if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
                 raise RuntimeError(
                     "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi "
-                    "currently requires m>0 MOLELinear blocks with mole_linear_mode='cublas_grouped'."
+                    "currently requires m>0 MOLELinear blocks that can mix expert parameters."
                 )
             _warn_once(
                 "indexed_sandwich_multi_backend_fallback",
-                "indexed_sandwich_multi currently requires m>0 cublas_grouped MOLELinear blocks; falling back.",
+                "indexed_sandwich_multi currently requires m>0 MOLELinear blocks that can mix expert parameters; falling back.",
             )
             return None
         if getattr(fc, "bias_experts", None) is not None:

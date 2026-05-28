@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+
+_INDEXED_MULTI_FLAT_BACKWARD_ENV = "DPTB_SO2_MOE_FUSED_P0_INDEXED_MULTI_FLAT_BACKWARD"
+
+
+def _flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "off", "no", "")
+
+
+def _resolve_fast_tf32(fast_tf32: Optional[bool]) -> bool:
+    if fast_tf32 is not None:
+        return bool(fast_tf32)
+    from so2_cuda_ops._cublas_grouped_gemm import _fast_tf32_enabled
+
+    return bool(_fast_tf32_enabled())
 
 
 def grouped_gemm(
@@ -30,6 +49,100 @@ def grouped_gemm_multi(
     return _grouped_gemm_multi(xs, ptrs, weights, fast_tf32=fast_tf32)
 
 
+class _IndexedSandwichMultiFlatBackwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        ptr: torch.Tensor,
+        permute_idx_or_empty: torch.Tensor,
+        unpermute_idx_or_empty: torch.Tensor,
+        raw_count: int,
+        fast_tf32: bool,
+        *pairs_and_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        raw_count = int(raw_count)
+        pair_inputs = list(pairs_and_weights[:raw_count])
+        weights = list(pairs_and_weights[raw_count:2 * raw_count])
+        if len(pair_inputs) != raw_count or len(weights) != raw_count:
+            raise RuntimeError("indexed_sandwich_multi flat backward received mismatched inputs")
+
+        sorted_inputs: list[torch.Tensor] = []
+        shapes: list[tuple[int, ...]] = []
+        has_permute = permute_idx_or_empty.numel() > 0
+        for pair in pair_inputs:
+            shapes.append(tuple(pair.shape))
+            flat = pair.reshape(-1, pair.shape[-1])
+            if has_permute:
+                flat = flat.index_select(0, permute_idx_or_empty)
+            sorted_inputs.append(flat.contiguous())
+
+        flat_outputs = grouped_gemm_multi(sorted_inputs, [ptr] * raw_count, weights, fast_tf32=fast_tf32)
+        outputs: list[torch.Tensor] = []
+        has_unpermute = unpermute_idx_or_empty.numel() > 0
+        for flat_out, shape in zip(flat_outputs, shapes):
+            if has_unpermute:
+                flat_out = flat_out.index_select(0, unpermute_idx_or_empty)
+            outputs.append(flat_out.reshape(*shape[:-1], flat_out.shape[-1]).contiguous())
+
+        ctx.raw_count = raw_count
+        ctx.fast_tf32 = bool(fast_tf32)
+        ctx.shapes = shapes
+        ctx.save_for_backward(
+            ptr,
+            permute_idx_or_empty,
+            unpermute_idx_or_empty,
+            *sorted_inputs,
+            *weights,
+        )
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: torch.Tensor):
+        from so2_cuda_ops._cublas_grouped_gemm import _load_extension as _load_cublas_grouped
+
+        raw_count = int(ctx.raw_count)
+        tensors = ctx.saved_tensors
+        ptr, permute_idx_or_empty, unpermute_idx_or_empty = tensors[:3]
+        sorted_inputs = tensors[3:3 + raw_count]
+        weights = tensors[3 + raw_count:3 + 2 * raw_count]
+        ext = _load_cublas_grouped()
+
+        has_permute = permute_idx_or_empty.numel() > 0
+        has_unpermute = unpermute_idx_or_empty.numel() > 0
+        sorted_grad_outputs: list[torch.Tensor] = []
+        for grad_out in grad_outputs:
+            grad_flat = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+            if has_permute:
+                grad_sorted = grad_flat.index_select(0, permute_idx_or_empty).contiguous()
+            else:
+                grad_sorted = grad_flat
+            sorted_grad_outputs.append(grad_sorted)
+
+        ptrs = [ptr] * raw_count
+        grad_x_sorted = ext.grouped_gemm_multi_forward_fp32(
+            sorted_grad_outputs,
+            ptrs,
+            [weight.transpose(1, 2).contiguous() for weight in weights],
+            ctx.fast_tf32,
+        )
+        grad_weights = ext.grouped_gemm_multi_backward_weight_fp32(
+            sorted_grad_outputs,
+            list(sorted_inputs),
+            ptrs,
+            ctx.fast_tf32,
+        )
+
+        grad_pairs: list[torch.Tensor] = []
+        for grad_x, shape in zip(grad_x_sorted, ctx.shapes):
+            if has_unpermute:
+                grad_x_flat = grad_x.index_select(0, unpermute_idx_or_empty)
+            else:
+                grad_x_flat = grad_x
+            grad_pairs.append(grad_x_flat.reshape(shape))
+
+        return (None, None, None, None, None, *grad_pairs, *grad_weights)
+
+
 def indexed_sandwich_multi_gemm(
     pair_inputs: list[torch.Tensor],
     ptrs: torch.Tensor | list[torch.Tensor],
@@ -40,6 +153,28 @@ def indexed_sandwich_multi_gemm(
     fast_tf32: Optional[bool] = None,
 ) -> list[torch.Tensor]:
     """Shared middle GEMM for indexed_sandwich_multi-style SO2 paths."""
+    if (
+        _flag(_INDEXED_MULTI_FLAT_BACKWARD_ENV, False)
+        and isinstance(ptrs, torch.Tensor)
+    ):
+        if len(pair_inputs) != len(weights):
+            raise RuntimeError("indexed_sandwich_multi inputs and weights must have the same length")
+        device = pair_inputs[0].device if pair_inputs else weights[0].device
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        permute_arg = permute_idx if permute_idx is not None else empty
+        unpermute_arg = unpermute_idx if unpermute_idx is not None else empty
+        return list(
+            _IndexedSandwichMultiFlatBackwardFunction.apply(
+                ptrs,
+                permute_arg,
+                unpermute_arg,
+                len(pair_inputs),
+                _resolve_fast_tf32(fast_tf32),
+                *pair_inputs,
+                *weights,
+            )
+        )
+
     ptr_list = [ptrs] * len(pair_inputs) if isinstance(ptrs, torch.Tensor) else list(ptrs)
     flat_inputs = []
     for pair in pair_inputs:
