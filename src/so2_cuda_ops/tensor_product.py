@@ -3012,6 +3012,22 @@ def _multi_output_entry_map(
     return cached
 
 
+def _radial_parts(module, weights):
+    """Per-m radial weights of a layer, cut with one split (None and an already split tuple pass through).
+
+    A weights[:, a:b] view per m allocates a full-width zero gradient for every m in backward; the backward of
+    one split concatenates the piece gradients once.  Same values and the same gradient."""
+    if weights is None or isinstance(weights, tuple):
+        return weights
+    bounds = [int(b) for b in module.m_in_index]
+    rest = int(weights.shape[-1]) - bounds[-1]
+    if bounds[0] != 0 or rest < 0:
+        return tuple(weights[:, a:b] for a, b in zip(bounds[:-1], bounds[1:]))
+    sizes = [b - a for a, b in zip(bounds[:-1], bounds[1:])]
+    parts = torch.split(weights, sizes + [rest] if rest else sizes, dim=-1)
+    return tuple(parts[: len(sizes)])
+
+
 def _fused_pairs_indexed_sandwich_multi(
     module,
     x: torch.Tensor,
@@ -3020,11 +3036,12 @@ def _fused_pairs_indexed_sandwich_multi(
     wigner_mode: int,
     wigner_stride: int,
     mole_globals: MOLEGlobals,
-    weights: Optional[torch.Tensor],
+    weights,
 ):
     if module.m_max < 1:
         return []
 
+    radial_parts = _radial_parts(module, weights)
     graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
     if graph_index.numel() != x.shape[0]:
         raise ValueError(
@@ -3080,7 +3097,7 @@ def _fused_pairs_indexed_sandwich_multi(
 
         radial = None
         if weights is not None:
-            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous()
+            radial = radial_parts[m].unsqueeze(1).contiguous()
             expected = cin if bool(module.front) else cout
             if radial.shape != (x.shape[0], 1, expected):
                 _warn_once(
@@ -3146,9 +3163,10 @@ def _fused_pairs_indexed_sandwich_multi(
             int(wigner_mode),
             int(wigner_stride),
         )
-        for i, (m, cin) in enumerate(zip(m_values_host, cin_values)):
-            pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
-            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous() if weights is not None else None
+        packed_parts = torch.split(packed_all, cin_values, dim=-1)
+        for i, m in enumerate(m_values_host):
+            pair = packed_parts[i]
+            radial = radial_parts[m].unsqueeze(1).contiguous() if weights is not None else None
             pair_inputs[i] = pair * radial if radial is not None and bool(module.front) else pair
     else:
         for i, m in enumerate(m_values_host):
@@ -3164,7 +3182,7 @@ def _fused_pairs_indexed_sandwich_multi(
                 int(wigner_mode),
                 int(wigner_stride),
             )
-            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous() if weights is not None else None
+            radial = radial_parts[m].unsqueeze(1).contiguous() if weights is not None else None
             pair_inputs[i] = pair * radial if radial is not None and bool(module.front) else pair
 
     permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, pair_inputs[0])
@@ -3542,9 +3560,10 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         )
 
     weights = module.radial_emb(latents) if module.radial_emb else None
+    radial_parts = _radial_parts(module, weights)
     out = torch.zeros((x.shape[0], module.irreps_out.dim), dtype=x.dtype, device=x.device)
 
-    radial_m0 = weights[:, module.m_in_index[0]:module.m_in_index[1]].unsqueeze(1) if module.radial_emb else None
+    radial_m0 = radial_parts[0].unsqueeze(1) if module.radial_emb else None
     m0_contribution = None
     if _flag("DPTB_SO2_MOE_FUSED_P0_FUSE_M0", "0"):
         m0_contribution = _fused_m0_contribution(
@@ -3586,7 +3605,7 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
             wigner_mode,
             wigner_stride,
             mole_globals,
-            weights,
+            radial_parts,
         )
         if contributions is None:
             return None
@@ -3594,7 +3613,7 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
             out.add_(contribution)
     else:
         for m in range(1, module.m_max + 1):
-            radial_m = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1) if module.radial_emb else None
+            radial_m = radial_parts[m].unsqueeze(1) if module.radial_emb else None
             contribution = _fused_pair_contribution(
                 module,
                 m,
