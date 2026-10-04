@@ -24,10 +24,10 @@ def _as_path_strings(paths: Optional[Iterable[str | Path]]) -> list[str]:
 
 def _candidate_toolkit_roots() -> list[Path]:
     roots: list[Path] = [Path(root) for root in (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH")) if root]
-    roots.append(Path("/usr/local/cuda"))
     usr_local = Path("/usr/local")
     if usr_local.is_dir():
         roots.extend(sorted(usr_local.glob("cuda-*"), reverse=True))
+    roots.append(Path("/usr/local/cuda"))
 
     deduped = []
     seen = set()
@@ -42,18 +42,20 @@ def _candidate_toolkit_roots() -> list[Path]:
 
 def _is_usable_toolkit_root(root: Path) -> bool:
     bin_dir = root / "bin"
-    if not (bin_dir / "nvcc").is_file():
+    nvcc = bin_dir / "nvcc"
+    if not nvcc.is_file() or not os.access(nvcc, os.X_OK):
         return False
     if (bin_dir / "cudafe++").is_file():
         return True
     # Some deployment shims expose an nvcc wrapper plus CUDA headers/libs, while
-    # forwarding compiler internals to the host toolkit.  Treat those as usable
+    # forwarding compiler internals to the host toolkit. Treat those as usable
     # so their newer headers stay ahead of stale /usr/local/cuda installs.
     return (root / "include" / "cuda_runtime.h").is_file()
 
 
 def _ensure_cuda_toolkit() -> None:
-    current = Path(str(getattr(torch_cpp_extension, "CUDA_HOME", "") or os.environ.get("CUDA_HOME", "")))
+    current_value = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or str(getattr(torch_cpp_extension, "CUDA_HOME", "") or "")
+    current = Path(current_value)
     if _is_usable_toolkit_root(current):
         os.environ["CUDA_HOME"] = str(current)
         os.environ["CUDA_PATH"] = str(current)
@@ -107,18 +109,27 @@ def _env_cuda_paths() -> tuple[list[str], list[str]]:
     library_paths = []
     for site_root in site.getsitepackages():
         root = Path(site_root) / "nvidia"
-        for package in ("cuda_runtime", "cublas"):
+        for package in ("cuda_nvcc", "cuda_runtime", "cublas"):
             include_dir = root / package / "include"
             library_dir = root / package / "lib"
             if include_dir.is_dir():
-                include_paths.append(str(include_dir))
+                # Hanhai's cuda_runtime wheel and some /usr/local/cuda installs ship
+                # cuda_runtime_api.h without the crt/ headers it includes. The
+                # cuda_nvcc wheel supplies crt/host_defines.h, so keep that include
+                # path in front while still using wheel libraries.
+                if package == "cuda_runtime" and not (include_dir / "crt" / "host_defines.h").is_file():
+                    pass
+                elif package == "cuda_nvcc" and not (include_dir / "crt" / "host_defines.h").is_file():
+                    pass
+                else:
+                    include_paths.append(str(include_dir))
             if library_dir.is_dir():
                 library_paths.append(str(library_dir))
     seen = set(include_paths)
     lib_seen = set(library_paths)
     for root in _candidate_toolkit_roots():
         for include_dir in (root / "include", root / "targets" / "x86_64-linux" / "include"):
-            if (include_dir / "crt" / "host_config.h").is_file() and str(include_dir) not in seen:
+            if (include_dir / "cuda_runtime_api.h").is_file() and str(include_dir) not in seen:
                 include_paths.append(str(include_dir))
                 seen.add(str(include_dir))
         for library_dir in (root / "lib64", root / "targets" / "x86_64-linux" / "lib"):
@@ -144,6 +155,7 @@ def load_cuda_extension(
 
     _ensure_cuda_toolkit()
     _ensure_ninja_on_path()
+    os.environ.setdefault("MAX_JOBS", "4")
     build_dir = Path(os.environ.get(build_dir_env, str(default_build_dir)))
     build_dir.mkdir(parents=True, exist_ok=True)
     env_include_paths, env_library_paths = _env_cuda_paths()
