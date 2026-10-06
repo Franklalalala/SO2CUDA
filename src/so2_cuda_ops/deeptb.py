@@ -232,3 +232,7 @@ def prepare_layout(in_entries: tuple[tuple[int, int, int], ...],
 
 
 __all__ += ['prepare_wigner', 'prepare_layout']
+
+from ._dense import true_dense_pairs
+
+__all__ += ['true_dense_pairs']
