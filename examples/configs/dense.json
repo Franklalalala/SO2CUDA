@@ -1,0 +1,75 @@
+{
+  "common_options": {
+    "basis": {
+      "C": "2s2p1d",
+      "Cu": "4s2p2d1f"
+    },
+    "dtype": "float32",
+    "device": "cuda:0",
+    "overlap": false,
+    "has_soc": true,
+    "full_soc_prediction": false,
+    "nextham_uureal_mask": true
+  },
+  "model_options": {
+    "embedding": {
+      "method": "lem_moe_v3_edge_h0",
+      "n_layers": 3,
+      "avg_num_neighbors": 80,
+      "irreps_hidden": "32x0e+32x1o+32x2e+32x3o+32x4e+32x5o+32x6e",
+      "env_embed_multiplicity": 10,
+      "latent_channels": [
+        200,
+        128
+      ],
+      "latent_dim": 128,
+      "edge_one_hot_dim": 128,
+      "num_experts": 1,
+      "num_shared_experts": 0,
+      "top_k": 1,
+      "mole_full_expert_fast_path": true,
+      "mole_linear_mode": "cublas_grouped",
+      "edge_router_prior_activate": false,
+      "edge_moe_compact_min_edges": 0,
+      "h0_init_scope": "both",
+      "h0_merge_mode": "replace",
+      "h0_node_mode": "direct",
+      "hidden_edge_activation_type": "gate",
+      "hidden_node_activation_type": "gate",
+      "ffn_hidden_factor": 0.0,
+      "equivariant_norm_type": "merged_rms",
+      "n_radial_basis": 128,
+      "ln_flag": true,
+      "in_frame_flag": true,
+      "optimized_in_frame": true,
+      "onehot_tp_mode": "scalar_fast",
+      "so2_fusion_mode": "streamed_m_major_fused_p0",
+      "so2_m_linear_mode": "standard",
+      "so2_wigner_apply_mode": "compact_blocks",
+      "tp_radial_emb": true,
+      "tp_radial_channels": [
+        32
+      ],
+      "universal": true,
+      "use_layer_onehot_tp": true,
+      "use_out_onehot_tp": true,
+      "use_interpolation_out": false,
+      "res_update": true,
+      "res_update_ratios": 0.5,
+      "self_mix_flag": false,
+      "r_max": 7.4
+    },
+    "prediction": {
+      "method": "e3tb",
+      "neurons": [
+        128,
+        128,
+        128
+      ],
+      "activation": "tanh",
+      "scale_type": "no_scale",
+      "complete_edges": true,
+      "symmetrize_onsite": true
+    }
+  }
+}

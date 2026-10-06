@@ -48,20 +48,6 @@ def _load_extension():
     include_paths = []
     if _flag("DPTB_SO2_MOE_FUSED_P0_LINEINFO"):
         cuda_flags.append("-lineinfo")
-    cutlass_root = (
-        os.environ.get("SO2_CUDA_CUTLASS_ROOT")
-        or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
-        or os.environ.get("DPTB_CUTLASS_ROOT")
-    )
-    if cutlass_root:
-        cutlass_root_path = Path(cutlass_root)
-        include_paths.extend([
-            str(cutlass_root_path / "include"),
-            str(cutlass_root_path / "tools" / "util" / "include"),
-        ])
-        cflags.append("-DDPTB_SO2_MOE_FUSED_P0_CUTLASS=1")
-        cuda_flags.append("-DDPTB_SO2_MOE_FUSED_P0_CUTLASS=1")
-
     _EXT = load_cuda_extension(
         name="so2_cuda_ops_pack_scatter",
         source_files=[
@@ -1170,84 +1156,8 @@ def _cublas_segmented_linear_backward(
     return grad_x_flat.reshape_as(x_in), grad_weight
 
 
-def _cutlass_segmented_raw_linear_backward(
-    x_pair: torch.Tensor,
-    grad_raw: torch.Tensor,
-    graph_index: torch.Tensor,
-    mixed_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from so2_cuda_ops._cutlass_grouped_gemm import grouped_gemm, grouped_gemm_backward_weight
-
-    n_routes = int(mixed_weight.shape[0])
-    cin = int(mixed_weight.shape[2])
-    out2 = int(mixed_weight.shape[1])
-    x_flat = x_pair.reshape(-1, cin).contiguous()
-    grad_flat = grad_raw.reshape(-1, out2).contiguous()
-    order, unorder, _sorted_graph, ptr_cpu = _pair_segment_layout(graph_index, n_routes)
-
-    if order is not None:
-        x_sorted = x_flat.index_select(0, order).contiguous()
-        grad_sorted = grad_flat.index_select(0, order).contiguous()
-    else:
-        x_sorted = x_flat
-        grad_sorted = grad_flat
-
-    grad_x_sorted = grouped_gemm(
-        grad_sorted,
-        ptr_cpu,
-        mixed_weight.transpose(1, 2).contiguous(),
-    )
-    if unorder is not None:
-        grad_x_flat = grad_x_sorted.index_select(0, unorder)
-    else:
-        grad_x_flat = grad_x_sorted
-    grad_weight = grouped_gemm_backward_weight(
-        grad_sorted,
-        x_sorted,
-        ptr_cpu,
-        n_routes,
-    )
-    return grad_x_flat.reshape_as(x_pair), grad_weight
 
 
-def _cutlass_segmented_linear_backward(
-    x_in: torch.Tensor,
-    grad_out: torch.Tensor,
-    graph_index: torch.Tensor,
-    mixed_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from so2_cuda_ops._cutlass_grouped_gemm import grouped_gemm, grouped_gemm_backward_weight
-
-    n_routes = int(mixed_weight.shape[0])
-    cin = int(mixed_weight.shape[2])
-    cout = int(mixed_weight.shape[1])
-    x_flat = x_in.reshape(-1, cin).contiguous()
-    grad_flat = grad_out.reshape(-1, cout).contiguous()
-    order, unorder, _sorted_graph, ptr_cpu = _row_segment_layout(graph_index, n_routes)
-
-    if order is not None:
-        x_sorted = x_flat.index_select(0, order).contiguous()
-        grad_sorted = grad_flat.index_select(0, order).contiguous()
-    else:
-        x_sorted = x_flat
-        grad_sorted = grad_flat
-
-    grad_x_sorted = grouped_gemm(
-        grad_sorted,
-        ptr_cpu,
-        mixed_weight.transpose(1, 2).contiguous(),
-    )
-    if unorder is not None:
-        grad_x_flat = grad_x_sorted.index_select(0, unorder)
-    else:
-        grad_x_flat = grad_x_sorted
-    grad_weight = grouped_gemm_backward_weight(
-        grad_sorted,
-        x_sorted,
-        ptr_cpu,
-        n_routes,
-    )
-    return grad_x_flat.reshape_as(x_in), grad_weight
 
 
 def _segmented_raw_linear_forward(
@@ -1355,11 +1265,7 @@ def _segmented_m0_backward(
         grad_radial = grad_linear * raw
         grad_linear = grad_linear * radial
 
-    if raw_backend == "cutlass_segmented":
-        grad_m0_eff, grad_weight = _cutlass_segmented_linear_backward(
-            x_m0_eff, grad_linear, graph_index, mixed_weight
-        )
-    elif raw_backend == "cublas_segmented":
+    if raw_backend == "cublas_segmented":
         grad_m0_eff, grad_weight = _cublas_segmented_linear_backward(
             x_m0_eff, grad_linear, graph_index, mixed_weight
         )
@@ -1469,11 +1375,7 @@ def _segmented_pair_backward(
     grad_raw[:, 0, cout:] = grad_pair[:, 1, :]
     grad_raw[:, 1, cout:] = -grad_pair[:, 0, :]
 
-    if raw_backend == "cutlass_segmented":
-        grad_x_pair_eff, grad_weight = _cutlass_segmented_raw_linear_backward(
-            x_pair_eff, grad_raw, graph_index, mixed_weight
-        )
-    elif raw_backend == "cublas_segmented":
+    if raw_backend == "cublas_segmented":
         grad_x_pair_eff, grad_weight = _cublas_segmented_raw_linear_backward(
             x_pair_eff, grad_raw, graph_index, mixed_weight
         )
@@ -2689,37 +2591,6 @@ class _FusedPairFunction(torch.autograd.Function):
         ext = _load_extension()
         forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
         forward_fn = ext.fused_pair_forward_fp32
-        tiled_forward_fns = {
-            "cutlass_tiled2": "fused_pair_forward_tiled2_fp32",
-            "cute_tiled2": "fused_pair_forward_tiled2_fp32",
-            "cutlass_tiled3": "fused_pair_forward_tiled3_fp32",
-            "cute_tiled3": "fused_pair_forward_tiled3_fp32",
-            "cutlass_tiled4": "fused_pair_forward_tiled4_fp32",
-            "cute_tiled4": "fused_pair_forward_tiled4_fp32",
-            "cutlass_tiled8": "fused_pair_forward_tiled8_fp32",
-            "cute_tiled8": "fused_pair_forward_tiled8_fp32",
-        }
-        if forward_mode in tiled_forward_fns:
-            forward_fn = getattr(ext, tiled_forward_fns[forward_mode], None)
-        elif forward_mode not in ("", "scalar"):
-            if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
-                raise RuntimeError(f"unknown DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r}")
-            _warn_once(
-                "unknown_forward_mode",
-                f"unknown DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r}; using scalar fused P0 forward.",
-            )
-        if forward_fn is None:
-            if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
-                raise RuntimeError(
-                    f"DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r} requires "
-                    "building the extension with DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT."
-                )
-            _warn_once(
-                "missing_tiled_forward",
-                f"DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r} is unavailable; using scalar fused P0 forward.",
-            )
-            forward_fn = ext.fused_pair_forward_fp32
-
         out = forward_fn(
             x,
             wigner,
@@ -3526,39 +3397,6 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
     wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
     forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
-    if forward_mode in (
-        "indexed_sandwich_multi_direct_warp",
-        "route_m_direct_warp",
-        "custom_a_loader_epilogue",
-        "indexed_sandwich_multi_cute_tiled",
-        "indexed_sandwich_multi_cutlass_native",
-        "custom_a_loader_cutlass_epilogue",
-    ):
-        from so2_cuda_ops._scheduler_backend import try_forward_so2_moe_persistent_grouped_p1
-
-        mainloop_override = (
-            "cute_tiled"
-            if forward_mode in (
-                "indexed_sandwich_multi_cute_tiled",
-            )
-            else "cutlass_native"
-            if forward_mode in (
-                "indexed_sandwich_multi_cutlass_native",
-                "custom_a_loader_cutlass_epilogue",
-            )
-            else "warp_collective"
-        )
-        return try_forward_so2_moe_persistent_grouped_p1(
-            module,
-            x,
-            R,
-            mole_globals,
-            latents,
-            wigner_D_all,
-            include_m0_override=False,
-            mainloop_override=mainloop_override,
-        )
-
     weights = module.radial_emb(latents) if module.radial_emb else None
     radial_parts = _radial_parts(module, weights)
     out = torch.zeros((x.shape[0], module.irreps_out.dim), dtype=x.dtype, device=x.device)

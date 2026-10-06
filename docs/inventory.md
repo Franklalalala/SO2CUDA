@@ -1,22 +1,7 @@
-# Extraction Inventory
+# 实现归属
 
-Moved into this package:
+SO2CUDA 维护 SO2 的 pack／scatter 原生核、分组 cuBLAS GEMM、自动微分、激活空间 top-k 编排、布局描述符与 JIT 工具链发现。唯一 CUDA 源目录为 `src/so2_cuda_ops/csrc/`。
 
-- `cublas_grouped_gemm.cpp` and Python grouped GEMM facade.
-- SO2 pack/scatter and indexed sandwich extension sources.
-- SO2 materialized scheduler native extension sources.
-- Shared CUDA JIT loader and segment layout helpers.
-- Optional CUTLASS grouped GEMM and SO2 smoke sources.
+DeePTB 保留模型类、专家参数、径向网络、路由概率计算、Wigner 几何构造、纯 PyTorch 参考数学、训练配置和检查点加载。H0 先验、晶体对称投影、e3nn 参考模块和激活重计算属于模型侧。
 
-Kept in DeePTB:
-
-- `SO2_Linear` model classes and mode normalization.
-- DeePTB training/config schema and old `DPTB_SO2_*` environment compatibility.
-- Shape gates, fallback policy, and model-specific `block_dense` orchestration.
-- End-to-end DeePTB tests and benchmarks.
-
-Dropped from DeePTB:
-
-- Embedded CUDA/C++ implementation sources under `dptb/nn/csrc`.
-
-The DeePTB files that previously owned backend implementation are now import shims or lightweight adapters into `so2_cuda_ops`.
+核心算子的既有 Python 入口继续用于独立算子调用；新集成使用 `so2_cuda_ops.deeptb`。未用于生产的 scheduler、CUTLASS smoke 和 flat-backward 实验不在此版本中。

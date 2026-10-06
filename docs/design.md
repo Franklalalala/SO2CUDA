@@ -1,9 +1,7 @@
-# Design
+# 设计
 
-The package separates backend responsibilities into three layers:
+包分为三个层次：张量与布局接口、自动微分及分组 GEMM 编排、CUDA/C++ 原生算子。包不导入 DeePTB，也不创建模型参数。
 
-1. Python metadata and segment preparation.
-2. JIT extension loading and grouped GEMM dispatch.
-3. CUDA/C++ kernels for pack, scatter, epilogue, and materialized scheduling.
+SO2 dense 接口保留调用方的 m=0 参考计算，然后按 m 顺序累加原生输出；激活空间 MoE 保留按 top-k 槽分组 GEMM、按槽加权求和及输出 scatter 的顺序。两条路线共享唯一的 pack／scatter 和 cuBLAS 实现。
 
-Model-specific shape gates, fallback policy, and training configuration stay in the host project. The backend package receives tensors and descriptors; it does not own DeePTB model construction.
+CPU 或不受支持的数学条件由模型侧参考实现处理。发生原生执行错误时不会吞掉异常重试其他数学路线。

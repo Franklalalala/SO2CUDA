@@ -6,7 +6,6 @@ def test_public_api_imports():
     assert callable(so2_cuda_ops.get_backend_config)
     assert callable(so2_cuda_ops.set_backend_config)
     assert callable(so2_cuda_ops.indexed_sandwich_multi)
-    assert callable(so2_cuda_ops.materialized_scheduler)
 
 
 def test_backend_config_round_trip(monkeypatch):
@@ -22,7 +21,7 @@ def test_backend_config_round_trip(monkeypatch):
         backend="indexed_sandwich",
         min_edges=128,
         materialized_min_edges=256,
-        gemm_strategy="scheduler",
+        gemm_strategy="grouped",
     )
     after = so2_cuda_ops.get_backend_config()
 
@@ -30,7 +29,7 @@ def test_backend_config_round_trip(monkeypatch):
     assert after.backend == "indexed_sandwich"
     assert after.min_edges == 128
     assert after.materialized_min_edges == 256
-    assert after.gemm_strategy == "scheduler"
+    assert after.gemm_strategy == "grouped"
 
 
 def test_profiler_records_host_spans_without_cuda(monkeypatch):

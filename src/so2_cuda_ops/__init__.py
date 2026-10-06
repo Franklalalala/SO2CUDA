@@ -40,17 +40,6 @@ def indexed_sandwich_multi(*args, **kwargs):
     return indexed_sandwich_multi_gemm(*args, **kwargs)
 
 
-def materialized_scheduler(*args, **kwargs):
-    from .scheduler import materialized_scheduler as _materialized_scheduler
-
-    return _materialized_scheduler(*args, **kwargs)
-
-
-def prepare_so2_single_route_layout(*args, **kwargs):
-    from .scheduler import prepare_so2_single_route_layout as _prepare_so2_single_route_layout
-
-    return _prepare_so2_single_route_layout(*args, **kwargs)
-
 __all__ = [
     "BackendConfig",
     "__version__",
@@ -63,9 +52,7 @@ __all__ = [
     "indexed_sandwich_multi_block_gemm",
     "indexed_sandwich_multi_gemm",
     "is_available",
-    "materialized_scheduler",
     "profile_enabled",
-    "prepare_so2_single_route_layout",
     "reset_profile_summary",
     "set_backend_config",
 ]

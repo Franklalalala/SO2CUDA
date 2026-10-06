@@ -1,4 +1,3 @@
-recursive-include csrc *
 recursive-include src/so2_cuda_ops/csrc *
 include README.md
 include LICENSE

@@ -1,9 +1,7 @@
-import os
-
-os.environ.setdefault("DPTB_SO2_M_LINEAR_MODE", "indexed_sandwich_materialized_scheduled")
-os.environ.setdefault("DPTB_SO2_MATERIALIZED_SCHEDULED_GEMM_STRATEGY", "scheduler")
-
+"""Inspect the optional integration backend without constructing a model."""
 import so2_cuda_ops
+from so2_cuda_ops import deeptb
 
 print("SO2 CUDA available:", so2_cuda_ops.is_available())
-print("Backend config:", so2_cuda_ops.get_backend_config())
+print("SO2CUDA version:", so2_cuda_ops.__version__)
+print("Integration entry points:", deeptb.__all__)

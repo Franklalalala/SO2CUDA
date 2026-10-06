@@ -113,7 +113,7 @@ def _env_cuda_paths() -> tuple[list[str], list[str]]:
             include_dir = root / package / "include"
             library_dir = root / package / "lib"
             if include_dir.is_dir():
-                # Hanhai's cuda_runtime wheel and some /usr/local/cuda installs ship
+                # Some cuda_runtime wheels and local CUDA installations ship
                 # cuda_runtime_api.h without the crt/ headers it includes. The
                 # cuda_nvcc wheel supplies crt/host_defines.h, so keep that include
                 # path in front while still using wheel libraries.
