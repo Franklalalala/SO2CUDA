@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Compare SO2CUDA and PyTorch on randomly initialized DeePTB models."""
+"""Compare SO2CUDA and PyTorch on randomly initialized UniTB dense/X1 models."""
 from __future__ import annotations
 
 import argparse
 import copy
+from datetime import datetime, timezone
 import functools
+import hashlib
 import importlib
 import itertools
 import json
@@ -136,6 +138,7 @@ def periodic_batch(model, args, torch):
 def select_backend(model, backend):
     """Change execution policy only; parameters and nonlinear routing stay intact."""
     fused = backend == "cuda"
+    os.environ["SO2_CUDA_BACKEND"] = "auto" if fused else "off"
     for module in model.modules():
         if hasattr(module, "so2_fusion_mode"):
             module.so2_fusion_mode = "streamed_m_major_fused_p0" if fused else "staged"
@@ -143,6 +146,15 @@ def select_backend(model, backend):
             module.mole_linear_mode = "cublas_grouped" if fused else "split_loop"
         if hasattr(module, "m_linear_mode"):
             module.m_linear_mode = "standard"
+
+
+def timing_summary(samples):
+    """Inclusive quartiles; a one-iteration smoke test has a degenerate interval."""
+    if any(not math.isfinite(value) or value < 0 for value in samples):
+        raise RuntimeError("Timing samples must be finite and nonnegative")
+    q1, _, q3 = (statistics.quantiles(samples, n=4, method="inclusive")
+                 if len(samples) > 1 else [samples[0]] * 3)
+    return {"median": statistics.median(samples), "q1": q1, "q3": q3}
 
 
 def measure(model, data, backend, args, torch, counters):
@@ -193,6 +205,11 @@ def measure(model, data, backend, args, torch, counters):
         "forward_samples_ms": forward,
         "backward_samples_ms": backward,
         "loss": float(loss.detach()),
+        "timing_statistics_ms": {
+            "forward": timing_summary(forward),
+            "backward": timing_summary(backward),
+            "forward_backward": timing_summary([f + b for f, b in zip(forward, backward)]),
+        },
     }
     snapshot = {
         "training_outputs": {key: outputs[key].detach().cpu() for key in ("node_features", "edge_features")},
@@ -201,12 +218,16 @@ def measure(model, data, backend, args, torch, counters):
     for name, grad in snapshot["parameter_gradients"].items():
         if not bool(torch.isfinite(grad).all()):
             raise RuntimeError(f"Non-finite {backend} gradient: {name}")
-    del outputs, loss
-    reset()
+    del outputs, loss, batch
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        for name, value in model.named_buffers():
+            value.copy_(buffers[name])
     model.eval()
     with torch.no_grad():
         inference = model({key: value.clone() for key, value in data.items()})
     snapshot["inference_outputs"] = {key: inference[key].detach().cpu() for key in ("node_features", "edge_features")}
+    del inference
     for group in ("training_outputs", "inference_outputs"):
         if any(not bool(torch.isfinite(value).all()) for value in snapshot[group].values()):
             raise RuntimeError(f"Non-finite {backend} {group}")
@@ -220,6 +241,7 @@ def measure(model, data, backend, args, torch, counters):
         raise RuntimeError("Reference execution unexpectedly called accelerated tensor-product/GEMM entry points")
     if args.device.startswith("cuda"):
         result["peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
+        result["peak_reserved_gib"] = torch.cuda.max_memory_reserved() / 2 ** 30
     with torch.no_grad():
         for name, value in model.named_buffers():
             value.copy_(buffers[name])
@@ -253,9 +275,11 @@ def main():
     os.environ["SO2_CUDA_FAST_TF32"] = "0"
     os.environ["DPTB_CUBLAS_GROUPED_FAST_TF32"] = "0"
     os.environ["DPTB_SO2_FUSION_MODE"] = "staged"
-    os.environ["DPTB_SO2_FUSE_M_CUBLAS"] = "0"
     os.environ["SO2_CUDA_PROFILE"] = "0"
     os.environ["DPTB_SO2_PROFILE"] = "0"
+    os.environ["DPTB_SO2_ACTIVATION_FUSED_P0"] = "1"
+    os.environ["DPTB_SO2_ACTIVATION_FUSED_P0_GEMM"] = "per_slot"
+    os.environ["SO2_CUDA_BACKEND"] = "off"
     import torch
 
     torch.set_num_threads(args.threads)
@@ -279,9 +303,11 @@ def main():
     os.environ["DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE"] = forward_mode
     counters = install_counters() if args.backend != "reference" else {}
     from dptb.nn.build import build_model
+    from dptb.nn.embedding.unitb_options import unitb_options
     import dptb
 
     report = {
+        "created": datetime.now(timezone.utc).isoformat(),
         "precision": "float32; TF32 disabled", "torch_version": torch.__version__,
         "deeptb_version": getattr(dptb, "__version__", None),
         "so2cuda_version": getattr(sys.modules.get("so2_cuda_ops"), "__version__", None),
@@ -290,11 +316,13 @@ def main():
         "dense_forward_mode": forward_mode, "cuda_allocator_limit_gib": args.max_memory_gib,
         "timing_scope": "Model forward and loss backward; setup, input cloning and buffer reset excluded; no optimizer update",
         "data": "Synthetic periodic geometry and random H0; overlap is synthetic; not a physical accuracy test",
+        "quantile_method": "statistics.quantiles(n=4, method='inclusive')",
         "models": {},
     }
     models = ("dense", "x1") if args.model == "both" else (args.model,)
     for name in models:
-        config = json.loads((Path(__file__).parent / "configs" / (name + ".json")).read_text())
+        config_path = Path(__file__).parent / "configs" / (name + ".json")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         common = copy.deepcopy(config["common_options"])
         common["device"] = args.device
         options = copy.deepcopy(config["model_options"])
@@ -304,7 +332,11 @@ def main():
         torch.manual_seed(args.seed)
         model = build_model(common_options=common, model_options=options, train_options={}, no_check=False)
         data, shape = periodic_batch(model, args, torch)
-        evidence = {"shape": shape, "irreps_hidden": options["embedding"]["irreps_hidden"],
+        effective_embedding = unitb_options(config["model_options"]["embedding"])
+        evidence = {"shape": shape, "irreps_hidden": effective_embedding["irreps_hidden"],
+                    "embedding_options": effective_embedding,
+                    "embedding_method": config["model_options"]["embedding"]["method"],
+                    "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
                     "parameters": sum(p.numel() for p in model.parameters()), "backends": {}}
         reference = accelerated = None
         backends = ("reference", "cuda") if args.backend == "both" else (args.backend,)
