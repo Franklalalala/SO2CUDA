@@ -66,7 +66,7 @@ UniTB-X1 使用 H₀-routed shared-basis mixture of experts (PDQ-MoE)：四个�
 ```bash
 pip install 'git+https://github.com/Franklalalala/DeePTB.git@1006-stable'
 pip install -e .
-python examples/deeptb_speed_test.py --model both --forward-mode indexed_sandwich_multi --json speed.json
+python examples/deeptb_speed_test.py --model both --json speed.json
 ```
 
 默认每批 20,000 条有向边：每个周期胞 125 个原子，每原子 80 个邻居。`--model dense` / `--model x1` 可只测一种模型。`--edges` 指定目标边数，脚本向上取整到完整周期胞并记录实际边数；默认结构下 20,000 / 50,000 / 130,000 均为精确边数。`--side`、`--neighbors` 和 `--spacing` 可调节结构。默认 CUDA 分配器上限为 20 GiB，遇到显存不足时减小边数；大边数测试可按设备容量增加 `--max-memory-gib`：
@@ -79,16 +79,16 @@ python examples/deeptb_speed_test.py --model both --edges 10000 --iterations 5 -
 
 结果包括前向、反向与合计 ms/iter、加速比、峰值分配与保留显存、实际成功调用的加速入口，以及推理输出、训练输出和参数梯度的最大绝对差与相对 L2 差。CUDA 模式会核验对应的加速入口确实执行，未进入加速路线会报错。计算固定为严格 FP32，禁用 TF32；参考与 CUDA 路线的求和顺序可能造成 FP32 舍入差，JSON 会给出实测数值。峰值分配包含模型、输入、训练中间张量与梯度；保留显存还包含分配器缓存。
 
-独占 H200 实测中，dense 使用 `indexed_sandwich_multi` 的前向＋反向为参考路线的 1.84–2.36 倍速度，因此上方三行命令显式选择该模式。示例的自动选择仍为 H200 `scalar`、其他 GPU `indexed_sandwich_multi`；库的默认值保持不变。正常模型运行可在启动前设置：
+dense 的 fused-P0 前向默认使用 `indexed_sandwich_multi`：独占 H200 实测中，其前向＋反向为参考路线的 1.84–2.36 倍速度。0.2.0 之前的默认是 `scalar`；需要与那些运行逐位一致时，在启动前设置：
 
 ```bash
-export DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi
+export DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=scalar
 ```
 
-示例会根据命令行参数设置同一环境变量，运行示例时同时使用 `--forward-mode`：
+示例用 `--forward-mode` 设置同一环境变量，例如对比旧默认：
 
 ```bash
-python examples/deeptb_speed_test.py --model dense --forward-mode indexed_sandwich_multi
+python examples/deeptb_speed_test.py --model dense --forward-mode scalar
 ```
 
 共用 GPU 的结果可能有计时噪声；用 `--shared-gpu` 将这一情况记入 JSON。CPU 或未安装 SO2CUDA 的 DeePTB 环境可以先做纯 PyTorch 小规模检查：
@@ -104,7 +104,7 @@ python examples/deeptb_speed_test.py --model both --device cpu --backend referen
 
 GPU：NVIDIA H200，逐次核对所用物理 GPU 的进程表，确认独占。严格 FP32，关闭 TF32；随机初始化 UniTB 模型与合成周期结构，每组 SO2CUDA 开／关使用相同参数和输入，无优化器更新。每路预热 3 次、计时 10 次。加速比为关闭／开启 SO2CUDA 的前向＋反向合计中位数；大于 1 表示更快。
 
-| 模型 | 有向边 | scalar 默认 | indexed_sandwich_multi 显式覆盖 |
+| 模型 | 有向边 | `scalar`（旧默认） | `indexed_sandwich_multi`（默认） |
 |---|---:|---:|---:|
 | UniTB-dense | 20,000 | 0.716× | 1.839× |
 | UniTB-dense | 50,000 | 0.601× | 2.181× |
@@ -113,7 +113,7 @@ GPU：NVIDIA H200，逐次核对所用物理 GPU 的进程表，确认独占。�
 | UniTB-X1 | 50,000 | 2.036× | 2.045× |
 | UniTB-X1 | 130,000 | 2.173× | 2.175× |
 
-`scalar` 是库的默认前向模式；本发布保持默认值。`indexed_sandwich_multi` 通过环境变量显式选择。该开关作用于 dense，X1 仍走相同的 activation fused-P0 与分组 GEMM；两组 X1 时间的差别包含独立测量波动。
+自 0.2.0 起 dense 前向默认 `indexed_sandwich_multi`；`scalar` 需通过环境变量显式选择。该开关作用于 dense，X1 仍走相同的 activation fused-P0 与分组 GEMM；两组 X1 时间的差别包含独立测量波动。
 
 <details>
 <summary>完整计时、四分位、峰值显存与数值差</summary>
@@ -197,7 +197,7 @@ GPU：NVIDIA H200，逐次核对所用物理 GPU 的进程表，确认独占。�
 | `SO2_CUDA_PACK_SCATTER_BUILD_DIR` | 张量打包与 scatter 扩展构建目录 |
 | `SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR` | 分组 GEMM 扩展构建目录 |
 | `SO2_CUDA_BACKEND` | DeePTB 后端策略：默认 `auto`，`off` 强制纯 PyTorch |
-| `SO2_CUDA_FORWARD_MODE` | dense 前向模式：`scalar` 或 `indexed_sandwich_multi` |
+| `SO2_CUDA_FORWARD_MODE` | dense 前向模式：`indexed_sandwich_multi`（默认）或 `scalar` |
 | `SO2_CUDA_FAST_TF32` | TF32 开关；上述示例固定为 `0` |
 | `SO2_CUDA_PROFILE` | 算子分段计时开关；速度测试期间关闭 |
 | `SO2_CUDA_MIN_EDGES` / `SO2_CUDA_MAX_EDGES` | DeePTB 扩展非 MoE dense 层的加速边数范围；`0` 不设限 |

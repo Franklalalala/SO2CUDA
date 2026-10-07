@@ -146,7 +146,7 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
     if not _supported(x, wigner):
         return None
     from . import tensor_product as tp
-    mode = forward_mode or tp._env('DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE', 'scalar')
+    mode = forward_mode or tp._env('DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE', tp.DEFAULT_FUSED_P0_FORWARD_MODE)
     multi = ('indexed_sandwich_multi', 'cublas_multi_sandwich', 'route_m_sandwich',
              'indexed_sandwich_multi_grouped', 'cublas_multi_sandwich_grouped')
     if mode not in ('scalar',) + multi:

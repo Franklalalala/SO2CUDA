@@ -298,7 +298,7 @@ def main():
         gpu = None
         if args.backend != "reference":
             raise RuntimeError("The CUDA benchmark needs a CUDA device; CPU supports --backend reference")
-    forward_mode = ("scalar" if gpu and "H200" in gpu else "indexed_sandwich_multi") if args.forward_mode == "auto" else args.forward_mode
+    forward_mode = "indexed_sandwich_multi" if args.forward_mode == "auto" else args.forward_mode
     os.environ["SO2_CUDA_FORWARD_MODE"] = forward_mode
     os.environ["DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE"] = forward_mode
     counters = install_counters() if args.backend != "reference" else {}

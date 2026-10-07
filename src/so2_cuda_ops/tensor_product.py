@@ -19,6 +19,11 @@ _EXT = None
 _WARNED: set[str] = set()
 
 
+# Dense fused-P0 forward kernel used when DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE is unset.
+# "scalar" remains selectable for bitwise continuity with runs made before 0.2.0.
+DEFAULT_FUSED_P0_FORWARD_MODE = "indexed_sandwich_multi"
+
+
 def _flag(name: str, default: str = "0") -> bool:
     sync_legacy_env_aliases()
     return truthy_env(name, default)
@@ -2589,7 +2594,7 @@ class _FusedPairFunction(torch.autograd.Function):
         wigner_stride: int,
     ):
         ext = _load_extension()
-        forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+        forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", DEFAULT_FUSED_P0_FORWARD_MODE)
         forward_fn = ext.fused_pair_forward_fp32
         out = forward_fn(
             x,
@@ -2919,7 +2924,7 @@ def _fused_pairs_indexed_sandwich_multi(
             f"MOLE graph_index has {graph_index.numel()} rows, but fused multi-m input has {x.shape[0]} rows."
         )
 
-    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", DEFAULT_FUSED_P0_FORWARD_MODE)
     use_native_multi = forward_mode in ("indexed_sandwich_multi_grouped", "cublas_multi_sandwich_grouped")
     use_grouped_pack = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_PACK", "0")
     use_grouped_epilogue = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE", "0")
@@ -3212,7 +3217,7 @@ def _fused_pair_contribution(
         _warn_once("pair_bias_fallback", "streamed_m_major_fused_p0 expects bias-free m>0 MoE linears; falling back.")
         return None
 
-    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", DEFAULT_FUSED_P0_FORWARD_MODE)
     if forward_mode in ("indexed_sandwich", "cueq_sandwich", "cueq_compatible"):
         return _fused_pair_indexed_sandwich(
             module,
@@ -3396,7 +3401,7 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         return None
     wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
-    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    forward_mode = _env("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", DEFAULT_FUSED_P0_FORWARD_MODE)
     weights = module.radial_emb(latents) if module.radial_emb else None
     radial_parts = _radial_parts(module, weights)
     out = torch.zeros((x.shape[0], module.irreps_out.dim), dtype=x.dtype, device=x.device)
