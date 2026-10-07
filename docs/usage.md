@@ -21,4 +21,4 @@ CPU、非 FP32、autocast、`torch.func` 或 Wigner 求导时，SO2 接口返回
 
 安装用 `pip install -e .`。`is_available()` 只报告 PyTorch 是否检测到 CUDA；第一次真正调用会 JIT 编译，也会验证本机工具链可用。无 CUDA 时可以正常导入包。
 
-环境变量：`SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR` 设置私有构建目录；`SO2_CUDA_FAST_TF32=0` 保持 FP32。为兼容现有模型保留 `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE`，可选 `scalar` 或 `indexed_sandwich_multi`。DeePTB 适配层支持 `SO2_CUDA_BACKEND=off` 回退。公开示例见仓库首页。
+环境变量：`SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR` 设置私有构建目录；`SO2_CUDA_FAST_TF32=0` 保持 FP32。DeePTB 适配层支持 `SO2_CUDA_BACKEND=off` 回退。公开示例见仓库首页。
