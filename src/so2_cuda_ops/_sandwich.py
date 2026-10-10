@@ -63,11 +63,23 @@ def _side(all_bases, all_ls, block_members, dim, device):
 
     table = [v for m in range(width) for v in (prefix[m], widths[m], strides[m])]
     radial_offsets = [sum(widths[:m]) for m in range(width)]
+    uniform = None
+    if levels and levels[0] == 0:
+        channels = levels.count(0)
+        lmax = max(levels)
+        expected_l = [l for l in range(lmax + 1) for _ in range(channels)]
+        expected_b = [channels * l * l + c * (2 * l + 1)
+                      for l in range(lmax + 1) for c in range(channels)]
+        if (channels % 32 == 0 and lmax <= 8 and levels == expected_l and bases == expected_b
+                and int(dim) == channels * (lmax + 1) ** 2
+                and all(cols[k][m] == (k - m * channels if l >= m and widths[m] else -1)
+                        for k, l in enumerate(levels) for m in range(width))):
+            uniform = (channels, lmax)
     return SimpleNamespace(
         base=as_int(bases), l=as_int(levels), cols=as_int([c for row in cols for c in row]),
         table=torch.tensor(table, dtype=torch.long, device=device),
         prefix=prefix, width=widths, stride=strides, total=total, radial_offsets=radial_offsets,
-        zero_fill=any(c != 1 for c in covered), dim=int(dim))
+        zero_fill=any(c != 1 for c in covered), dim=int(dim), uniform=uniform)
 
 
 def sandwich_plan(layout, in_dim, device, *, with_m0=False):
@@ -100,6 +112,7 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
             no_scale=torch.empty(0, dtype=torch.float32, device=device),
         )
     cache[key] = hit
+    hit.uniform = hit.inp.uniform is not None and hit.inp.uniform == hit.out.uniform
     return hit
 
 
@@ -108,6 +121,12 @@ def _rotate(src, side, plan, wigner, rotate, scale=None, rows=None, copies=1, ra
     copy c stores edge e in row ``rows[c * N + e]``, scaled by ``scale[c * N + e]`` and, per
     block m and column, by ``radials[m]``. With ``plain`` one more buffer follows with the
     unscaled values in edge order."""
+    if (plan.uniform and int(wigner.mode) in (0, 2) and scale is None and rows is None
+            and copies == 1 and not radials and not plain):
+        return _ext().uniform_transform_fp32(
+            src, wigner.values, wigner.compact_offsets, side.table, src.shape[0],
+            *side.uniform, side.total, len(side.width) - 1, bool(side.width[0]),
+            bool(rotate and wigner.mode != 0), int(wigner.stride), False)
     return _ext().channel_rotate_to_blocks_fp32(
         src, wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.total, plan.no_scale if scale is None else scale,
@@ -124,6 +143,13 @@ def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None, into=None
     unscaled rotated input); ``sum_out`` receives the sum before that scaling (edge-order
     block rows). ``dot_out[c * N + e]`` receives the dot product of edge e's rows of copy c
     in ``src`` and ``dot_src``."""
+    if (plan.uniform and int(wigner.mode) in (0, 2) and scale is None and rows is None
+            and copies == 1 and not radials and into is None and plain is None
+            and radial_grad is None and dot_src is None and dot_out is None and sum_out is None):
+        return _ext().uniform_transform_fp32(
+            src, wigner.values, wigner.compact_offsets, side.table, int(n),
+            *side.uniform, side.total, len(side.width) - 1, bool(side.width[0]),
+            bool(rotate and wigner.mode != 0), int(wigner.stride), True)
     return _ext().channel_gather_from_blocks_fp32(
         src, int(n), wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.dim, bool(side.zero_fill), plan.no_scale if scale is None else scale,

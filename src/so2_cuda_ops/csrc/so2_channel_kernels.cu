@@ -996,6 +996,89 @@ __global__ void block_complex_weights_kernel(WeightSet ws, bool backward) {
   }
 }
 
+// A warp owns 32 channels of one degree and one edge. All its lanes follow the
+// same unrolled rotation, and its staging area is independent of the other warps.
+// Splitting a uniform row by degree avoids staging the entire feature row and
+// increases occupancy for wide layouts. Global feature reads/writes are coalesced.
+template <int L, bool Gather>
+__device__ __forceinline__ void uniform_transform_tile(
+    const float* src, float* dst, const float* wigner, const int64_t* compact_offsets,
+    const int64_t* table, int64_t n, int channels, int feature_dim, int mmax, bool with_m0,
+    bool rotate, int64_t wigner_stride, float* shared) {
+  constexpr int d = 2 * L + 1;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t edge = static_cast<int64_t>(blockIdx.x) * 4 + warp;
+  if (edge >= n) return;
+  const int first_channel = blockIdx.z * 32;
+  const int channel = first_channel + lane;
+  float* tile = shared + warp * (32 * d + d * d);
+  float* rotation = tile + 32 * d;
+  const int64_t feature_start = edge * feature_dim + channels * L * L + first_channel * d;
+  if (rotate && L > 0) {
+    const float* D = wigner + edge * wigner_stride + compact_offsets[L];
+    for (int i = lane; i < d * d; i += 32) rotation[i] = D[i];
+  }
+  if (!Gather) {
+    for (int i = lane; i < 32 * d; i += 32) tile[i] = src[feature_start + i];
+  }
+  __syncwarp();
+  float values[d];
+#pragma unroll
+  for (int j = 0; j < d; ++j) {
+    if (Gather) {
+      const int m = j < L ? L - j : j - L;
+      float value = 0.0f;
+      if (m <= mmax && (m > 0 || with_m0)) {
+        const int64_t width = table[3 * m + 1];
+        const int64_t offset = n * table[3 * m] + edge * table[3 * m + 2];
+        value = src[offset + (L - m) * channels + channel + (j > L ? width : 0)];
+      }
+      values[j] = value;
+    } else {
+      values[j] = tile[lane * d + j];
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < d; ++j) {
+    const int m = j < L ? L - j : j - L;
+    if (!Gather && (m > mmax || (m == 0 && !with_m0))) continue;
+    float value = values[j];
+    if (rotate && L > 0) {
+      value = 0.0f;
+#pragma unroll
+      for (int k = 0; k < d; ++k) {
+        if (!Gather || (k - L <= mmax && L - k <= mmax)) {
+          value = fmaf(rotation[Gather ? j * d + k : k * d + j], values[k], value);
+        }
+      }
+    }
+    if (Gather) {
+      tile[lane * d + j] = value;
+    } else {
+      const int64_t width = table[3 * m + 1];
+      const int64_t offset = n * table[3 * m] + edge * table[3 * m + 2];
+      dst[offset + (L - m) * channels + channel + (j > L ? width : 0)] = value;
+    }
+  }
+  if (Gather) {
+    __syncwarp();
+    for (int i = lane; i < 32 * d; i += 32) dst[feature_start + i] = tile[i];
+  }
+}
+
+template <bool Gather>
+__global__ void uniform_transform_kernel(
+    const float* src, float* dst, const float* wigner, const int64_t* compact_offsets,
+    const int64_t* table, int64_t n, int channels, int feature_dim, int mmax, bool with_m0,
+    bool rotate, int64_t wigner_stride) {
+  extern __shared__ float shared[];
+  const int l = blockIdx.y;
+  SO2_DISPATCH_DEGREE(l, (uniform_transform_tile<LL, Gather>(
+      src, dst, wigner, compact_offsets, table, n, channels, feature_dim, mmax, with_m0,
+      rotate, wigner_stride, shared)), (void)0);
+}
+
 WignerRef make_wigner_ref(
     const torch::Tensor& wigner,
     const torch::Tensor& offsets,
@@ -1017,6 +1100,33 @@ WignerRef make_wigner_ref(
 }
 
 }  // namespace
+
+torch::Tensor uniform_transform_fp32_cuda(
+    torch::Tensor src, torch::Tensor wigner, torch::Tensor compact_offsets, torch::Tensor block_table,
+    int64_t n_edges, int64_t channels, int64_t lmax, int64_t total_width, int64_t mmax,
+    bool with_m0, bool rotate, int64_t wigner_stride, bool gather) {
+  const int64_t dim = channels * (lmax + 1) * (lmax + 1);
+  auto out = gather ? torch::empty({n_edges, dim}, src.options())
+                    : torch::empty({n_edges * total_width}, src.options());
+  if (n_edges == 0) return out;
+  const dim3 grid((n_edges + 3) / 4, lmax + 1, channels / 32);
+  const int d = 2 * lmax + 1;
+  const int bytes = 4 * (32 * d + d * d) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const float* w = rotate ? wigner.data_ptr<float>() : nullptr;
+  const int64_t* offsets = rotate ? compact_offsets.data_ptr<int64_t>() : nullptr;
+  if (gather) {
+    uniform_transform_kernel<true><<<grid, 128, bytes, stream>>>(
+        src.data_ptr<float>(), out.data_ptr<float>(), w, offsets, block_table.data_ptr<int64_t>(),
+        n_edges, channels, dim, mmax, with_m0, rotate, wigner_stride);
+  } else {
+    uniform_transform_kernel<false><<<grid, 128, bytes, stream>>>(
+        src.data_ptr<float>(), out.data_ptr<float>(), w, offsets, block_table.data_ptr<int64_t>(),
+        n_edges, channels, dim, mmax, with_m0, rotate, wigner_stride);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
 
 torch::Tensor channel_pack_grad_fp32_cuda(
     torch::Tensor grad_packed,

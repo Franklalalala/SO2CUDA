@@ -324,6 +324,37 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor dot_out,
     torch::Tensor sum_out);
 
+torch::Tensor uniform_transform_fp32_cuda(
+    torch::Tensor src, torch::Tensor wigner, torch::Tensor compact_offsets, torch::Tensor block_table,
+    int64_t n_edges, int64_t channels, int64_t lmax, int64_t total_width, int64_t mmax,
+    bool with_m0, bool rotate, int64_t wigner_stride, bool gather);
+
+torch::Tensor uniform_transform_fp32(
+    torch::Tensor src, torch::Tensor wigner, torch::Tensor compact_offsets, torch::Tensor block_table,
+    int64_t n_edges, int64_t channels, int64_t lmax, int64_t total_width, int64_t mmax,
+    bool with_m0, bool rotate, int64_t wigner_stride, bool gather) {
+  TORCH_CHECK(src.is_cuda() && src.is_contiguous() && src.scalar_type() == torch::kFloat32,
+              "uniform transform requires contiguous CUDA fp32 input");
+  TORCH_CHECK(channels > 0 && channels % 32 == 0 && lmax >= 0 && lmax <= 8 &&
+              mmax >= 0 && mmax <= lmax && n_edges >= 0 && n_edges <= INT32_MAX,
+              "unsupported uniform transform shape");
+  TORCH_CHECK(block_table.device() == src.device() && block_table.is_contiguous() &&
+              block_table.scalar_type() == torch::kInt64 && block_table.numel() == 3 * (mmax + 1),
+              "invalid uniform block table");
+  const int64_t dim = channels * (lmax + 1) * (lmax + 1);
+  TORCH_CHECK(src.numel() == n_edges * (gather ? total_width : dim), "uniform input size mismatch");
+  if (rotate) {
+    TORCH_CHECK(wigner.device() == src.device() && wigner.is_contiguous() &&
+                wigner.scalar_type() == torch::kFloat32 && wigner.numel() == n_edges * wigner_stride,
+                "invalid compact Wigner data");
+    TORCH_CHECK(compact_offsets.device() == src.device() && compact_offsets.is_contiguous() &&
+                compact_offsets.scalar_type() == torch::kInt64 && compact_offsets.numel() > lmax,
+                "invalid compact Wigner offsets");
+  }
+  return uniform_transform_fp32_cuda(src, wigner, compact_offsets, block_table, n_edges, channels,
+                                     lmax, total_width, mmax, with_m0, rotate, wigner_stride, gather);
+}
+
 torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights);
 
 std::vector<torch::Tensor> block_complex_weight_grads_fp32_cuda(
@@ -1837,6 +1868,7 @@ std::vector<torch::Tensor> block_complex_backward_fp32(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("uniform_transform_fp32", &uniform_transform_fp32, "Uniform channel-tiled SO2 rotation fp32");
   m.def("fused_pair_forward_fp32", &fused_pair_forward_fp32, "SO2 MoE fused P0 pair forward fp32");
   m.def("fused_m0_forward_fp32", &fused_m0_forward_fp32, "SO2 MoE fused P0 m0 forward fp32");
   m.def("fused_pair_backward_fp32", &fused_pair_backward_fp32, "SO2 MoE fused P0 pair backward fp32");
