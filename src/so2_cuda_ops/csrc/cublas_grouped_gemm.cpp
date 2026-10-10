@@ -36,8 +36,13 @@ static void configure_math(cublasHandle_t handle, bool fast_tf32) {
       handle, fast_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
 }
 
+// cuBLAS runs FP32 grouped problems on a SIMT grouped kernel that is several times
+// slower than the kernels it selects for the same problems one at a time. The
+// grouped call only saves launches, so it is used when there are more than
+// ``loop_max`` non-empty problems; up to that count each problem is one GEMM.
 static void run_grouped_or_loop_gemm_fp32(
     cublasHandle_t handle,
+    int64_t loop_max,
     const std::vector<cublasOperation_t>& transa,
     const std::vector<cublasOperation_t>& transb,
     const std::vector<int>& m,
@@ -56,6 +61,37 @@ static void run_grouped_or_loop_gemm_fp32(
     const torch::Tensor& like) {
   const int active_groups = static_cast<int>(group_size.size());
   if (active_groups == 0) {
+    return;
+  }
+
+  bool loop = static_cast<int64_t>(active_groups) <= loop_max;
+#if !(defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 12050)
+  loop = true;
+#endif
+  if (loop) {
+    for (int group = 0; group < active_groups; ++group) {
+      TORCH_CHECK(group_size[group] == 1, "per-problem grouped GEMM only supports singleton groups");
+      check_cublas(cublasGemmEx(
+          handle,
+          transa[group],
+          transb[group],
+          m[group],
+          n[group],
+          k[group],
+          static_cast<const void*>(&alpha[group]),
+          reinterpret_cast<const void*>(a_array[group]),
+          CUDA_R_32F,
+          lda[group],
+          reinterpret_cast<const void*>(b_array[group]),
+          CUDA_R_32F,
+          ldb[group],
+          static_cast<const void*>(&beta[group]),
+          reinterpret_cast<void*>(c_array[group]),
+          CUDA_R_32F,
+          ldc[group],
+          compute_type,
+          CUBLAS_GEMM_DEFAULT));
+    }
     return;
   }
 
@@ -84,30 +120,6 @@ static void run_grouped_or_loop_gemm_fp32(
       active_groups,
       group_size.data(),
       compute_type));
-#else
-  for (int group = 0; group < active_groups; ++group) {
-    TORCH_CHECK(group_size[group] == 1, "fallback grouped GEMM only supports singleton groups");
-    check_cublas(cublasGemmEx(
-        handle,
-        transa[group],
-        transb[group],
-        m[group],
-        n[group],
-        k[group],
-        static_cast<const void*>(&alpha[group]),
-        reinterpret_cast<const void*>(a_array[group]),
-        CUDA_R_32F,
-        lda[group],
-        reinterpret_cast<const void*>(b_array[group]),
-        CUDA_R_32F,
-        ldb[group],
-        static_cast<const void*>(&beta[group]),
-        reinterpret_cast<void*>(c_array[group]),
-        CUDA_R_32F,
-        ldc[group],
-        compute_type,
-        CUBLAS_GEMM_DEFAULT));
-  }
 #endif
 }
 
@@ -115,7 +127,8 @@ torch::Tensor grouped_gemm_forward_fp32(
     torch::Tensor x,
     torch::Tensor ptr,
     torch::Tensor weight,
-    bool fast_tf32) {
+    bool fast_tf32,
+    int64_t loop_max) {
   TORCH_CHECK(x.is_cuda(), "x must be CUDA");
   TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
   TORCH_CHECK(!ptr.is_cuda(), "ptr must be CPU int64");
@@ -188,7 +201,7 @@ torch::Tensor grouped_gemm_forward_fp32(
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
   run_grouped_or_loop_gemm_fp32(
-      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
       c_array, ldc, group_size, compute_type, x);
 
   return y;
@@ -199,7 +212,8 @@ torch::Tensor grouped_gemm_backward_weight_fp32(
     torch::Tensor x,
     torch::Tensor ptr,
     int64_t groups,
-    bool fast_tf32) {
+    bool fast_tf32,
+    int64_t loop_max) {
   TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
   TORCH_CHECK(x.is_cuda(), "x must be CUDA");
   TORCH_CHECK(!ptr.is_cuda(), "ptr must be CPU int64");
@@ -270,7 +284,7 @@ torch::Tensor grouped_gemm_backward_weight_fp32(
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
   run_grouped_or_loop_gemm_fp32(
-      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
       c_array, ldc, group_size, compute_type, x);
 
   return grad_weight;
@@ -280,7 +294,8 @@ std::vector<torch::Tensor> grouped_gemm_multi_forward_fp32(
     std::vector<torch::Tensor> xs,
     std::vector<torch::Tensor> ptrs,
     std::vector<torch::Tensor> weights,
-    bool fast_tf32) {
+    bool fast_tf32,
+    int64_t loop_max) {
   const int64_t problems = static_cast<int64_t>(xs.size());
   TORCH_CHECK(problems == static_cast<int64_t>(ptrs.size()), "xs and ptrs must have the same length");
   TORCH_CHECK(problems == static_cast<int64_t>(weights.size()), "xs and weights must have the same length");
@@ -387,7 +402,7 @@ std::vector<torch::Tensor> grouped_gemm_multi_forward_fp32(
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
   run_grouped_or_loop_gemm_fp32(
-      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
       c_array, ldc, group_size, compute_type, xs[0]);
 
   return outputs;
@@ -397,7 +412,8 @@ std::vector<torch::Tensor> grouped_gemm_multi_backward_weight_fp32(
     std::vector<torch::Tensor> grad_outs,
     std::vector<torch::Tensor> xs,
     std::vector<torch::Tensor> ptrs,
-    bool fast_tf32) {
+    bool fast_tf32,
+    int64_t loop_max) {
   const int64_t problems = static_cast<int64_t>(xs.size());
   TORCH_CHECK(problems == static_cast<int64_t>(ptrs.size()), "xs and ptrs must have the same length");
   TORCH_CHECK(problems == static_cast<int64_t>(grad_outs.size()), "xs and grad_outs must have the same length");
@@ -503,7 +519,7 @@ std::vector<torch::Tensor> grouped_gemm_multi_backward_weight_fp32(
       fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
   run_grouped_or_loop_gemm_fp32(
-      handle, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
+      handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
       c_array, ldc, group_size, compute_type, xs[0]);
 
   return grad_weights;

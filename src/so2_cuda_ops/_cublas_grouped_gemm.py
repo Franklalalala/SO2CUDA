@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,25 @@ def _fast_tf32_enabled() -> bool:
     return truthy_env("SO2_CUDA_FAST_TF32") or truthy_env("DPTB_CUBLAS_GROUPED_FAST_TF32")
 
 
+def _loop_max(weights=None) -> int:
+    """Largest problem count the extension runs as one cuBLAS GEMM per problem.
+
+    cuBLAS's FP32 grouped kernel has no split-K: a weight gradient whose
+    reduction runs over all rows of one group becomes a handful of tiles. With a
+    single group per weight (one problem per m block) every problem is issued
+    on its own; with several groups the grouped call keeps the GPU busy and
+    saves launches. ``SO2_CUDA_GROUPED_GEMM_LOOP_MAX`` overrides the choice."""
+    value = os.environ.get("SO2_CUDA_GROUPED_GEMM_LOOP_MAX")
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    if weights is not None and all(int(w.shape[0]) == 1 for w in weights):
+        return 1 << 30
+    return 0
+
+
 class _GroupedGemmFunction(torch.autograd.Function):
     # setup_context style (forward without ctx) so this Function composes with
     # torch.func transforms, in particular torch.func.jvp used by the pixel
@@ -56,6 +76,7 @@ class _GroupedGemmFunction(torch.autograd.Function):
             ptr_cpu,
             weight_contig,
             bool(fast_tf32),
+            _loop_max((weight_contig,)),
         )
         return out
 
@@ -75,19 +96,25 @@ class _GroupedGemmFunction(torch.autograd.Function):
         x, ptr_cpu, weight = ctx.saved_tensors
         grad_out = grad_out.contiguous()
         ext = _load_extension()
-        grad_x = ext.grouped_gemm_forward_fp32(
-            grad_out,
-            ptr_cpu,
-            weight.transpose(1, 2).contiguous(),
-            ctx.fast_tf32,
-        )
-        grad_weight = ext.grouped_gemm_backward_weight_fp32(
-            grad_out,
-            x,
-            ptr_cpu,
-            int(weight.shape[0]),
-            ctx.fast_tf32,
-        )
+        loop_max = _loop_max((weight,))
+        grad_x = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_x = ext.grouped_gemm_forward_fp32(
+                grad_out,
+                ptr_cpu,
+                weight.transpose(1, 2).contiguous(),
+                ctx.fast_tf32,
+                loop_max,
+            )
+        if ctx.needs_input_grad[2]:
+            grad_weight = ext.grouped_gemm_backward_weight_fp32(
+                grad_out,
+                x,
+                ptr_cpu,
+                int(weight.shape[0]),
+                ctx.fast_tf32,
+                loop_max,
+            )
         return grad_x, None, grad_weight, None
 
     @staticmethod
@@ -98,11 +125,11 @@ class _GroupedGemmFunction(torch.autograd.Function):
         out_t = None
         if x_t is not None:
             out_t = ext.grouped_gemm_forward_fp32(
-                x_t.contiguous(), ptr_cpu, weight, ctx.fast_tf32
+                x_t.contiguous(), ptr_cpu, weight, ctx.fast_tf32, _loop_max((weight,))
             )
         if weight_t is not None:
             term = ext.grouped_gemm_forward_fp32(
-                x, ptr_cpu, weight_t.contiguous(), ctx.fast_tf32
+                x, ptr_cpu, weight_t.contiguous(), ctx.fast_tf32, _loop_max((weight,))
             )
             out_t = term if out_t is None else out_t + term
         return out_t
@@ -139,7 +166,7 @@ class _GroupedGemmMultiFunction(torch.autograd.Function):
                 raise RuntimeError(f"cublas_grouped_gemm currently requires float32, got x={x.dtype}, weight={weight.dtype}")
             if not x.is_cuda or not weight.is_cuda:
                 raise RuntimeError("cublas_grouped_gemm requires CUDA tensors")
-        outputs = _load_extension().grouped_gemm_multi_forward_fp32(xs, ptrs, weights, bool(fast_tf32))
+        outputs = _load_extension().grouped_gemm_multi_forward_fp32(xs, ptrs, weights, bool(fast_tf32), _loop_max(weights))
         ctx.num_problems = int(num_problems)
         ctx.fast_tf32 = bool(fast_tf32)
         ctx.save_for_backward(*(xs + ptrs + weights))
@@ -152,20 +179,36 @@ class _GroupedGemmMultiFunction(torch.autograd.Function):
         xs = list(saved[:num_problems])
         ptrs = list(saved[num_problems:2 * num_problems])
         weights = list(saved[2 * num_problems:])
-        grad_outputs = [grad.contiguous() for grad in grad_outputs]
+        grad_outputs = [grad.contiguous() if grad is not None else None for grad in grad_outputs]
         ext = _load_extension()
-        grad_xs = ext.grouped_gemm_multi_forward_fp32(
-            grad_outputs,
-            ptrs,
-            [weight.transpose(1, 2).contiguous() for weight in weights],
-            ctx.fast_tf32,
-        )
-        grad_weights = ext.grouped_gemm_multi_backward_weight_fp32(
-            grad_outputs,
-            xs,
-            ptrs,
-            ctx.fast_tf32,
-        )
+        loop_max = _loop_max(weights)
+        needs = ctx.needs_input_grad
+        # Each problem computes only the gradients autograd asks for.
+        x_problems = [p for p in range(num_problems) if needs[2 + p] and grad_outputs[p] is not None]
+        w_problems = [p for p in range(num_problems)
+                      if needs[2 + 2 * num_problems + p] and grad_outputs[p] is not None]
+        grad_xs = [None] * num_problems
+        grad_weights = [None] * num_problems
+        if x_problems:
+            values = ext.grouped_gemm_multi_forward_fp32(
+                [grad_outputs[p] for p in x_problems],
+                [ptrs[p] for p in x_problems],
+                [weights[p].transpose(1, 2).contiguous() for p in x_problems],
+                ctx.fast_tf32,
+                loop_max,
+            )
+            for p, value in zip(x_problems, values):
+                grad_xs[p] = value
+        if w_problems:
+            values = ext.grouped_gemm_multi_backward_weight_fp32(
+                [grad_outputs[p] for p in w_problems],
+                [xs[p] for p in w_problems],
+                [ptrs[p] for p in w_problems],
+                ctx.fast_tf32,
+                loop_max,
+            )
+            for p, value in zip(w_problems, values):
+                grad_weights[p] = value
         return (None, None, *grad_xs, *([None] * num_problems), *grad_weights)
 
 

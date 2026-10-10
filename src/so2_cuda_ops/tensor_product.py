@@ -1091,6 +1091,12 @@ def _scatter_m0_grad_radial_input_cuda(
     return grad_x, grad_radial
 
 
+def _cublas_loop_max(weight=None) -> int:
+    from so2_cuda_ops._cublas_grouped_gemm import _loop_max
+
+    return _loop_max(None if weight is None else (weight,))
+
+
 def _segmented_raw_linear_backward(
     x_pair: torch.Tensor,
     grad_raw: torch.Tensor,
@@ -1166,6 +1172,7 @@ def _cublas_segmented_raw_linear_backward(
         ptr_cpu,
         mixed_weight.transpose(1, 2).contiguous(),
         False,
+        _cublas_loop_max(mixed_weight),
     )
     if unorder is not None:
         grad_x_flat = grad_x_sorted.index_select(0, unorder)
@@ -1177,6 +1184,7 @@ def _cublas_segmented_raw_linear_backward(
         ptr_cpu,
         n_routes,
         False,
+        _cublas_loop_max(mixed_weight),
     )
     return grad_x_flat.reshape_as(x_pair), grad_weight
 
@@ -1209,6 +1217,7 @@ def _cublas_segmented_linear_backward(
         ptr_cpu,
         mixed_weight.transpose(1, 2).contiguous(),
         False,
+        _cublas_loop_max(mixed_weight),
     )
     if unorder is not None:
         grad_x_flat = grad_x_sorted.index_select(0, unorder)
@@ -1220,6 +1229,7 @@ def _cublas_segmented_linear_backward(
         ptr_cpu,
         n_routes,
         False,
+        _cublas_loop_max(mixed_weight),
     )
     return grad_x_flat.reshape_as(x_in), grad_weight
 
