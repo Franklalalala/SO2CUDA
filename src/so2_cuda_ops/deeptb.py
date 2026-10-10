@@ -350,12 +350,19 @@ def _routed_forward(x, layout, wigner, linears, radials, routing, schedule):
         return None
     from ._sandwich import _slot, full_sandwich, sandwich_plan
     slots = []
-    for order, inverse, ptr, *_ in routing.slots:
+    for order, inverse, ptr, *rest in routing.slots:
         if (ptr.is_cuda or ptr.ndim != 1 or ptr.numel() != experts + 1 or int(ptr[0]) != 0
                 or int(ptr[-1]) != n or order.numel() != n or inverse.numel() != n):
             return None
+        # The sorted expert ids of the slot are the group of every sorted row; using them
+        # avoids expanding the CPU pointer on the device (a synchronizing copy per layer).
+        sorted_ids = rest[0] if rest else None
+        if (sorted_ids is None or not torch.is_tensor(sorted_ids) or sorted_ids.shape != (n,)
+                or sorted_ids.device != x.device):
+            sorted_ids = None
         slots.append(_slot(inverse.to(device=x.device, dtype=torch.long),
-                           order.to(device=x.device, dtype=torch.long), ptr.to(torch.long), x.device))
+                           order.to(device=x.device, dtype=torch.long), ptr.to(torch.long), x.device,
+                           group_rows=None if sorted_ids is None else sorted_ids.to(torch.long)))
     if not sandwich_plan(layout, x.shape[1], x.device, with_m0=True).supported:
         return None
     values = routing.values.to(device=x.device, dtype=x.dtype)

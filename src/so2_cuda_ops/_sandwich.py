@@ -177,7 +177,10 @@ def _rowdot(a, b, pairs, n):
 
 
 def _rows_of(slot, n):
-    """Group of every block row of a grouped slot, as a device index [N] (computed once per slot)."""
+    """Group of every block row of a grouped slot, as a device index [N] (computed once per slot).
+
+    Callers that already hold the sorted group ids pass them to ``_slot``; otherwise they
+    are expanded from the CPU pointer, which costs one host-to-device copy."""
     if getattr(slot, "group_rows", None) is None:
         counts = (slot.ptr[1:] - slot.ptr[:-1]).to(slot.device)
         slot.group_rows = torch.repeat_interleave(torch.arange(counts.numel(), device=slot.device), counts,
@@ -397,8 +400,8 @@ class _Sandwich(torch.autograd.Function):
         return tuple(grads)
 
 
-def _slot(rows=None, order=None, ptr=None, device=None):
-    return SimpleNamespace(rows=rows, order=order, ptr=ptr, device=device)
+def _slot(rows=None, order=None, ptr=None, device=None, group_rows=None):
+    return SimpleNamespace(rows=rows, order=order, ptr=ptr, device=device, group_rows=group_rows)
 
 
 def _apply(x, plan, layout, wigner, *, w0=None, b0=None, pair_weights=(), radials=(), slots=None, gates=(),
