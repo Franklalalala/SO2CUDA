@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 import torch
 from e3nn import o3
 
-from operator_baselines import (NaiveOperator, SO2CUDAOperator, CueqOperator, ExplicitGEMMOperator,
+from operator_baselines import (ActivationOperator, NaiveOperator, SO2CUDAOperator, CueqOperator, ExplicitGEMMOperator,
                                 canonical_weights, prepare_geometry, uniform_irreps,
                                 SO2CUDA_CANDIDATES, so2cuda_candidate_environment)
 from operator_eqv3 import UnsupportedConfiguration
@@ -78,6 +78,8 @@ def make_operator(name, irreps_in, irreps_out, mmax, weights, geometry, eqv3_roo
         return NaiveOperator(*args)
     if name == "so2cuda":
         return SO2CUDAOperator(*args, candidate=so2cuda_candidate)
+    if name == "activation":
+        return ActivationOperator(*args)
     if name == "explicit_gemm":
         return ExplicitGEMMOperator(*args)
     if name == "cueq":

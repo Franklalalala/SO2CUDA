@@ -190,6 +190,45 @@ class SO2CUDAOperator(CanonicalOperator):
 SO2CUDA_CANDIDATES = ("dense_pairs", "dense_pairs_grouped", "true_dense_pairs")
 
 
+class ActivationOperator(CanonicalOperator):
+    """Public activation_forward (the PDQ-MoE entry) with one expert, top-1 and gate 1.
+
+    Every m block, m=0 included, is a routed LinearWeights holding the canonical weight
+    as a [1, out, in] view; the routing is the slot layout of an all-zero expert index.
+    Routing metadata is built once, outside the timed call."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        from so2_cuda_ops.deeptb import ActivationRouting, prepare_layout, prepare_wigner
+        device = self.weights[0].device
+        entries = lambda irreps: tuple((ir.l, mul, sl.start) for (mul, ir), sl in zip(irreps, irreps.slices()))
+        lmax = max(self.irreps_in.lmax, self.irreps_out.lmax)
+        self.layout = prepare_layout(entries(self.irreps_in), entries(self.irreps_out),
+                                     m_max=self.mmax, l_max=lmax, out_dim=self.irreps_out.dim, device=device)
+        n = len(self.geometry.vectors)
+        self.wigner = prepare_wigner(self.geometry.vectors.new_empty((n, self.irreps_in.dim)),
+                                     self.geometry.blocks, l_max=lmax)
+        if self.wigner is None:
+            raise ValueError("SO2CUDA requires CUDA FP32 and constant geometry")
+        index = torch.zeros(n, 1, dtype=torch.long, device=device)
+        order = torch.arange(n, device=device)
+        slot = (order, order, torch.tensor([0, n], dtype=torch.long), index[:, 0])
+        self.routing = ActivationRouting(index, torch.ones(n, 1, device=device), (slot,))
+        self.metadata = {"candidate": "activation_forward", "api": "so2_cuda_ops.deeptb.activation_forward",
+                         "feature_layout": "e3nn mul_ir",
+                         "routing": "one expert, top-1, gate 1; every m block routed, m=0 included"}
+        # m=0 runs inside the call, so the per-l blocks are not kept.
+        self.geometry = Geometry(None, None, None, None, ())
+
+    def forward(self, x):
+        from so2_cuda_ops.deeptb import LinearWeights, activation_forward
+        out = activation_forward(x, self.layout, self.wigner, tuple(LinearWeights(w.unsqueeze(0)) for w in self.weights),
+                                 None, self.routing)
+        if out is None:
+            raise RuntimeError("SO2CUDA activation_forward declined this configuration")
+        return out
+
+
 @contextmanager
 def so2cuda_candidate_environment(candidate):
     """Select the public environment control outside the measured region.

@@ -15,7 +15,7 @@ from e3nn import o3
 _examples = Path(__file__).resolve().parents[1] / "examples"
 sys.path.insert(0, str(_examples))
 from operator_baselines import (
-    CueqOperator, NaiveOperator, SO2CUDAOperator, ExplicitGEMMOperator,
+    ActivationOperator, CueqOperator, NaiveOperator, SO2CUDAOperator, ExplicitGEMMOperator,
     canonical_weights, prepare_geometry, uniform_irreps,
 )
 from operator_eqv3 import Eqv3Operator
@@ -108,7 +108,7 @@ _SHAPES = (
 
 @pytest.mark.parametrize("irreps_in,irreps_out,mmax", _SHAPES)
 @pytest.mark.parametrize("implementation,descriptor_name", [
-    ("so2cuda", None), ("explicit_gemm", None), ("cueq", "escn_tp"),
+    ("so2cuda", None), ("activation", None), ("explicit_gemm", None), ("cueq", "escn_tp"),
     ("cueq", "escn_tp_compact"), ("eqv3", None),
 ])
 def test_available_baselines_match_float64_reference(
@@ -142,6 +142,8 @@ def test_available_baselines_match_float64_reference(
                               prepare_geometry(vectors.double(), lmax))
     if implementation == "so2cuda":
         operator = SO2CUDAOperator(irreps_in, irreps_out, mmax, weights, geometry)
+    elif implementation == "activation":
+        operator = ActivationOperator(irreps_in, irreps_out, mmax, weights, geometry)
     elif implementation == "explicit_gemm":
         operator = ExplicitGEMMOperator(irreps_in, irreps_out, mmax, weights, geometry)
     elif implementation == "cueq":
