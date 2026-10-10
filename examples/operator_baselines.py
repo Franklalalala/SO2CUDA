@@ -140,7 +140,7 @@ class NaiveOperator(CanonicalOperator):
 
 
 class SO2CUDAOperator(CanonicalOperator):
-    """Public pair APIs with the caller-owned m=0 path used by DeePTB."""
+    """Public pair APIs, the m=0 term computed in the same call (``include_m0=True``)."""
 
     def __init__(self, *args, candidate="dense_pairs"):
         super().__init__(*args)
@@ -167,30 +167,24 @@ class SO2CUDAOperator(CanonicalOperator):
                          "forward_mode": ("indexed_sandwich_multi_grouped" if candidate == "dense_pairs_grouped"
                                           else "default" if candidate == "dense_pairs" else None)}
         self.metadata["feature_layout"] = "e3nn mul_ir"
-        self.geometry = Geometry(None, None, None, None, self.geometry.blocks)
+        self.metadata["m0"] = "include_m0=True: m=0 runs inside the public pair call"
+        # m=0 no longer needs the per-l blocks; only the packed Wigner data stay alive.
+        self.geometry = Geometry(None, None, None, None, ())
 
     def forward(self, x):
         from so2_cuda_ops.deeptb import dense_pairs, true_dense_pairs, LinearWeights
-        parts = []
-        for (mul, ir), block in zip(self.irreps_in, x.split([m*i.dim for m, i in self.irreps_in], dim=-1)):
-            part = block.reshape(len(x), mul, ir.dim)
-            parts.append(torch.einsum("ncd,nd->nc", part, self.geometry.blocks[ir.l][:, :, ir.l]))
-        y0 = F.linear(torch.cat(parts, dim=1), self.weights[0])
-        out = torch.cat([(part[:, :, None] * self.geometry.blocks[ir.l][:, None, :, ir.l]).flatten(1)
-                         for (mul, ir), part in zip(self.irreps_out, y0.split([m for m, _ in self.irreps_out], dim=-1))], dim=-1)
         if self.candidate == "true_dense_pairs":
-            contributions = true_dense_pairs(x, self.layout, self.wigner,
-                                              tuple(LinearWeights(w, routed=False) for w in self.weights), None)
+            parts = true_dense_pairs(x, self.layout, self.wigner,
+                                     tuple(LinearWeights(w, routed=False) for w in self.weights), None,
+                                     include_m0=True)
         else:
-            contributions = dense_pairs(x, self.layout, self.wigner,
-                                        tuple(w.unsqueeze(0) for w in self.weights), None, self.routing,
-                                        forward_mode=("indexed_sandwich_multi_grouped"
-                                                      if self.candidate == "dense_pairs_grouped" else None))
-        if contributions is None:
+            parts = dense_pairs(x, self.layout, self.wigner, tuple(w.unsqueeze(0) for w in self.weights), None,
+                                self.routing, include_m0=True,
+                                forward_mode=("indexed_sandwich_multi_grouped"
+                                              if self.candidate == "dense_pairs_grouped" else None))
+        if parts is None:
             raise RuntimeError("SO2CUDA public API declined this configuration")
-        for contribution in contributions:
-            out = out + contribution
-        return out
+        return parts[0]
 
 
 SO2CUDA_CANDIDATES = ("dense_pairs", "dense_pairs_grouped", "true_dense_pairs")
