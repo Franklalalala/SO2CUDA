@@ -313,3 +313,116 @@ def test_activation_routed_experts_rotated(radial):
     torch.testing.assert_close(actual.double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
     for a, b in zip(grads, ref_grads):
         torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)
+
+
+def _check_layer(fn, front, radial, bias=False, **case):
+    """Whole layer output (m = 0 included) of ``fn`` against float64, with every gradient."""
+    entries_in, entries_out, dim_in, dim_out, l_max, m_max, x64, blocks64, w64, r64 = _case(front, radial, **case)
+    n = x64.shape[0]
+    g = torch.Generator().manual_seed(17)
+    b64 = torch.randn(w64[0].shape[0], generator=g, dtype=torch.float64)
+    probe = torch.randn(n, dim_out, generator=g, dtype=torch.float64)
+    leaves = [x64] + list(w64) + ([b64] if bias else []) + (list(r64) if r64 is not None else [])
+    leaves = [t.clone().requires_grad_(True) for t in leaves]
+    nw = len(w64)
+    xr, wr, rr = leaves[0], leaves[1:1 + nw], leaves[1 + nw + int(bias):]
+    br = leaves[1 + nw] if bias else torch.zeros((), dtype=torch.float64)
+    ref = _reference_layer(xr, blocks64, entries_in, entries_out, wr, br, rr or None, front, dim_out,
+                           torch.ones(n, dtype=torch.float64))
+    ref_grads = torch.autograd.grad((ref * probe).sum(), leaves)
+
+    dev = "cuda"
+    cuda = [t.detach().float().to(dev).requires_grad_(True) for t in leaves]
+    x, ws = cuda[0], cuda[1:1 + nw]
+    b0 = cuda[1 + nw] if bias else None
+    rs = cuda[1 + nw + int(bias):] or None
+    layout = prepare_layout(entries_in, entries_out, m_max=m_max, l_max=l_max, out_dim=dim_out,
+                            device=dev, front=front)
+    wigner = prepare_wigner(x, tuple(b.float().to(dev) for b in blocks64), l_max=l_max)
+    parts = fn(x, layout, wigner, ws, b0, rs)
+    assert parts is not None and len(parts) == 1
+    grads = torch.autograd.grad((parts[0] * probe.float().to(dev)).sum(), cuda)
+    scale = ref.detach().abs().max()
+    torch.testing.assert_close(parts[0].double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
+    for a, b in zip(grads, ref_grads):
+        torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)
+
+
+def _true_dense_m0(x, layout, wigner, ws, b0, rs):
+    linears = (LinearWeights(ws[0], b0, routed=False),) + tuple(LinearWeights(w, routed=False) for w in ws[1:])
+    return true_dense_pairs(x, layout, wigner, linears, None if rs is None else tuple(rs), include_m0=True)
+
+
+def _dense_m0(x, layout, wigner, ws, b0, rs):
+    assert b0 is None
+    n = x.shape[0]
+    routing = DenseRouting(torch.zeros(n, dtype=torch.long, device=x.device), torch.tensor([0, 2 * n]))
+    return dense_pairs(x, layout, wigner, tuple(w.unsqueeze(0) for w in ws),
+                       None if rs is None else tuple(rs), routing, include_m0=True)
+
+
+@pytest.mark.parametrize("front", [True, False])
+@pytest.mark.parametrize("radial", [True, False])
+def test_true_dense_pairs_include_m0_rotated(front, radial):
+    _check_layer(_true_dense_m0, front, radial, bias=True)
+
+
+@pytest.mark.parametrize("front", [True, False])
+@pytest.mark.parametrize("radial", [True, False])
+def test_dense_pairs_include_m0_rotated(front, radial):
+    _check_layer(_dense_m0, front, radial)
+
+
+def test_pairs_include_m0_truncated_m_and_high_degree():
+    _check_layer(_true_dense_m0, True, True, bias=True, m_max=1)
+    _check_layer(_true_dense_m0, False, False, bias=False, m_max=0)
+    _check_layer(_dense_m0, False, True, entries=(HIGH_IN, HIGH_OUT))
+
+
+@pytest.mark.parametrize("front", [True, False])
+@pytest.mark.parametrize("radial", [True, False])
+def test_dense_pairs_grouped_include_m0_rotated(front, radial):
+    entries_in, entries_out, dim_in, dim_out, l_max, m_max, x64, blocks64, w64, r64 = _case(front, radial)
+    n = x64.shape[0]
+    gen = torch.Generator().manual_seed(19)
+    groups = 4
+    graph = torch.randint(0, groups - 1, (n,), generator=gen)
+    graph[graph == 2] = 3  # group 2 owns no edge: its weight gradients must be zero
+    graph[0] = 1  # not already sorted
+    wg64 = [torch.randn(groups, *w.shape, generator=gen, dtype=torch.float64) for w in w64]
+    probe = torch.randn(n, dim_out, generator=gen, dtype=torch.float64)
+    leaves = [x64] + wg64 + (list(r64) if r64 is not None else [])
+    leaves = [t.clone().requires_grad_(True) for t in leaves]
+    xr, wr, rr = leaves[0], leaves[1:1 + len(wg64)], leaves[1 + len(wg64):]
+    ref = torch.zeros(n, dim_out, dtype=torch.float64)
+    ones = torch.ones(n, dtype=torch.float64)
+    for gi in range(groups):
+        sel = (graph == gi).nonzero().flatten()
+        if sel.numel() == 0:
+            continue
+        part = _reference_layer(xr[sel], [b[sel] for b in blocks64], entries_in, entries_out,
+                                [w[gi] for w in wr], torch.zeros((), dtype=torch.float64),
+                                [r[sel] for r in rr] if rr else None, front, dim_out, ones[sel])
+        ref = ref.index_add(0, sel, part)
+    ref_grads = torch.autograd.grad((ref * probe).sum(), leaves)
+
+    dev = "cuda"
+    cuda = [t.detach().float().to(dev).requires_grad_(True) for t in leaves]
+    x, ws, rs = cuda[0], cuda[1:1 + len(wg64)], cuda[1 + len(wg64):]
+    layout = prepare_layout(entries_in, entries_out, m_max=m_max, l_max=l_max, out_dim=dim_out,
+                            device=dev, front=front)
+    wigner = prepare_wigner(x, tuple(b.float().to(dev) for b in blocks64), l_max=l_max)
+    graph_dev = graph.to(dev)
+    flat = graph_dev.repeat_interleave(2)
+    permute = torch.argsort(flat, stable=True)
+    unpermute = torch.argsort(permute)
+    counts = torch.bincount(flat, minlength=groups).cpu()
+    ptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+    routing = DenseRouting(graph_dev, ptr, permute, unpermute)
+    parts = dense_pairs(x, layout, wigner, tuple(ws), tuple(rs) if rs else None, routing, include_m0=True)
+    assert parts is not None and len(parts) == 1
+    grads = torch.autograd.grad((parts[0] * probe.float().to(dev)).sum(), cuda)
+    scale = ref.detach().abs().max()
+    torch.testing.assert_close(parts[0].double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
+    for a, b in zip(grads, ref_grads):
+        torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)

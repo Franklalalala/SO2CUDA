@@ -196,14 +196,42 @@ def _radials_fit(x, layout, radial_parts, first_m=1):
                for m in range(first_m, len(layout.maps)))
 
 
+def _dense_with_m0(x, layout, wigner, weights, radial_parts, routing):
+    """[whole layer output] of dense_pairs(include_m0=True), or None."""
+    if len(weights) != len(layout.maps) or not _radials_fit(x, layout, radial_parts, first_m=0):
+        return None
+    w0 = weights[0]
+    cin0, cout0 = layout.maps[0][0].numel(), layout.maps[0][2].numel()
+    if w0.ndim != 3 or w0.shape[1:] != (cout0, cin0) or w0.device != x.device or w0.dtype != x.dtype:
+        return None
+    from ._sandwich import _slot, full_sandwich, sandwich_plan
+    if not sandwich_plan(layout, x.shape[1], x.device, with_m0=True).supported:
+        return None
+    if w0.shape[0] == 1 and _single_group(x, layout, weights, routing):
+        out = full_sandwich(x, layout, wigner, w0[0], None, (None,) + tuple(w[0] for w in weights[1:]),
+                            radial_parts)
+    else:
+        grouping = _edge_grouping(x, layout, weights, routing)
+        if grouping is None or w0.shape[0] != grouping[0].numel() - 1:
+            return None
+        ptr_edges, order, rows = grouping
+        out = full_sandwich(x, layout, wigner, w0, None, weights, radial_parts,
+                            slots=[_slot(rows, order, ptr_edges, x.device)])
+    return None if out is None else [out]
+
+
 def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
                 weights: tuple[torch.Tensor, ...], radial_parts: tuple[torch.Tensor, ...] | None,
-                routing: DenseRouting, *, forward_mode: str | None = None):
+                routing: DenseRouting, *, forward_mode: str | None = None, include_m0: bool = False):
     """Return ordered m>0 contributions, or None before any unsupported computation.
 
     The caller forms its reference m=0 output first, then adds these contributions
     in order. ``weights`` includes an unused m=0 placeholder to preserve m indexing.
     Pair weights are [groups, 2*Cout_m, Cin_m]. Geometry is constant.
+
+    With ``include_m0=True``, ``weights[0]`` is the [groups, Cout_0, Cin_0] m=0
+    weight and ``radial_parts[0]`` its radial weight; the m=0 term is computed with
+    the pairs and the single returned tensor is the whole layer output.
     """
     if not _supported(x, wigner):
         return None
@@ -213,6 +241,8 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
              'indexed_sandwich_multi_grouped', 'cublas_multi_sandwich_grouped')
     if mode not in ('scalar',) + multi:
         return None
+    if include_m0:
+        return _dense_with_m0(x, layout, wigner, weights, radial_parts, routing)
     if mode in multi and _radials_fit(x, layout, radial_parts):
         from ._sandwich import block_sandwich, grouped_sandwich, sandwich_plan
         if _single_group(x, layout, weights, routing):

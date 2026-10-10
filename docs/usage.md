@@ -6,7 +6,8 @@ DeePTB 集成入口为 `so2_cuda_ops.deeptb`。模型构造、径向网络、专
 |---|---|
 | `prepare_layout`、`PairLayout` | 从 `(l, multiplicity, first_feature)` 构造各 m 的整数映射；同一层、设备可复用 |
 | `prepare_wigner`、`WignerData` | 接收 dense Wigner 张量或逐 l 的 compact blocks；几何不求导 |
-| `dense_pairs`、`DenseRouting` | 返回按 m 排序的 m>0 输出贡献；调用方先形成 m=0，再依次相加 |
+| `dense_pairs`、`DenseRouting` | 返回按 m 排序的 m>0 输出贡献；调用方先形成 m=0，再依次相加。`include_m0=True` 时 m=0 一并计算，返回整层输出 |
+| `true_dense_pairs` | 非 MoE dense 层（非路由 `LinearWeights`），返回值约定同 `dense_pairs`；`include_m0=True` 时含 m=0 的 bias 与径向块 |
 | `activation_forward`、`ActivationRouting`、`LinearWeights` | 激活空间 top-k 路由的 pack、分组线性层与输出 scatter |
 | `grouped_gemm`、`grouped_gemm_multi` | 可微的分段矩阵乘法，分别用于单组问题与多个 m 块 |
 | `permute_rows` | 双射行置换，反向用逆置换读取 |
@@ -15,7 +16,7 @@ DeePTB 集成入口为 `so2_cuda_ops.deeptb`。模型构造、径向网络、专
 
 `activation_forward` 的 `indices/values` 为 `[N,K]`，`slots` 每项为稳定排序的 `(order, inverse, ptr_cpu, sorted_expert_ids)`；`LinearWeights.weight` 为 `[experts,Dout,Din]`，非路由插值块为 `[Dout,Din]`。调用方已按模型定义折入共享专家时设置 `coefficients_sum_to_one=True`；否则传入未折入的共享权重。
 
-`dense_pairs` 的 `weights` 与 `radial_parts` 都按 m 编号，包含 m=0 占位。m>0 权重的输出维为 `2*Cout_m`；径向块为 `[N,Cin_m]`（front）或 `[N,Cout_m]`（back）。`DenseRouting.ptr` 描述展平后的 `[N,2]` pair 行，必要时携带对应双射置换。
+`dense_pairs` 的 `weights` 与 `radial_parts` 都按 m 编号，包含 m=0 占位。m>0 权重的输出维为 `2*Cout_m`；径向块为 `[N,Cin_m]`（front）或 `[N,Cout_m]`（back）。`DenseRouting.ptr` 描述展平后的 `[N,2]` pair 行，必要时携带对应双射置换。仅关键字参数 `include_m0=True` 时，`weights[0]` 为 m=0 权重 `[G,Cout_0,Cin_0]`，`radial_parts[0]` 为其径向块，返回只含一个张量（整层输出）的序列；默认 `include_m0=False` 的行为不变。
 
 CPU、非 FP32、autocast、`torch.func` 或 Wigner 求导时，SO2 接口返回 `None`，由 DeePTB 使用纯 PyTorch 参考路线。分组 GEMM 直接调用要求 CUDA FP32，单问题接口额外支持 JVP。内核执行异常直接向上传播。
 
