@@ -233,7 +233,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
       } else {
 #pragma unroll
         for (int d = 0; d < dim; ++d) {
-          r[j] = fmaf(v[d], __ldg(D + d * rs + j), r[j]);
+          r[j] = fmaf(v[d], D[d * rs + j], r[j]);
         }
       }
     }
@@ -315,7 +315,7 @@ __device__ __forceinline__ void gather_channel_from_blocks(
 #pragma unroll
       for (int j = 0; j < dim; ++j) {
         if (j - L <= reach && L - j <= reach) {
-          acc = fmaf(__ldg(D + d * rs + j), g[j], acc);
+          acc = fmaf(D[d * rs + j], g[j], acc);
         }
       }
     }
@@ -560,6 +560,233 @@ __global__ void channel_gather_from_blocks_kernel(
                                                       accumulate, out)));
 }
 
+// ---------------------------------------------------------------------------
+// Edge-tiled kernels: one thread block per edge. The edge's input row (rotation) or
+// its block rows summed over the copies (gather), its compact Wigner blocks and the
+// gathered output row live in shared memory, so every global access is a contiguous
+// row segment read or written by consecutive threads. The threads loop over the
+// channels of the edge; the per-channel arithmetic is the one of the kernels above.
+
+// Gather one channel of degree L from the staged block rows of one edge (block m of
+// the edge starts at table[3m] inside `rows`) and rotate it back into out[0..2L].
+template <int L>
+__device__ __forceinline__ void gather_channel_tile(
+    const float* rows,
+    const int32_t* __restrict__ cols,
+    int mtab,
+    const BlockSet& blocks,
+    const float* D,
+    float* out) {
+  constexpr int dim = 2 * L + 1;
+  float g[dim];
+#pragma unroll
+  for (int j = 0; j < dim; ++j) {
+    g[j] = 0.0f;
+  }
+  if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
+    g[L] = rows[blocks.table[0] + cols[0]];
+  }
+#pragma unroll
+  for (int m = 1; m <= L; ++m) {
+    if (m > mtab) {
+      break;
+    }
+    const int col = cols[m];
+    if (col < 0 || block_width(blocks, m) == 0) {
+      continue;
+    }
+    const float* in = rows + blocks.table[3 * m] + col;
+    g[L - m] = in[0];
+    g[L + m] = in[block_width(blocks, m)];
+  }
+  const int reach = mtab < L ? mtab : L;
+#pragma unroll
+  for (int d = 0; d < dim; ++d) {
+    float acc;
+    if (D == nullptr || L == 0) {
+      acc = g[d];
+    } else {
+      acc = 0.0f;
+#pragma unroll
+      for (int j = 0; j < dim; ++j) {
+        if (j - L <= reach && L - j <= reach) {
+          acc = fmaf(D[d * dim + j], g[j], acc);
+        }
+      }
+    }
+    out[d] = acc;
+  }
+}
+
+__device__ void gather_channel_tile_any(
+    const float* rows,
+    int l,
+    const int32_t* __restrict__ cols,
+    int mtab,
+    const BlockSet& blocks,
+    const float* D,
+    float* out) {
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    float acc = 0.0f;
+    for (int m = 0; m <= l && m <= mtab; ++m) {
+      const int col = cols[m];
+      if (col < 0 || block_width(blocks, m) == 0) {
+        continue;
+      }
+      const float* in = rows + blocks.table[3 * m] + col;
+      for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
+        const int j = p == 0 ? l - m : l + m;
+        const float g = in[p * block_width(blocks, m)];
+        acc = D == nullptr ? (d == j ? acc + g : acc) : fmaf(D[d * dim + j], g, acc);
+      }
+    }
+    out[d] = acc;
+  }
+}
+
+__device__ __forceinline__ void stage_wigner_row(const WignerRef& w, int64_t edge, int floats, float* sw) {
+  const float* __restrict__ row = w.data + edge * w.compact_stride;
+  for (int i = threadIdx.x; i < floats; i += blockDim.x) {
+    sw[i] = row[i];
+  }
+}
+
+__global__ void channel_rotate_edge_kernel(
+    const float* __restrict__ src,
+    int64_t src_stride,
+    int src_dim,
+    WignerRef w,
+    int wigner_floats,
+    const int32_t* __restrict__ ch_base,
+    const int32_t* __restrict__ ch_l,
+    const int32_t* __restrict__ ch_cols,
+    int cols_per_channel,
+    int mtab,
+    BlockSet blocks,
+    float* __restrict__ dst,
+    Copies copies,
+    int64_t n_edges,
+    int n_channels) {
+  extern __shared__ float smem[];
+  float* sx = smem;
+  float* sw = smem + src_dim;
+  const int64_t edge = blockIdx.x;
+  const float* __restrict__ row = src + edge * src_stride;
+  for (int i = threadIdx.x; i < src_dim; i += blockDim.x) {
+    sx[i] = row[i];
+  }
+  if (wigner_floats > 0) {
+    stage_wigner_row(w, edge, wigner_floats, sw);
+  }
+  __syncthreads();
+  for (int k = threadIdx.x; k < n_channels; k += blockDim.x) {
+    const int l = ch_l[k];
+    const float* v = sx + ch_base[k];
+    const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
+    const float* D = (wigner_floats > 0 && l > 0) ? sw + w.compact_offsets[l] : nullptr;
+    SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(v, cols, mtab, blocks, dst, copies, n_edges, edge, D,
+                                                         2 * LL + 1)),
+                        (rotate_channel_to_blocks_any(v, l, cols, mtab, blocks, dst, copies, n_edges, edge, D,
+                                                      2 * l + 1)));
+  }
+}
+
+__global__ void channel_gather_edge_kernel(
+    const float* __restrict__ src,
+    WignerRef w,
+    int wigner_floats,
+    const int32_t* __restrict__ ch_base,
+    const int32_t* __restrict__ ch_l,
+    const int32_t* __restrict__ ch_cols,
+    int cols_per_channel,
+    int mtab,
+    BlockSet blocks,
+    int n_blocks,
+    int total_width,
+    float* __restrict__ dst,
+    int64_t dst_stride,
+    int dst_dim,
+    bool zero_fill,
+    Copies copies,
+    bool accumulate,
+    int64_t n_edges,
+    int n_channels) {
+  extern __shared__ float smem[];
+  float* sg = smem;
+  float* sw = sg + total_width;
+  float* so = sw + wigner_floats;
+  const int64_t edge = blockIdx.x;
+  for (int i = threadIdx.x; i < total_width; i += blockDim.x) {
+    sg[i] = 0.0f;
+  }
+  __syncthreads();
+  for (int c = 0; c < copies.count; ++c) {
+    const int64_t row = copy_row(copies, c, n_edges, edge);
+    const float scale = copy_scale(copies, c, n_edges, edge);
+    const float* __restrict__ in_copy = src + c * copies.stride;
+    for (int m = 0; m < n_blocks; ++m) {
+      const int64_t prefix = blocks.table[3 * m];
+      const int stride = static_cast<int>(blocks.table[3 * m + 2]);
+      const float* __restrict__ seg = in_copy + n_edges * prefix + row * stride;
+      for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        sg[prefix + i] = fmaf(scale, seg[i], sg[prefix + i]);
+      }
+    }
+  }
+  if (wigner_floats > 0) {
+    stage_wigner_row(w, edge, wigner_floats, sw);
+  }
+  if (zero_fill) {
+    for (int i = threadIdx.x; i < dst_dim; i += blockDim.x) {
+      so[i] = 0.0f;
+    }
+  }
+  __syncthreads();
+  for (int k = threadIdx.x; k < n_channels; k += blockDim.x) {
+    const int l = ch_l[k];
+    const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
+    const float* D = (wigner_floats > 0 && l > 0) ? sw + w.compact_offsets[l] : nullptr;
+    float* out = so + ch_base[k];
+    SO2_DISPATCH_DEGREE(l, (gather_channel_tile<LL>(sg, cols, mtab, blocks, D, out)),
+                        (gather_channel_tile_any(sg, l, cols, mtab, blocks, D, out)));
+  }
+  __syncthreads();
+  float* __restrict__ out_row = dst + edge * dst_stride;
+  if (accumulate) {
+    for (int i = threadIdx.x; i < dst_dim; i += blockDim.x) {
+      out_row[i] += so[i];
+    }
+  } else {
+    for (int i = threadIdx.x; i < dst_dim; i += blockDim.x) {
+      out_row[i] = so[i];
+    }
+  }
+}
+
+// Threads per edge block: one warp per 32 channels, between 64 and 256.
+int edge_block_threads(int64_t n_channels) {
+  int64_t t = ((n_channels + 31) / 32) * 32;
+  return static_cast<int>(t < 64 ? 64 : (t > 256 ? 256 : t));
+}
+
+// Allows `bytes` of dynamic shared memory for `kernel`; false when the device cannot.
+template <typename Kernel>
+bool allow_shared_memory(Kernel kernel, int64_t bytes) {
+  if (bytes <= 48 * 1024) {
+    return true;
+  }
+  int device = 0;
+  int optin = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  if (bytes > optin) {
+    return false;
+  }
+  C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+  return true;
+}
+
 // [[A, -B], [B, A]] for every m block from the stacked [A; B] pair weights.
 // Each block holds `groups` stacked weights (one per routing group).
 struct WeightSet {
@@ -720,6 +947,20 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
   const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
                         edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
                         n_edges * total_width, static_cast<int>(copies)};
+  // Edge-tiled rotation for identity or compact Wigner data that fit in shared memory.
+  const int wigner_floats = w.mode == 2 ? static_cast<int>(w.compact_stride) : 0;
+  const int64_t edge_bytes = (src.size(1) + wigner_floats) * static_cast<int64_t>(sizeof(float));
+  if ((w.mode == 0 || w.mode == 2) && n_edges <= INT32_MAX && n_channels <= INT32_MAX &&
+      allow_shared_memory(channel_rotate_edge_kernel, edge_bytes)) {
+    channel_rotate_edge_kernel<<<static_cast<unsigned int>(n_edges), edge_block_threads(n_channels), edge_bytes,
+                                 stream>>>(
+        src.data_ptr<float>(), src.size(1), static_cast<int>(src.size(1)), w, wigner_floats,
+        ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
+        cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set,
+        n_edges, static_cast<int>(n_channels));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+  }
   channel_rotate_to_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), src.size(1), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
@@ -769,6 +1010,24 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
   const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
                         edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
                         src.numel() / copies, static_cast<int>(copies)};
+  // Edge-tiled gather for identity or compact Wigner data that fit in shared memory.
+  const int64_t total_width = n_edges > 0 ? src.numel() / copies / n_edges : 0;
+  const int n_blocks = cols_per_channel;
+  const int wigner_floats = w.mode == 2 ? static_cast<int>(w.compact_stride) : 0;
+  const int64_t edge_bytes = (total_width + wigner_floats + dst.size(1)) * static_cast<int64_t>(sizeof(float));
+  if ((w.mode == 0 || w.mode == 2) && n_edges <= INT32_MAX && n_channels <= INT32_MAX &&
+      total_width * n_edges * copies == src.numel() &&
+      allow_shared_memory(channel_gather_edge_kernel, edge_bytes)) {
+    channel_gather_edge_kernel<<<static_cast<unsigned int>(n_edges), edge_block_threads(n_channels), edge_bytes,
+                                 stream>>>(
+        src.data_ptr<float>(), w, wigner_floats,
+        ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
+        cols_per_channel, cols_per_channel - 1, blocks, n_blocks, static_cast<int>(total_width),
+        dst.data_ptr<float>(), dst.size(1), static_cast<int>(dst.size(1)), zero_fill, copy_set,
+        accumulate, n_edges, static_cast<int>(n_channels));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+  }
   channel_gather_from_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
