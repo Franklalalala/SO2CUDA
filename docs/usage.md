@@ -22,3 +22,7 @@ CPU、非 FP32、autocast、`torch.func` 或 Wigner 求导时，SO2 接口返回
 安装用 `pip install -e .`。`is_available()` 只报告 PyTorch 是否检测到 CUDA；第一次真正调用会 JIT 编译，也会验证本机工具链可用。无 CUDA 时可以正常导入包。
 
 环境变量：`SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR` 设置私有构建目录；`SO2_CUDA_FAST_TF32=0` 保持 FP32。DeePTB 适配层支持 `SO2_CUDA_BACKEND=off` 回退。公开示例见仓库首页。
+
+单算子的四种实现、参数映射及计时约定见 [算子对照说明](operator-benchmark.md)；运行 `python examples/so2_operator_speed_test.py --help` 查看形状、可选依赖和等价性检查选项。
+
+各实现的旋转、逐 m 线性与逆旋转调用链见 [源码核查](rotation-implementation-audit.md)，其中区分 Wigner 系数重排、indexed sandwich 的 CUDA pack/scatter 和独立的分组 GEMM。

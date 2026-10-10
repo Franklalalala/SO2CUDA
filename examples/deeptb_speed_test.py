@@ -21,7 +21,11 @@ import time
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("unitb", "dense", "both"), default="both")
-    parser.add_argument("--backend", choices=("reference", "cuda", "both"), default="both")
+    parser.add_argument("--backend", choices=("reference", "cuda", "cueq", "both", "cueq-check"), default="both")
+    parser.add_argument("--cueq-method", default="auto", help="Auto selects descriptors and methods on at most 64 layer edges")
+    parser.add_argument("--cueq-descriptor", choices=("escn_tp", "escn_tp_compact"), default="escn_tp",
+                        help="Descriptor for an explicit method; use compact with a whole-model method comparison")
+    parser.add_argument("--cueq-selection", type=Path, help="Freeze per-layer choices from the model equivalence JSON")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--edges", type=int, default=20000, help="Target directed edges, rounded up to complete cells")
     parser.add_argument("--side", type=int, default=5, help="Atoms along each axis of a periodic cubic cell")
@@ -146,11 +150,19 @@ def periodic_batch(model, args, torch):
     return batch, shape
 
 
-def select_backend(model, backend):
+def select_backend(model, backend, *, cueq_method="auto", cueq_descriptor="escn_tp", cueq_selection=None):
     """Swap ordinary child modules while preserving the original parameters."""
     from naive_baseline import install_naive_baseline
 
     handle = model.__dict__.get("_naive_execution_handle")
+    current = model.__dict__.get("_ordinary_execution_backend", "reference" if handle else "cuda")
+    if handle is not None and (backend != current or (backend == "cueq" and
+            (model.__dict__.get("_cueq_execution_method") != cueq_method or
+             model.__dict__.get("_cueq_execution_descriptor", "escn_tp") != cueq_descriptor or
+             model.__dict__.get("_cueq_execution_selection") != cueq_selection))):
+        handle.restore()
+        del model.__dict__["_naive_execution_handle"]
+        handle = None
     if backend == "reference":
         os.environ["SO2_CUDA_BACKEND"] = "off"
         if handle is None:
@@ -160,8 +172,18 @@ def select_backend(model, backend):
             handle.restore()
             del model.__dict__["_naive_execution_handle"]
         os.environ["SO2_CUDA_BACKEND"] = "auto"
+    elif backend == "cueq":
+        from cueq_baseline import install_cueq_baseline
+        os.environ["SO2_CUDA_BACKEND"] = "off"
+        if handle is None:
+            model.__dict__["_naive_execution_handle"] = install_cueq_baseline(
+                model, method=cueq_method, descriptor=cueq_descriptor, selection=cueq_selection)
+            model.__dict__["_cueq_execution_method"] = cueq_method
+            model.__dict__["_cueq_execution_descriptor"] = cueq_descriptor
+            model.__dict__["_cueq_execution_selection"] = copy.deepcopy(cueq_selection)
     else:
-        raise ValueError("backend must be reference or cuda")
+        raise ValueError("backend must be reference, cuda or cueq")
+    model.__dict__["_ordinary_execution_backend"] = backend
 
 
 def timing_summary(samples):
@@ -174,7 +196,9 @@ def timing_summary(samples):
 
 
 def measure(model, data, backend, args, torch, counters):
-    select_backend(model, backend)
+    select_backend(model, backend, cueq_method=getattr(args, "cueq_method", "auto"),
+                   cueq_descriptor=getattr(args, "cueq_descriptor", "escn_tp"),
+                   cueq_selection=getattr(args, "cueq_selection_data", None))
     buffers = {name: value.detach().clone() for name, value in model.named_buffers()}
     model.train()
     before = dict(counters)
@@ -279,7 +303,12 @@ def measure(model, data, backend, args, torch, counters):
         if result["dispatch"].get(expected, 0) == 0:
             raise RuntimeError(f"No successful {expected} dispatch; the accelerated route fell back")
     elif result["so2cuda_calls"]:
-        raise RuntimeError("Naive execution called SO2CUDA: " + str(result["so2cuda_calls"]))
+        raise RuntimeError("Ordinary execution called SO2CUDA: " + str(result["so2cuda_calls"]))
+    if backend == "cueq":
+        from cueq_baseline import cueq_execution_metadata
+        result["cueq_execution"] = cueq_execution_metadata(model)
+        if len(result["cueq_execution"]) != 6 or any(row["calls"] == 0 for row in result["cueq_execution"].values()):
+            raise RuntimeError("cuEquivariance did not execute every UniTB SO2 layer")
     if args.device.startswith("cuda"):
         result["peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
         result["peak_reserved_gib"] = torch.cuda.max_memory_reserved() / 2 ** 30
@@ -358,8 +387,8 @@ def main():
         gpu = properties.name
     else:
         gpu = None
-        if args.backend != "reference":
-            raise RuntimeError("The CUDA benchmark needs a CUDA device; CPU supports --backend reference")
+        if args.backend not in ("reference", "cueq"):
+            raise RuntimeError("The CUDA benchmark needs a CUDA device; CPU supports reference and cueq")
     counters = install_counters()
     from dptb.nn.build import build_model
     from dptb.nn.embedding.unitb_options import unitb_options
@@ -382,7 +411,16 @@ def main():
         "models": {},
     }
     models = ("unitb", "dense") if args.model == "both" else (args.model,)
+    selection_document = json.loads(args.cueq_selection.read_text()) if args.cueq_selection else None
     for name in models:
+        if selection_document is None:
+            args.cueq_selection_data = None
+        elif "models" in selection_document:
+            if selection_document.get("status") != "passed":
+                raise ValueError("Frozen model selection requires passed equivalence evidence")
+            args.cueq_selection_data = selection_document["models"][name]["cueq_execution"]
+        else:
+            args.cueq_selection_data = selection_document
         config_path = Path(__file__).parent / "configs" / ("unitb_dense.json" if name == "dense" else "unitb.json")
         config = json.loads(config_path.read_text(encoding="utf-8"))
         common = copy.deepcopy(config["common_options"])
@@ -399,15 +437,18 @@ def main():
                     "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
                     "parameters": sum(p.numel() for p in model.parameters()), "backends": {}}
         reference = accelerated = None
-        backends = ("reference", "cuda") if args.backend == "both" else (args.backend,)
+        backends = (("reference", "cuda") if args.backend == "both" else
+                    ("cuda", "cueq") if args.backend == "cueq-check" else (args.backend,))
+        snapshots = {}
         for backend in backends:
             if use_cuda:
                 torch.cuda.reset_peak_memory_stats()
             result, snapshot = measure(model, data, backend, args, torch, counters)
             evidence["backends"][backend] = result
+            snapshots[backend] = snapshot
             if backend == "reference":
                 reference = snapshot
-            else:
+            elif backend == "cuda":
                 accelerated = snapshot
             print(f"{label}/{backend}: forward={result['forward_ms']:.3f} ms, "
                   f"backward={result['backward_ms']:.3f} ms, total={result['forward_backward_ms']:.3f} ms, "
@@ -418,6 +459,10 @@ def main():
             print(f"{label}: speedup={evidence['speedup']:.3f}x, "
                   f"max output difference={evidence['differences']['training_outputs']['max_abs']:.6g}, "
                   f"max gradient difference={evidence['differences']['parameter_gradients']['max_abs']:.6g}", flush=True)
+        if "cueq" in snapshots and "cuda" in snapshots:
+            evidence["differences"] = differences(snapshots["cuda"], snapshots["cueq"], torch)
+            evidence["all_named_parameter_gradients_checked"] = True
+            print(f"{label}: cueq equivalence={all(row['passed'] for row in evidence['differences'].values())}", flush=True)
         report["models"][name] = evidence
         if "differences" in evidence and not all(v["passed"] for v in evidence["differences"].values()):
             raise RuntimeError(f"{label}: numerical equivalence failed")
