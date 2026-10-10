@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.3.1（2026-10-11）
+
+- 旋入与收集增加按边分块的 kernel：每条边一个线程块，输入行、Wigner 块和输出行经共享内存暂存，读写连续。混合阶数的 warp（如 `24x1o+16x2e+...`）也合并读写。
+- top-k 路由的 `activation_forward` 中，各槽共用一次旋入和一次收集：旋入一次写出 K 份按槽排序的副本，收集按门控加权求和后只旋回一次，反向同样各一次。各行的专家组号直接取自路由结果，不再每层把 CPU 端的段指针展开到 GPU。
+- 前置径向权重在旋入 kernel 中施加，后置径向权重在收集 kernel 中施加。带径向权重的层前向只保存输入（后置径向层另存径向缩放前的求和），反向重算旋入。以 [unitb_slem.json](examples/configs/unitb_slem.json) 在 2 万条边上训练一步，峰值显存 16.15 → 12.70 GiB。
+- 新增 UniTB-SLEM 合成配置 [examples/configs/unitb_slem.json](examples/configs/unitb_slem.json)。
+- 接口与数值约定不变。README 中的性能表仍是 0.3.0 的测量结果。
+
 ## 0.3.0（2026-10-10）
 
 - 新的块布局 sandwich 内核：每个 m 一块缓冲，(−m, +m) 成对存放，m>0 块的 2×2 复结构写成一个实数块权重，每块做一次 GEMM。旋入与收集各由一个按（边，通道）并行的 kernel 完成，反向复用同一套 kernel，不使用原子加。
