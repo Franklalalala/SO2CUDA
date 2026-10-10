@@ -80,6 +80,23 @@ def atomic_json(path, result):
     tmp.replace(path)
 
 
+def cueq_selection_basis(args):
+    """Attach the measured selection provenance without reusing any timings."""
+    path = getattr(args, "cueq_selection_basis_json", None)
+    if path is None:
+        return None
+    basis = json.loads(Path(path).read_text())
+    choice = getattr(args, "cueq_choice", None)
+    fields = ("descriptor", "method", "rotation")
+    if (basis.get("schema") != "so2-cueq-selection-basis-v1" or choice is None
+            or tuple(basis.get("choice", {}).get(key) for key in fields) != tuple(choice.split(","))
+            or basis.get("config_count") != len(basis.get("cases", []))
+            or not basis.get("source_sha256") or not basis.get("source_commits")
+            or basis.get("metric") != "forward_backward.median_ms"):
+        raise ValueError("cuEquivariance selection basis does not match the requested combination")
+    return basis
+
+
 def snapshot(op, x, upstream):
     op.zero_grad(set_to_none=True)
     x = op.input_to_native(x.detach()).detach().requires_grad_(True)
@@ -414,11 +431,19 @@ def run(args):
               "gpu": torch.cuda.get_device_name(), "precision": "strict FP32; TF32 disabled",
               "geometry": "Precomputed per implementation; input and all weight gradients included, no geometry gradient",
               "warmup": args.warmup, "iterations": args.iterations, "implementations": {}}
+    basis = cueq_selection_basis(args)
+    if basis is not None:
+        report["cueq_selection_basis"] = basis
     if allow_shared:
         report["measurement_class"] = "bounded functional smoke; shared GPU allowed; not formal timing evidence"
     # All full-shape configurations first pass an independent small equivalence case.
+    selected_choice = getattr(args, "cueq_choice", None)
+    check_descriptor, check_method, check_rotation = (
+        selected_choice.split(",") if selected_choice else ("escn_tp", "naive", "pytorch"))
     checks = equivalence_case(ii, io, mmax, args.edges if args.check_only else min(args.edges, 128),
-                              args.eqv3_root, [v for v in impls if v != "eqv3+compile"])
+                              args.eqv3_root, [v for v in impls if v != "eqv3+compile"],
+                              method=check_method, rotation=check_rotation,
+                              descriptor_name=check_descriptor)
     report["equivalence"] = checks
     if not checks["passed"]:
         report["status"] = "failed_equivalence"
@@ -589,6 +614,9 @@ def run_suite(args):
               "timing_contract": "native-layout-v2",
               "geometry": "Precomputed in each implementation's native layout, outside timing",
               "table_sessions": {group: task_id for case in cases for group in case["groups"]}}
+    basis = cueq_selection_basis(args)
+    if basis is not None:
+        report["cueq_selection_basis"] = basis
     if getattr(args, "allow_shared_gpu", False):
         report["measurement_class"] = "bounded functional smoke; shared GPU allowed; not formal timing evidence"
     report["provenance"]["equiformerv3_sha"] = EQV3_COMMIT
@@ -624,7 +652,7 @@ def run_suite(args):
                 row["implementations"] = result["equivalence"]["implementations"]
             else:
                 row["config"] = result["config"]
-                for field in ("implementations", "cueq_alternatives", "geometry_setup_seconds"):
+                for field in ("implementations", "cueq_alternatives", "geometry_setup_seconds", "cueq_selection_basis"):
                     if field in result:
                         row[field] = result[field]
         report["cases"].append(row)
@@ -663,6 +691,8 @@ def main():
                         help="Reuse matching unsupported/incorrect method evidence; never reuse timings")
     parser.add_argument("--cueq-choice", help="descriptor,method,rotation: time only this cuEquivariance "
                         "combination instead of scanning all of them")
+    parser.add_argument("--cueq-selection-basis-json", type=Path,
+                        help="Measured full-scan provenance for --cueq-choice; copied into the result")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()

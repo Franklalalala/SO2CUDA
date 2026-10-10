@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 from pathlib import Path
@@ -29,6 +30,8 @@ MODEL_LABELS = {"dense": "UniTB-dense", "unitb": "UniTB", "slem": "UniTB-SLEM"}
 GROUP_LABELS = {"A1": "Shape", "A2": "Edge count", "A3": "Truncated m", "A4": "Non-uniform irreps"}
 METHODS = {"naive", "uniform_1d", "fused_tp", "indexed_linear"}
 DESCRIPTORS = {"escn_tp", "escn_tp_compact"}
+CUEQ_CHOICE = {"descriptor": "escn_tp_compact", "method": "naive", "rotation": "pytorch"}
+CUEQ_SELECTION_FILE = "docs/benchmarks/CUEQ_SELECTION_SCAN.json"
 DECREASING_2 = "128x0e+64x1o+32x2e"
 DECREASING_4 = DECREASING_2 + "+16x3o+16x4e"
 V_SHAPE = "128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e"
@@ -176,22 +179,102 @@ def implementation(row, *, model=False, alternative=False, expected_samples=None
 
 
 def provenance(raw):
-    source = raw.get("provenance", raw.get("payload_source", {}))
     output = {}
     aliases = {"so2cuda": "SO2CUDA", "so2cuda_sha": "SO2CUDA", "deeptb": "DeePTB", "dptb_sha": "DeePTB",
                "deeptb_sha": "DeePTB", "equiformerv3": "EquiformerV3", "equiformerv3_sha": "EquiformerV3",
                "eqv3_sha": "EquiformerV3"}
-    values = {**source.get("commits", {}), **raw.get("commits", {}), **raw.get("source_commits", {}), **source}
-    for key, value in values.items():
-        name = aliases.get(key.lower().replace("_", "") if key.lower().replace("_", "") in aliases else key.lower())
-        if name and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value):
-            output[name] = value
     versions = {}
-    for key in ("torch", "cuda", "e3nn", "cuequivariance"):
-        value = source.get(key, source.get(key + "_version", raw.get(key + "_version")))
-        if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}[A-Za-z0-9+.-]*", value):
-            versions[key] = value
+    for source in (raw.get("payload_source", {}), raw.get("provenance", {}), raw):
+        values = {**source.get("commits", {}), **source.get("source_commits", {}), **source}
+        for key, value in values.items():
+            name = aliases.get(key.lower().replace("_", "") if key.lower().replace("_", "") in aliases else key.lower())
+            if name and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value):
+                if name in output and output[name] != value:
+                    raise ValueError("Conflicting recorded source commits for " + name)
+                output[name] = value
+        for key in ("torch", "cuda", "e3nn", "cuequivariance"):
+            value = source.get(key, source.get(key + "_version"))
+            if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}[A-Za-z0-9+.-]*", value):
+                versions[key] = value
     return {"source_commits": output, "versions": versions}
+
+
+def row_provenance(row, raw):
+    parent, own = provenance(raw), provenance(row)
+    return {key: {**parent[key], **own[key]} for key in ("source_commits", "versions")}
+
+
+def table_source_commits(rows, raw, *, operator):
+    """Keep a commit pin for every complete table, including mixed releases."""
+    tables = {}
+    recorded = raw.get("table_source_commits", raw.get("table_commits", {}))
+    for row in rows:
+        commits = row["source_commits"]
+        if "SO2CUDA" not in commits:
+            raise ValueError("Every table row must pin its SO2CUDA source commit")
+        for group in row["groups"] if operator else [row["model"]]:
+            if group in tables and tables[group] != commits:
+                raise ValueError("One table includes different source commits: " + group)
+            tables[group] = commits
+            if group in recorded and recorded[group] != commits:
+                raise ValueError("Table source commits disagree with its rows: " + group)
+    return tables
+
+
+def common_source_commits(tables):
+    values = list(tables.values())
+    return {key: value for key, value in values[0].items()
+            if all(row.get(key) == value for row in values)} if values else {}
+
+
+def cueq_selection_basis(raw):
+    """Publish the fixed choice and its immutable scan reference, never paths."""
+    if raw.get("schema") != "so2-cueq-selection-basis-v1" or raw.get("choice") != CUEQ_CHOICE:
+        raise ValueError("The cuEquivariance selection basis must pin compact/naive/PyTorch")
+    if (raw.get("config_count") != 12 or raw.get("alternatives_per_config") != 16
+            or raw.get("metric") != "forward_backward.median_ms"
+            or raw.get("evidence_file") != CUEQ_SELECTION_FILE):
+        raise ValueError("cuEquivariance selection must refer to the complete 12-by-16 uniform scan")
+    source_hash = raw.get("source_sha256")
+    if not isinstance(source_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+        raise ValueError("The cuEquivariance selection scan needs its original SHA256")
+    commits = provenance({"source_commits": raw.get("source_commits", {})})["source_commits"]
+    if (set(commits) != {"SO2CUDA", "DeePTB", "EquiformerV3"}
+            or commits["EquiformerV3"] != EQV3_SHA or commits["DeePTB"] != DEEPTB_SHA):
+        raise ValueError("The cuEquivariance selection scan needs its pinned source commits")
+    return {"schema": raw["schema"], "choice": dict(CUEQ_CHOICE), "source_sha256": source_hash,
+            "source_commits": commits, "evidence_file": CUEQ_SELECTION_FILE,
+            "config_count": 12, "alternatives_per_config": 16, "metric": raw["metric"]}
+
+
+def candidate_key(row):
+    return tuple(row.get(key) for key in ("descriptor", "method", "rotation"))
+
+
+def validate_cueq_candidates(chosen, alternatives, basis=None):
+    keys = [candidate_key(row) for row in alternatives]
+    expected = (set(itertools.product(DESCRIPTORS, METHODS, ("pytorch", "cueq")))
+                if basis is None else {candidate_key(CUEQ_CHOICE)})
+    if len(keys) != len(expected) or set(keys) != expected:
+        raise ValueError("cuEquivariance candidate records must cover the full scan or the pinned single choice")
+    if any(row["status"] not in ("passed", "N/A", "oom", "failed_equivalence") for row in alternatives):
+        raise ValueError("Incomplete or failed cuEquivariance candidate attempt")
+    if chosen["status"] == "passed":
+        if candidate_key(chosen) not in keys:
+            raise ValueError("Selected cuEquivariance implementation lacks a candidate record")
+        matching = alternatives[keys.index(candidate_key(chosen))]
+        if matching["status"] != "passed" or any(chosen[phase] != matching[phase]
+                for phase in ("forward", "forward_backward")):
+            raise ValueError("Selected cuEquivariance timing disagrees with its candidate record")
+        if basis is None:
+            successful = [row for row in alternatives if row["status"] == "passed"]
+            if chosen["forward_backward"]["median_ms"] != min(row["forward_backward"]["median_ms"] for row in successful):
+                raise ValueError("Selected cuEquivariance candidate is not the fastest valid measurement")
+    if basis is not None:
+        if chosen["status"] != "passed" and candidate_key(chosen) == (None, None, None):
+            chosen.update(CUEQ_CHOICE)
+        if candidate_key(chosen) != candidate_key(CUEQ_CHOICE):
+            raise ValueError("The cuEquivariance column differs from its pinned selection basis")
 
 
 def hardware(raw):
@@ -327,6 +410,7 @@ def operator_evidence(raw, *, required_groups=None):
         if set(OPERATOR_COLUMNS) - set(impls):
             raise ValueError("Operator configuration lacks requested implementations")
         row = {"groups": list(groups), "config": config, "warmup": warmup, "iterations": iterations,
+               **row_provenance(source, raw),
                "implementations": {name: implementation(impls[name], expected_samples=iterations) for name in OPERATOR_COLUMNS}}
         so2cuda = row["implementations"]["so2cuda"]
         if so2cuda["status"] == "passed" and (so2cuda.get("api") != "so2_cuda_ops.deeptb.true_dense_pairs"
@@ -343,8 +427,12 @@ def operator_evidence(raw, *, required_groups=None):
                 raise ValueError("These tables require cuEquivariance 0.12.0")
         row["cueq_alternatives"] = [implementation(value, alternative=True, expected_samples=iterations)
                                     for value in source.get("cueq_alternatives", [])]
-        if not row["cueq_alternatives"]:
-            raise ValueError("cuEquivariance candidate records are missing")
+        basis = source.get("cueq_selection_basis")
+        if basis is None and len(row["cueq_alternatives"]) != 16:
+            basis = raw.get("cueq_selection_basis")
+        if basis is not None:
+            row["cueq_selection_basis"] = cueq_selection_basis(basis)
+        validate_cueq_candidates(cueq, row["cueq_alternatives"], row.get("cueq_selection_basis"))
         if "A4" in groups:
             for name in ("eqv3", "eqv3+compile"):
                 if row["implementations"][name]["status"] != "N/A":
@@ -360,9 +448,108 @@ def operator_evidence(raw, *, required_groups=None):
         actual = {operator_configuration(r["config"]) for r in cases if group in r["groups"]}
         if actual != configurations:
             raise ValueError("Operator " + group + " table is incomplete")
-    return {"schema": "so2cuda-public-operator-benchmarks-v3", "hardware": "NVIDIA H200", "precision": "FP32",
+    tables = table_source_commits(cases, raw, operator=True)
+    return {"schema": "so2cuda-public-operator-benchmarks-v4", "hardware": "NVIDIA H200", "precision": "FP32",
             "tf32": False, "geometry_precomputed": True, "feature_layout_conversion_timed": False,
-            **provenance(raw), "cases": cases}
+            **provenance(raw), "source_commits": common_source_commits(tables),
+            "table_source_commits": tables, "cases": cases}
+
+
+def cueq_selection_scan(raw, basis):
+    """Preserve all original candidates without declaring a partial suite complete."""
+    summaries = basis.get("cases")
+    basis = cueq_selection_basis(basis)
+    hardware(raw)
+    require_precision(raw)
+    sources = list(operator_rows(raw))
+    if len(sources) != basis["config_count"]:
+        raise ValueError("The selection scan must contain the twelve original complete configurations")
+    check_table_sessions(sources, raw, operator=True)
+    cases = []
+    for source in sources:
+        if source.get("status") not in ("completed", "complete", "passed"):
+            raise ValueError("The selection scan contains an incomplete configuration")
+        config = source["config"]
+        config = {"irreps_in": irreps(config["irreps_in"]), "irreps_out": irreps(config["irreps_out"]),
+                  "mmax": number(config["mmax"]), "edges": number(config["edges"])}
+        shape = uniform(config["irreps_in"])
+        if not shape or config["irreps_in"] != config["irreps_out"] or config["mmax"] != shape[0]:
+            raise ValueError("The selection scan requires uniform, untruncated configurations")
+        config["lmax"], config["channels"] = shape
+        warmup = number(source.get("warmup", raw.get("warmup")))
+        iterations = number(source.get("iterations", raw.get("iterations")))
+        if warmup < 5 or iterations < 20:
+            raise ValueError("The selection scan lacks the operator timing protocol")
+        chosen_source = source["implementations"]["cueq"]
+        chosen = implementation(chosen_source, expected_samples=iterations)
+        alternatives = [implementation(row, alternative=True, expected_samples=iterations)
+                        for row in source.get("cueq_alternatives", [])]
+        validate_cueq_candidates(chosen, alternatives)
+        if chosen["status"] != "passed" or candidate_key(chosen) != candidate_key(CUEQ_CHOICE):
+            raise ValueError("The original uniform scan does not support the fixed cuEquivariance choice")
+        equivalence = equivalence_evidence(chosen_source["equivalence"])
+        source_commits = row_provenance(source, raw)["source_commits"]
+        if any(value != basis["source_commits"].get(key) for key, value in source_commits.items()):
+            raise ValueError("The original selection scan source differs from its selection basis")
+        cases.append({"config": config, "warmup": warmup, "iterations": iterations,
+                      "selected": chosen, "selected_equivalence": equivalence,
+                      "cueq_alternatives": alternatives})
+    configurations = [operator_configuration(row["config"]) for row in cases]
+    if (len(configurations) != len(set(configurations))
+            or not expected_operator_tables()["A1"] <= set(configurations)
+            or not set(configurations) <= expected_operator_tables()["A1"] | expected_operator_tables()["A2"]):
+        raise ValueError("The selection scan must preserve the original shape and edge-count grid")
+    if summaries is not None:
+        check_cueq_scan_summaries(summaries, cases)
+    return {"schema": "so2cuda-public-cueq-selection-scan-v1", "hardware": "NVIDIA H200",
+            "precision": "FP32", "tf32": False, "selection_basis": basis, "cases": cases}
+
+
+def check_cueq_scan_summaries(summaries, cases):
+    expected = {}
+    for case in cases:
+        successful = sorted(row["forward_backward"]["median_ms"] for row in case["cueq_alternatives"]
+                            if row["status"] == "passed")
+        expected[operator_configuration(case["config"])] = (
+            CUEQ_CHOICE, successful[0], successful[1], len(case["cueq_alternatives"]))
+    actual = {}
+    for row in summaries:
+        key = operator_configuration(row["config"])
+        if key in actual:
+            raise ValueError("Duplicate cuEquivariance selection summary")
+        actual[key] = (row["selected"], number(row["selected_median_ms"]),
+                       number(row["runner_up_median_ms"]), row["candidate_count"])
+    if actual != expected:
+        raise ValueError("cuEquivariance selection summaries differ from the original full scan")
+
+
+def selection_scan_artifact(raw, path=None):
+    references = ([raw["cueq_selection_basis"]] if "cueq_selection_basis" in raw else [])
+    references.extend(row["cueq_selection_basis"] for row in operator_rows(raw) if "cueq_selection_basis" in row)
+    if not references:
+        if path is not None or "cueq_selection_scan" in raw:
+            raise ValueError("The selection scan is missing its explicit selection basis")
+        return None
+    bases = [cueq_selection_basis(value) for value in references]
+    if any(value != bases[0] for value in bases):
+        raise ValueError("Operator tables refer to different cuEquivariance selection scans")
+    embedded = raw.get("cueq_selection_scan")
+    if path is not None:
+        if digest(path) != bases[0]["source_sha256"]:
+            raise ValueError("The original cuEquivariance selection scan SHA256 differs from its basis")
+        original = load(path)
+        if embedded is not None and embedded != original:
+            raise ValueError("Embedded and original cuEquivariance selection scans disagree")
+    else:
+        if (embedded is None or raw.get("cueq_selection_session", {}).get("raw_sha256")
+                != bases[0]["source_sha256"]):
+            raise ValueError("The operator aggregate must retain its original cuEquivariance selection scan and digest")
+        original = embedded
+    scan = cueq_selection_scan(original, references[0])
+    for reference in references[1:]:
+        if "cases" in reference:
+            check_cueq_scan_summaries(reference["cases"], scan["cases"])
+    return scan
 
 
 def model_rows(raw):
@@ -413,7 +600,7 @@ def model_evidence(raw):
         if set(backends) != set(MODEL_COLUMNS):
             raise ValueError("A model/head row needs all three requested backends")
         row = {"model": model, "head": head, "warmup": warmup, "iterations": iterations,
-               "batch_stream": {**means, "sha256": fingerprint}, **provenance(source),
+               "batch_stream": {**means, "sha256": fingerprint}, **row_provenance(source, raw),
                "implementations": {name: implementation(backends[name], model=True, expected_samples=iterations) for name in MODEL_COLUMNS}}
         for backend in backends.values():
             own_hash = backend.get("batch_stream_sha256", fingerprint)
@@ -427,9 +614,11 @@ def model_evidence(raw):
     actual = [(r["model"], r["head"]) for r in cases]
     if set(actual) != expected or len(actual) != len(expected):
         raise ValueError("Real-batch table needs each of three models and two heads exactly once")
-    return {"schema": "so2cuda-public-real-batch-benchmarks-v1", "hardware": "NVIDIA H200", "precision": "FP32",
+    tables = table_source_commits(cases, raw, operator=False)
+    return {"schema": "so2cuda-public-real-batch-benchmarks-v2", "hardware": "NVIDIA H200", "precision": "FP32",
             "tf32": False, "optimizer": "HybridMuon", "optimizer_mode": "fast", "batch_size_limit": 32,
-            **provenance(raw), "cases": sorted(cases, key=lambda r: (list(MODEL_LABELS).index(r["model"]), r["head"] == "hopping"))}
+            **provenance(raw), "source_commits": common_source_commits(tables), "table_source_commits": tables,
+            "cases": sorted(cases, key=lambda r: (list(MODEL_LABELS).index(r["model"]), r["head"] == "hopping"))}
 
 
 def equivalence_evidence(raw, *, require_pass=True):
@@ -549,7 +738,10 @@ def operator_tables(report, groups):
                     if impl["status"] != "passed"})
     if notes:
         lines.extend(["", *["- " + text for text in notes]])
-    lines.extend(["", "All candidate timings and unsupported combinations are recorded in [operator JSON](docs/benchmarks/OP_SPEED_H200.json).", "", "</details>", ""])
+    evidence_note = "Measured candidate timings and unsupported combinations are recorded in [operator JSON](docs/benchmarks/OP_SPEED_H200.json)."
+    if any("cueq_selection_basis" in row for row in report["cases"]):
+        evidence_note += " The original 12-configuration full scan is recorded in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json)."
+    lines.extend(["", evidence_note, "", "</details>", ""])
     return "\n".join(lines)
 
 
@@ -591,6 +783,22 @@ def protocol(cases):
     return span(warmups), span(iterations)
 
 
+def so2cuda_version_sentence(operator, model):
+    versions = {}
+    for group in GROUP_LABELS:
+        sha = operator["table_source_commits"][group]["SO2CUDA"]
+        versions.setdefault(sha, []).append(group)
+    for name, label in MODEL_LABELS.items():
+        sha = model["table_source_commits"][name]["SO2CUDA"]
+        versions.setdefault(sha, []).append(label)
+    def commit_link(sha):
+        return f"[`{sha[:8]}`](https://github.com/Franklalalala/SO2CUDA/tree/{sha})"
+    if len(versions) == 1:
+        return "All operator and model tables use SO2CUDA commit " + commit_link(next(iter(versions))) + "."
+    parts = [commit_link(sha) + " for " + ", ".join(labels) for sha, labels in versions.items()]
+    return "The SO2CUDA source commits are " + "; ".join(parts) + "."
+
+
 def render(operator, model, equiv_op, equiv_model):
     op_warmup, op_iterations = protocol(operator["cases"])
     model_warmup, model_iterations = protocol(model["cases"])
@@ -601,6 +809,16 @@ def render(operator, model, equiv_op, equiv_model):
     if len(cueq_versions) != 1:
         raise ValueError("Exactly one measured cuEquivariance version is required")
     cueq_version = next(iter(cueq_versions))
+    fixed_choice = any("cueq_selection_basis" in row for row in operator["cases"])
+    cueq_description = (
+        "`SegmentedPolynomial` with `escn_tp_compact`, method `naive`, and precomputed PyTorch Wigner `bmm` rotation. "
+        "All 16 descriptor/method/rotation combinations were compared on 12 uniform configurations; this combination "
+        "was the fastest numerically correct choice in every configuration. The complete scan is retained in "
+        "[selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json), and the tables use this fixed choice."
+        if fixed_choice else
+        "`SO3` irreps with `escn_tp` or `escn_tp_compact`, executed by `SegmentedPolynomial`. "
+        "The selected method and rotation are listed below; alternatives and unsupported combinations are retained in the JSON. "
+        "PyTorch rotation uses precomputed Wigner `bmm`; the `cueq` rotation choice uses the public `Rotation` interface.")
     nonuniform = [r for r in operator["cases"] if "A4" in r["groups"]]
     configurations = []
     for config in (r["config"] for r in nonuniform):
@@ -615,8 +833,8 @@ def render(operator, model, equiv_op, equiv_model):
              "- **SO2CUDA:** the public `true_dense_pairs(..., include_m0=True)` interface, with default settings, computes the complete layer.",
              "- **Our pure PyTorch:** our implementation of [DeePTB upstream `SO2_Linear`](https://github.com/deepmodeling/DeePTB/blob/1dcc7f61480c373870cd5bad1d4000ac80757ff5/dptb/nn/tensor_product.py), in [operator_baselines.py](examples/operator_baselines.py). It is authored here from that computation pattern.",
              f"- **EquiformerV3:** the original `SO3Rotation` and `SO2Linear` at [commit `{EQV3_SHA[:8]}`](https://github.com/atomicarchitects/equiformer_v3/tree/{EQV3_SHA}), with m=0 bias set to zero. Eager and `torch.compile(dynamic=True)` are measured separately; compilation is outside steady-state timing.",
-             f"- **cuEquivariance {cueq_version}:** `SO3` irreps with `escn_tp` or `escn_tp_compact`, executed by `SegmentedPolynomial`. The selected method and rotation are listed below; alternatives and unsupported combinations are retained in the JSON. PyTorch rotation uses precomputed Wigner `bmm`; the `cueq` rotation choice uses the public `Rotation` interface.", "",
-             f"Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has {op_warmup} warmup iterations and {op_iterations} measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.", "",
+             f"- **cuEquivariance {cueq_version}:** " + cueq_description, "",
+             f"Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. {so2cuda_version_sentence(operator, model)} Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has {op_warmup} warmup iterations and {op_iterations} measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.", "",
              "#### 1.1 Uniform irreps", "", operator_tables(operator, ("A1", "A2", "A3")),
              "#### 1.2 Non-uniform irreps", "", "The configurations below use decreasing channels, UniTB's V-shaped hidden channels, and unequal input/output irreps:", "",
              "| Configuration | Input irreps | Output irreps |", "|---|---|---|"]
@@ -639,7 +857,8 @@ def render(operator, model, equiv_op, equiv_model):
                   "Reproduce an operator comparison from the repository root. The environment must already contain CUDA-enabled PyTorch, compatible cuBLAS, and the standard Python dependencies (NumPy, SciPy, SymPy, NetworkX, opt-einsum, tqdm, nvidia-ml-py, and platformdirs). `--no-deps` preserves that environment; measured software versions are recorded in the JSON:", "", "```bash",
                   f"pip install --no-deps cuequivariance=={cueq_version} cuequivariance-torch=={cueq_version} cuequivariance-ops-cu12=={cueq_version} cuequivariance-ops-torch-cu12=={cueq_version}",
                   f"git clone https://github.com/atomicarchitects/equiformer_v3.git && git -C equiformer_v3 checkout {EQV3_SHA}",
-                  "python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup 5 --iterations 20 --json operator.json",
+                  "python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup 5 --iterations 20" +
+                  (" --cueq-choice escn_tp_compact,naive,pytorch" if fixed_choice else "") + " --json operator.json",
                   "```", "", "### 2. UniTB models on real training batches", "",
                   "UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. Both onsite and hopping heads use the production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; the tables report the measured mean structure and directed-edge counts for each fixed batch stream.", "",
                   f"For each model and head, all backends use the same structures in the same order, with {model_warmup} warmup steps and {model_iterations} measured steps on NVIDIA H200. We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, [our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. The main tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. Forward + backward timing excluding the optimizer appears in the details.", "",
@@ -664,23 +883,21 @@ def replace_section(readme, section):
 
 
 def verify_sources(operator, model):
-    op_commits = operator["source_commits"]
-    if set(op_commits) != {"SO2CUDA", "DeePTB", "EquiformerV3"}:
-        raise ValueError("Operator source commit provenance must pin SO2CUDA, DeePTB, and EquiformerV3")
-    eq_sha = op_commits.get("EquiformerV3")
-    if eq_sha is not None and not EQV3_SHA.startswith(eq_sha):
-        raise ValueError("EquiformerV3 benchmark used another source commit")
-    models = [row["source_commits"] for row in model["cases"]]
-    if any(not {"SO2CUDA", "DeePTB"} <= set(row) for row in models):
-        raise ValueError("Every model/head result must pin SO2CUDA and DeePTB")
-    if op_commits["DeePTB"] != DEEPTB_SHA or any(row["DeePTB"] != DEEPTB_SHA for row in models):
-        raise ValueError("Real-batch measurements must use the pinned DeePTB release")
-    for name in ("SO2CUDA", "DeePTB"):
-        measured = {row[name] for row in models if name in row}
-        if name in op_commits:
-            measured.add(op_commits[name])
-        if len(measured) > 1:
-            raise ValueError("Operator and model tables measured different " + name + " source commits")
+    op_tables = table_source_commits(operator["cases"], operator, operator=True)
+    model_tables = table_source_commits(model["cases"], model, operator=False)
+    for commits in op_tables.values():
+        if set(commits) != {"SO2CUDA", "DeePTB", "EquiformerV3"}:
+            raise ValueError("Every operator table must pin SO2CUDA, DeePTB, and EquiformerV3")
+        if commits["EquiformerV3"] != EQV3_SHA:
+            raise ValueError("EquiformerV3 benchmark used another source commit")
+    for commits in model_tables.values():
+        if not {"SO2CUDA", "DeePTB"} <= set(commits):
+            raise ValueError("Every model/head result must pin SO2CUDA and DeePTB")
+    for commits in (*op_tables.values(), *model_tables.values()):
+        if any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in commits.values()):
+            raise ValueError("Source commits must be full forty-character SHA values")
+        if commits["DeePTB"] != DEEPTB_SHA:
+            raise ValueError("Real-batch measurements must use the pinned DeePTB release")
 
 
 def main():
@@ -689,6 +906,8 @@ def main():
     parser.add_argument("--model-json", type=Path, required=True)
     parser.add_argument("--equiv-operator-json", type=Path, required=True)
     parser.add_argument("--equiv-model-json", type=Path, required=True)
+    parser.add_argument("--cueq-selection-json", type=Path,
+                        help="Original full 12-configuration cuEquivariance scan (otherwise use the aggregate's embedded scan)")
     root = Path(__file__).resolve().parents[1]
     parser.add_argument("--readme", type=Path, default=root / "README.md")
     parser.add_argument("--docs-dir", type=Path, default=root / "docs/benchmarks")
@@ -697,16 +916,22 @@ def main():
     args = parser.parse_args()
     if args.check and args.write_readme:
         parser.error("--check and --write-readme are mutually exclusive")
-    operator = operator_evidence(load(args.operator_json))
+    raw_operator = load(args.operator_json)
+    operator = operator_evidence(raw_operator)
+    selection_scan = selection_scan_artifact(raw_operator, args.cueq_selection_json)
     model = model_evidence(load(args.model_json))
     verify_sources(operator, model)
     equiv_op = equivalence_evidence(load(args.equiv_operator_json))
     equiv_model = equivalence_evidence(load(args.equiv_model_json))
     inputs = {"operator": digest(args.operator_json), "model": digest(args.model_json),
               "equiv_operator": digest(args.equiv_operator_json), "equiv_model": digest(args.equiv_model_json)}
+    if selection_scan is not None:
+        inputs["cueq_selection_scan"] = selection_scan["selection_basis"]["source_sha256"]
     section = render(operator, model, equiv_op, equiv_model)
     artifacts = {"OP_SPEED_H200": operator, "MODEL_BS32_H200": model,
                  "EQUIV_OP_L40S": equiv_op, "EQUIV_MODEL": equiv_model}
+    if selection_scan is not None:
+        artifacts["CUEQ_SELECTION_SCAN"] = selection_scan
     expected = {args.docs_dir / (name + ".json"): json.dumps({**value, "input_sha256": inputs}, indent=2,
                 ensure_ascii=False, allow_nan=False) + "\n" for name, value in artifacts.items()}
     expected[args.docs_dir / "README_SECTION.md"] = section

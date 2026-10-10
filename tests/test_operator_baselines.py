@@ -1,5 +1,6 @@
 """Numerical contracts for the optional original/public operator baselines."""
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -21,6 +22,21 @@ from operator_baselines import (
 from operator_eqv3 import Eqv3Operator
 from so2_operator_speed_test import metric
 import so2_operator_speed_test as speed
+
+
+def test_selection_basis_requires_matching_measured_combination(tmp_path):
+    path = tmp_path / "selection.json"
+    basis = {"schema": "so2-cueq-selection-basis-v1",
+             "choice": {"descriptor": "escn_tp_compact", "method": "naive", "rotation": "pytorch"},
+             "source_sha256": "a" * 64, "source_commits": {"SO2CUDA": "b" * 40},
+             "metric": "forward_backward.median_ms", "config_count": 1,
+             "cases": [{"id": "uniform"}]}
+    path.write_text(json.dumps(basis))
+    args = SimpleNamespace(cueq_choice="escn_tp_compact,naive,pytorch", cueq_selection_basis_json=path)
+    assert speed.cueq_selection_basis(args) == basis
+    args.cueq_choice = "escn_tp,naive,pytorch"
+    with pytest.raises(ValueError, match="does not match"):
+        speed.cueq_selection_basis(args)
 
 
 def test_operator_adapters_import_without_optional_dependencies(monkeypatch):
@@ -405,7 +421,8 @@ def test_geometry_cache_cuda_setup_preserves_exact_outputs_and_gradients(nonunif
             assert torch.equal(first, second), (implementation, rotation, "weight", index)
 
 
-def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tmp_path):
+@pytest.mark.parametrize("selected_only", [False, True])
+def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tmp_path, selected_only):
     """A third-party method bug must not discard other valid candidates."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test device")
@@ -432,15 +449,19 @@ def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tm
     monkeypatch.setattr(speed, "measure", lambda *a, **k: {"forward_backward": {"median_ms": 1.}})
     args = SimpleNamespace(impl="cueq", include_compile=False, lmax=1, channels=1,
         irreps_in=None, irreps_out=None, mmax=None, edges=2, check_only=False,
-        eqv3_root=None, json=tmp_path / "result.json", warmup=5, iterations=20)
+        eqv3_root=None, json=tmp_path / "result.json", warmup=5, iterations=20,
+        cueq_choice="escn_tp_compact,naive,pytorch" if selected_only else None)
     result = speed.run(args)
     rows = result["cueq_alternatives"]
-    assert result["status"] == "completed" and len(rows) == 16
+    assert result["status"] == "completed" and len(rows) == (1 if selected_only else 16)
     failures = [row for row in rows if row["status"] == "unavailable"]
-    assert len(failures) == 4 and all(row["reason"] == "KeyError: 0" for row in failures)
+    assert len(failures) == (0 if selected_only else 4)
+    assert all(row["reason"] == "KeyError: 0" for row in failures)
     assert ("escn_tp_compact", "naive") in visited
     assert result["implementations"]["cueq"]["status"] == "passed"
     assert len(caches) == 1
+    if selected_only:
+        assert visited == [("escn_tp_compact", "naive")] * 2
 
 
 def test_so2cuda_candidate_control_restores_environment(monkeypatch):
