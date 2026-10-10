@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 import sys
+import weakref
 
 import pytest
 
@@ -127,6 +128,77 @@ def test_forward_backward_timer_brackets_actual_loss_backward_and_restores(monke
     assert parameter.grad.item() == 4
     assert trainer._build_train_payload is payload
     assert torch.Tensor.backward is original_backward
+
+
+def test_backend_oom_releases_traceback_tensors_before_next_restore(monkeypatch, tmp_path):
+    import bench_training_backends as harness
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"train_options": {"batch_size": 32}}))
+    args = SimpleNamespace(config=config, out=tmp_path / "out", model="dense", head="onsite",
+                           backends=["so2cuda", "naive"], warmup=4, iterations=12,
+                           equivalence_structures=1, equivalence_only=False, shared_gpu=False,
+                           metadata_cache=[], dptb_sha="test", so2cuda_sha="test",
+                           cueq_method="auto", cueq_descriptor="escn_tp")
+    class BatchStream(list):
+        batch_sampler = None
+
+    trainer = SimpleNamespace(model=torch.nn.Linear(1, 1), train_loader=BatchStream([batch([1])] * 16))
+    retained = []
+    restores = []
+
+    class State:
+        def __init__(self, trainer):
+            pass
+
+        def restore(self, trainer):
+            # This checks the next backend's restore, before its probe or cache cleanup.
+            assert all(reference() is None for reference in retained)
+            assert all(parameter.grad is None for parameter in trainer.model.parameters())
+            restores.append(True)
+
+    def probe(trainer, batch, backend):
+        return ({"loss": .2, "gradients": {"weight": torch.ones(1)}},
+                {"finite_gradients": True})
+
+    def measure(trainer, batches, warmup, stream_hash):
+        if not retained:
+            tensor = torch.ones(4)
+            retained.append(weakref.ref(tensor))
+            # Python graph owners can contain cycles; exception frames keep them
+            # reachable during an in-handler gc.collect().
+            graph_owner = [tensor]
+            graph_owner.append(graph_owner)
+            trainer.model.weight.grad = torch.ones_like(trainer.model.weight)
+            raise torch.cuda.OutOfMemoryError("simulated backend OOM")
+        assert retained[0]() is None
+        return {"status": "ok", "batch_stream_sha256": stream_hash}
+
+    monkeypatch.setattr(harness, "arguments", lambda: args)
+    monkeypatch.setattr(harness, "processes", lambda: {"exclusive": True, "processes": []})
+    monkeypatch.setattr(harness, "initialize", lambda *args: trainer)
+    monkeypatch.setattr(harness, "InitialState", State)
+    monkeypatch.setattr(harness, "select_backend", lambda *args, **kwargs: None)
+    monkeypatch.setattr(harness, "probe", probe)
+    monkeypatch.setattr(harness, "measure", measure)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test device")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args: SimpleNamespace(uuid="test"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    automatic_gc = harness.gc.isenabled()
+    harness.gc.disable()
+    try:
+        harness.main()
+    finally:
+        if automatic_gc:
+            harness.gc.enable()
+
+    result = json.loads((args.out / "RESULT.json").read_text())
+    assert result["backends"]["so2cuda"]["status"] == "oom"
+    assert result["backends"]["naive"]["status"] == "ok"
+    assert result["equivalence"]["passed"]
+    assert result["status"] == "completed"
+    assert len(restores) == 4
 
 
 def test_metadata_cache_is_portable_and_never_overwrites_source(monkeypatch, tmp_path):

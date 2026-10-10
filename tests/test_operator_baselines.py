@@ -15,7 +15,7 @@ from e3nn import o3
 _examples = Path(__file__).resolve().parents[1] / "examples"
 sys.path.insert(0, str(_examples))
 from operator_baselines import (
-    ActivationOperator, CueqOperator, NaiveOperator, SO2CUDAOperator, ExplicitGEMMOperator,
+    ActivationOperator, Geometry, CueqOperator, NaiveOperator, SO2CUDAOperator, ExplicitGEMMOperator,
     canonical_weights, prepare_geometry, uniform_irreps,
 )
 from operator_eqv3 import Eqv3Operator
@@ -281,12 +281,142 @@ def test_measurement_setup_releases_non_native_copies(monkeypatch):
     assert operator.weight.shape == (3, 3)
 
 
+@pytest.mark.parametrize("implementation,descriptor", [
+    ("naive", "escn_tp"), ("cueq", "escn_tp"), ("cueq", "escn_tp_compact"),
+])
+def test_geometry_cache_cpu_setup_preserves_exact_outputs_and_gradients(
+        monkeypatch, implementation, descriptor):
+    """CPU adapters verify the copy/setup contract independently of CUDA."""
+    if implementation == "cueq":
+        pytest.importorskip("cuequivariance_torch")
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda tensor: tensor.clone())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    torch.manual_seed(42)
+    ii, io = o3.Irreps("3x0e+2x1o+1x2e"), o3.Irreps("2x0e+1x1o+3x2e")
+    host = (canonical_weights(ii, io, 2, device="cpu"), torch.randn(7, ii.dim),
+            torch.randn(7, io.dim), torch.randn(7, 3))
+    cached = speed.prepare_geometry_cache(host[-1], 2)
+    snapshots = []
+    for geometry in (None, cached):
+        op, x, cotangent = speed.prepare_measurement(
+            implementation, ii, io, 2, host, None, descriptor_name=descriptor,
+            geometry_cpu=geometry)
+        snapshots.append(speed.snapshot(op, op.input_from_native(x), op.output_from_native(cotangent)))
+    for key in ("output", "input_gradient"):
+        assert torch.equal(snapshots[0][key], snapshots[1][key])
+    for first, second in zip(snapshots[0]["weight_gradients"], snapshots[1]["weight_gradients"]):
+        assert torch.equal(first, second)
+
+
+@pytest.mark.parametrize("implementation,rotation,fields", [
+    ("naive", "pytorch", {"blocks"}), ("cueq", "pytorch", {"blocks"}),
+    ("cueq", "cueq", {"alpha", "beta"}),
+    ("so2cuda", "pytorch", {"vectors", "blocks"}),
+    ("eqv3", "pytorch", {"rotation_matrix"}),
+    ("eqv3+compile", "pytorch", {"rotation_matrix"}),
+])
+def test_geometry_cache_transfers_only_required_fields_and_releases_temporaries(
+        monkeypatch, implementation, rotation, fields):
+    """A CPU cache must not keep candidate GPU transfer tensors alive."""
+    transfers, prepared = [], []
+
+    def transfer(tensor):
+        result = tensor.clone()
+        transfers.append(weakref.ref(result))
+        return result
+
+    def geometry(vectors, lmax):
+        values = Geometry(vectors, torch.ones(2), torch.ones(2), torch.eye(3)[None].repeat(2, 1, 1),
+                          (torch.ones(2, 1, 1), torch.ones(2, 3, 3)))
+        prepared.extend(weakref.ref(value) for value in
+                        (values.vectors, values.alpha, values.beta, values.rotation_matrix, *values.blocks))
+        return values
+
+    class NativeOnly(torch.nn.Module):
+        def __init__(self, weights):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weights[0].clone())
+
+        def input_to_native(self, x):
+            return x.clone()
+
+        output_to_native = input_to_native
+
+    def operator(name, ii, io, mmax, weights, geometry, *args):
+        assert {name for name in ("vectors", "alpha", "beta", "rotation_matrix", "blocks")
+                if getattr(geometry, name) is not None and
+                (name != "blocks" or geometry.blocks)} == fields
+        return NativeOnly(weights)
+
+    monkeypatch.setattr(torch.Tensor, "cuda", transfer)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(speed, "prepare_geometry", geometry)
+    monkeypatch.setattr(speed, "make_operator", operator)
+    ii = uniform_irreps(1, 1)
+    host = ((torch.eye(2),), torch.ones(2, 4), torch.ones(2, 4), torch.ones(2, 3))
+    cached = speed.prepare_geometry_cache(host[-1], 1)
+    assert all(ref() is None for ref in prepared + transfers)
+    assert all(tensor.device.type == "cpu" for tensor in
+               (cached.vectors, cached.alpha, cached.beta, cached.rotation_matrix, *cached.blocks))
+    speed.prepare_measurement(implementation, ii, ii, 1, host, None,
+                              rotation=rotation, geometry_cpu=cached)
+    assert all(ref() is None for ref in transfers)
+
+
+@pytest.mark.parametrize("nonuniform", [False, True])
+def test_geometry_cache_cuda_setup_preserves_exact_outputs_and_gradients(nonuniform):
+    """The cache retains GPU rounding and each native implementation's math."""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU-computed geometry cache requires CUDA")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    torch.manual_seed(42)
+    if nonuniform:
+        ii = o3.Irreps(speed.NONUNIFORM_CASES[-1][2])
+        io = o3.Irreps(speed.NONUNIFORM_CASES[-1][3])
+        mmax = 6
+    else:
+        ii = io = uniform_irreps(2, 3)
+        mmax = 2
+    host = (canonical_weights(ii, io, mmax, device="cpu"), torch.randn(7, ii.dim),
+            torch.randn(7, io.dim), torch.randn(7, 3))
+    cached = speed.prepare_geometry_cache(host[-1], max(ii.lmax, io.lmax))
+    assert all(tensor.device.type == "cpu" for tensor in
+               (cached.vectors, cached.alpha, cached.beta, cached.rotation_matrix, *cached.blocks))
+    implementations = [("naive", "pytorch"), ("so2cuda", "pytorch")]
+    if importlib.util.find_spec("cuequivariance_torch"):
+        implementations.extend(("cueq", rotation) for rotation in ("pytorch", "cueq"))
+    root = os.environ.get("SO2CUDA_EQV3_ROOT")
+    if root and not nonuniform:
+        implementations.append(("eqv3", "pytorch"))
+    for implementation, rotation in implementations:
+        snapshots = []
+        for geometry in (None, cached):
+            op, x, cotangent = speed.prepare_measurement(
+                implementation, ii, io, mmax, host, root, rotation=rotation,
+                descriptor_name="escn_tp_compact", geometry_cpu=geometry)
+            snapshots.append(speed.snapshot(op, op.input_from_native(x), op.output_from_native(cotangent)))
+            del op, x, cotangent
+        for key in ("output", "input_gradient"):
+            assert torch.equal(snapshots[0][key], snapshots[1][key]), (implementation, rotation, key)
+        for index, (first, second) in enumerate(zip(snapshots[0]["weight_gradients"],
+                                                  snapshots[1]["weight_gradients"])):
+            assert torch.equal(first, second), (implementation, rotation, "weight", index)
+
+
 def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tmp_path):
     """A third-party method bug must not discard other valid candidates."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test device")
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(speed, "source_identity", lambda: {})
+    caches = []
+    def cache(*args):
+        value = object()
+        caches.append(value)
+        return value
+    monkeypatch.setattr(speed, "prepare_geometry_cache", cache)
     visited = []
     def check(*args, **kwargs):
         method = kwargs.get("method", "naive")
@@ -295,8 +425,10 @@ def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tm
             raise KeyError(0)
         return {"passed": True, "implementations": {"cueq": {"status": "passed"}}}
     monkeypatch.setattr(speed, "equivalence_case", check)
-    monkeypatch.setattr(speed, "prepare_measurement", lambda *a, **k:
-                        (SimpleNamespace(metadata={}), None, None))
+    def setup(*args, **kwargs):
+        assert kwargs["geometry_cpu"] is caches[0]
+        return SimpleNamespace(metadata={}), None, None
+    monkeypatch.setattr(speed, "prepare_measurement", setup)
     monkeypatch.setattr(speed, "measure", lambda *a, **k: {"forward_backward": {"median_ms": 1.}})
     args = SimpleNamespace(impl="cueq", include_compile=False, lmax=1, channels=1,
         irreps_in=None, irreps_out=None, mmax=None, edges=2, check_only=False,
@@ -308,6 +440,7 @@ def test_candidate_keyerror_is_recorded_and_later_candidates_run(monkeypatch, tm
     assert len(failures) == 4 and all(row["reason"] == "KeyError: 0" for row in failures)
     assert ("escn_tp_compact", "naive") in visited
     assert result["implementations"]["cueq"]["status"] == "passed"
+    assert len(caches) == 1
 
 
 def test_so2cuda_candidate_control_restores_environment(monkeypatch):
@@ -361,6 +494,7 @@ def test_default_so2cuda_measurement_uses_public_default_api(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test device")
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(speed, "source_identity", lambda: {})
+    monkeypatch.setattr(speed, "prepare_geometry_cache", lambda *args: None)
     monkeypatch.setattr(speed, "equivalence_case", lambda *a, **k:
                         {"passed": True, "implementations": {"so2cuda": {"status": "passed"}}})
     calls = []

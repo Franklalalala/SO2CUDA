@@ -20,7 +20,7 @@ import torch
 from e3nn import o3
 import operator_eqv3
 
-from operator_baselines import (ActivationOperator, NaiveOperator, SO2CUDAOperator, CueqOperator, ExplicitGEMMOperator,
+from operator_baselines import (ActivationOperator, Geometry, NaiveOperator, SO2CUDAOperator, CueqOperator, ExplicitGEMMOperator,
                                 canonical_weights, prepare_geometry, uniform_irreps)
 from operator_eqv3 import EQV3_COMMIT
 
@@ -287,12 +287,37 @@ def compile_delta(before, after):
     return {key: after[key] - before[key] for key in before}
 
 
+def prepare_geometry_cache(vectors_cpu, lmax):
+    """Keep the original GPU-computed, rounded geometry on CPU for one case."""
+    geometry = prepare_geometry(vectors_cpu.cuda(), lmax)
+    # A CPU copy owns its storage and cannot keep GPU setup tensors alive.
+    cpu = lambda tensor: tensor.detach().to(device="cpu", copy=True)
+    cached = Geometry(cpu(geometry.vectors), cpu(geometry.alpha), cpu(geometry.beta),
+                      cpu(geometry.rotation_matrix), tuple(cpu(block) for block in geometry.blocks))
+    del geometry
+    gc.collect()
+    torch.cuda.empty_cache()
+    return cached
+
+
+def measurement_geometry(name, cached, rotation):
+    """Transfer only the canonical geometry used to construct this operator."""
+    if name in ("eqv3", "eqv3+compile"):
+        return Geometry(None, None, None, cached.rotation_matrix.cuda(), ())
+    if name == "cueq" and rotation == "cueq":
+        return Geometry(None, cached.alpha.cuda(), cached.beta.cuda(), None, ())
+    vectors = cached.vectors.cuda() if name in ("so2cuda", "activation", "explicit_gemm") else None
+    return Geometry(vectors, None, None, None, tuple(block.cuda() for block in cached.blocks))
+
+
 def prepare_measurement(name, ii, io, mmax, host_data, eqv3_root, method="naive",
-                        rotation="pytorch", descriptor_name="escn_tp", so2cuda_candidate="true_dense_pairs"):
+                        rotation="pytorch", descriptor_name="escn_tp", so2cuda_candidate="true_dense_pairs",
+                        geometry_cpu=None):
     """Transfer one candidate, convert its inputs, then release setup tensors."""
     weights_cpu, x_cpu, upstream_cpu, vectors_cpu = host_data
     weights = tuple(w.cuda() for w in weights_cpu)
-    geometry = prepare_geometry(vectors_cpu.cuda(), max(ii.lmax, io.lmax))
+    geometry = (prepare_geometry(vectors_cpu.cuda(), max(ii.lmax, io.lmax)) if geometry_cpu is None
+                else measurement_geometry(name, geometry_cpu, rotation))
     op = make_operator(name, ii, io, mmax, weights, geometry, eqv3_root,
                        method, rotation, descriptor_name, so2cuda_candidate)
     with torch.no_grad():
@@ -412,6 +437,18 @@ def run(args):
                  torch.randn(args.edges, io.dim) / io.dim ** .5,
                  torch.randn(args.edges, 3))
     rejected = previous_rejections(getattr(args, "cueq_rejections_json", None), ii, io, mmax)
+    geometry_cpu = None
+
+    def setup_measurement(name, method="naive", rotation="pytorch", descriptor_name="escn_tp"):
+        nonlocal geometry_cpu
+        if geometry_cpu is None:
+            start = time.perf_counter()
+            geometry_cpu = prepare_geometry_cache(host_data[-1], max(ii.lmax, io.lmax))
+            report["geometry_setup_seconds"] = time.perf_counter() - start
+            print(f"GEOMETRY cached on CPU: {report['geometry_setup_seconds']:.3f}s", flush=True)
+        return prepare_measurement(name, ii, io, mmax, host_data, args.eqv3_root,
+                                   method, rotation, descriptor_name, geometry_cpu=geometry_cpu)
+
     gc.collect()
     torch.cuda.empty_cache()
     for name in impls:
@@ -446,8 +483,7 @@ def run(args):
                     if not validation["passed"]:
                         row["status"] = "failed_equivalence"
                     else:
-                        op, x, upstream = prepare_measurement(name, ii, io, mmax, host_data,
-                            args.eqv3_root, method, rotation, descriptor_name)
+                        op, x, upstream = setup_measurement(name, method, rotation, descriptor_name)
                         row["metadata"] = op.metadata
                         row.update(measure(op, x, upstream, args.warmup, args.iterations, allow_shared=allow_shared))
                         row["status"] = "passed"
@@ -484,7 +520,7 @@ def run(args):
             try:
                 start = time.perf_counter()
                 counters_before = compile_counters() if name.endswith("+compile") else None
-                op, x, upstream = prepare_measurement(name, ii, io, mmax, host_data, args.eqv3_root)
+                op, x, upstream = setup_measurement(name)
                 row = {"metadata": op.metadata}
                 if name.endswith("+compile"):
                     # Trigger forward/backward compilation before both timed loops.
@@ -492,7 +528,7 @@ def run(args):
                     start = time.perf_counter()
                     compiled_check = snapshot(op, op.input_from_native(x), op.output_from_native(upstream))
                     row["compile_and_first_training_call_seconds"] = time.perf_counter() - start
-                    eager, eager_x, eager_upstream = prepare_measurement("eqv3", ii, io, mmax, host_data, args.eqv3_root)
+                    eager, eager_x, eager_upstream = setup_measurement("eqv3")
                     row["equivalence_vs_eager"] = compare(compiled_check,
                         snapshot(eager, eager.input_from_native(eager_x), eager.output_from_native(eager_upstream)))
                     del eager, eager_x, eager_upstream, compiled_check
@@ -588,7 +624,7 @@ def run_suite(args):
                 row["implementations"] = result["equivalence"]["implementations"]
             else:
                 row["config"] = result["config"]
-                for field in ("implementations", "cueq_alternatives"):
+                for field in ("implementations", "cueq_alternatives", "geometry_setup_seconds"):
                     if field in result:
                         row[field] = result[field]
         report["cases"].append(row)

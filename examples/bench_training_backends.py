@@ -490,8 +490,11 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     count = 1 if args.equivalence_only else args.warmup + args.iterations
+    batches = []
     with cache.install():
-        batches = [batch.cpu() for batch in itertools.islice(trainer.train_loader, count)]
+        for batch in itertools.islice(trainer.train_loader, count):
+            batches.append(batch.cpu())
+            print(f"BENCH_PHASE batch_stream {len(batches)}/{count}", flush=True)
     if len(batches) != count:
         raise RuntimeError("The training loader did not provide the requested batch stream")
     report["metadata_cost_cache"] = cache.record()
@@ -543,9 +546,10 @@ def main():
             report["backends"][backend] = {"status": "oom" if oom else "error", "reason": str(error),
                                            "batch_stream_sha256": report["batch_stream"]["sha256"]}
             print("BENCH_FAILURE " + json.dumps(report["backends"][backend]), flush=True)
-            trainer.model.zero_grad(set_to_none=True)
-            gc.collect()
-            torch.cuda.empty_cache()
+        # The exception traceback can retain tensors until the handler exits.
+        trainer.model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
         backend_after = processes()
         report["backends"][backend]["gpu_before"] = backend_before
         report["backends"][backend]["gpu_after"] = backend_after
