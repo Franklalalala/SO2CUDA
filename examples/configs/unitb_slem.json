@@ -1,0 +1,53 @@
+{
+  "common_options": {
+    "basis": {
+      "C": "2s2p1d",
+      "Cu": "4s2p2d1f"
+    },
+    "dtype": "float32",
+    "device": "cuda:0",
+    "overlap": false,
+    "has_soc": true,
+    "full_soc_prediction": false,
+    "nextham_uureal_mask": true
+  },
+  "model_options": {
+    "embedding": {
+      "method": "unitb",
+      "r_max": 7.4,
+      "layer_topology": "slem"
+    },
+    "prediction": {
+      "method": "e3tb",
+      "neurons": [
+        128,
+        128,
+        128
+      ],
+      "activation": "tanh",
+      "scale_type": "no_scale",
+      "complete_edges": true,
+      "symmetrize_onsite": true
+    },
+    "shift_head": {
+      "mode": "atom",
+      "hidden": 64,
+      "layers": 2,
+      "element_dim": 0,
+      "response": {
+        "auxiliary_weight": 0.0,
+        "canonical_onsite": false,
+        "context": "none",
+        "element_dim": 8,
+        "g_cut": 4.0,
+        "hardness_max": 40.0,
+        "hardness_min": 5.0,
+        "hidden": 64,
+        "kind": "qeq",
+        "output_scale": 0.1,
+        "qeq_local": true,
+        "sigma": 1.2
+      }
+    }
+  }
+}
