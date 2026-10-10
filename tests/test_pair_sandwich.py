@@ -58,24 +58,29 @@ def _reference(x, blocks, entries_in, entries_out, weights, radials, front, out_
     return out
 
 
-def _case(front, radial, seed=7, n=33):
+HIGH_IN = ((0, 2, 0), (9, 2, 2), (4, 3, 40))
+HIGH_OUT = ((1, 2, 0), (9, 1, 6), (5, 2, 25))
+
+
+def _case(front, radial, seed=7, n=33, entries=(V_IN, V_OUT), m_max=None):
     generator = torch.Generator().manual_seed(seed)
-    entries_in, entries_out = (V_IN, V_OUT) if front else (V_OUT, V_IN)
+    entries_in, entries_out = entries if front else entries[::-1]
     dim_in, dim_out = _dim(entries_in), _dim(entries_out)
-    l_max = 3
+    l_max = max(l for l, _, _ in entries_in + entries_out)
+    m_max = l_max if m_max is None else m_max
     x = torch.randn(n, dim_in, generator=generator, dtype=torch.float64)
     blocks = _blocks(n, l_max, generator)
     weights, radials = [], []
-    for m in range(l_max + 1):
+    for m in range(m_max + 1):
         cin = sum(mul for l, mul, _ in entries_in if l >= m)
         cout = sum(mul for l, mul, _ in entries_out if l >= m)
         weights.append(torch.randn(cout * (2 if m else 1), cin, generator=generator, dtype=torch.float64))
         radials.append(torch.randn(n, cin if front else cout, generator=generator, dtype=torch.float64))
-    return entries_in, entries_out, dim_in, dim_out, l_max, x, blocks, weights, (radials if radial else None)
+    return entries_in, entries_out, dim_in, dim_out, l_max, m_max, x, blocks, weights, (radials if radial else None)
 
 
-def _check(fn, front, radial):
-    entries_in, entries_out, dim_in, dim_out, l_max, x64, blocks64, w64, r64 = _case(front, radial)
+def _check(fn, front, radial, **case):
+    entries_in, entries_out, dim_in, dim_out, l_max, m_max, x64, blocks64, w64, r64 = _case(front, radial, **case)
     probe = torch.randn(x64.shape[0], dim_out, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
     leaves64 = [x64.clone().requires_grad_(True)] + [w.clone().requires_grad_(True) for w in w64[1:]]
     rad64 = None if r64 is None else [r.clone().requires_grad_(True) for r in r64]
@@ -86,7 +91,7 @@ def _check(fn, front, radial):
     x = leaves64[0].detach().float().to(dev).requires_grad_(True)
     ws = [w.detach().float().to(dev).requires_grad_(True) for w in w64]
     rs = None if r64 is None else [r.detach().float().to(dev).requires_grad_(True) for r in r64]
-    layout = prepare_layout(entries_in, entries_out, m_max=l_max, l_max=l_max, out_dim=dim_out,
+    layout = prepare_layout(entries_in, entries_out, m_max=m_max, l_max=l_max, out_dim=dim_out,
                             device=dev, front=front)
     wigner = prepare_wigner(x, tuple(b.float().to(dev) for b in blocks64), l_max=l_max)
     parts = fn(x, layout, wigner, ws, rs)
@@ -122,3 +127,14 @@ def test_true_dense_pairs_rotated(front, radial):
 @pytest.mark.parametrize("radial", [True, False])
 def test_dense_pairs_single_group_rotated(front, radial):
     _check(_dense_single_group, front, radial)
+
+
+@pytest.mark.parametrize("front", [True, False])
+def test_true_dense_pairs_degrees_above_unrolled_range(front):
+    _check(_true_dense, front, True, entries=(HIGH_IN, HIGH_OUT))
+
+
+@pytest.mark.parametrize("m_max", [1, 2])
+def test_pairs_truncated_m(m_max):
+    _check(_true_dense, True, False, m_max=m_max)
+    _check(_dense_single_group, True, True, m_max=m_max)

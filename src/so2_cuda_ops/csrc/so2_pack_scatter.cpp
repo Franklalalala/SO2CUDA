@@ -278,6 +278,51 @@ torch::Tensor channel_pack_grad_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor channel_rotate_to_blocks_fp32_cuda(
+    torch::Tensor src,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    std::vector<int64_t> block_prefix,
+    std::vector<int64_t> block_width,
+    std::vector<int64_t> block_stride,
+    int64_t total_width,
+    torch::Tensor row_of_edge,
+    bool rotate,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor channel_gather_from_blocks_fp32_cuda(
+    torch::Tensor src,
+    int64_t n_edges,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    std::vector<int64_t> block_prefix,
+    std::vector<int64_t> block_width,
+    std::vector<int64_t> block_stride,
+    int64_t dst_dim,
+    bool zero_fill,
+    torch::Tensor edge_scale,
+    torch::Tensor accumulate_into,
+    torch::Tensor row_of_edge,
+    bool rotate,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights);
+
+std::vector<torch::Tensor> block_complex_weight_grads_fp32_cuda(
+    torch::Tensor grad_flat,
+    std::vector<int64_t> couts,
+    std::vector<int64_t> cins);
+
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32_cuda(
     torch::Tensor grad_pair_eff,
     torch::Tensor pair_no_radial,
@@ -1354,6 +1399,111 @@ torch::Tensor channel_pack_grad_fp32(
       in_dim, zero_fill, rotate_in, wigner_mode, wigner_stride);
 }
 
+static void check_wigner_inputs(const torch::Tensor& wigner, const torch::Tensor& offsets,
+                                const torch::Tensor& compact_offsets, bool rotate) {
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  if (rotate) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+}
+
+static void check_optional_rows(const torch::Tensor& row_of_edge, int64_t n_edges) {
+  if (row_of_edge.numel() > 0) {
+    check_cuda_contiguous(row_of_edge, "row_of_edge");
+    TORCH_CHECK(row_of_edge.scalar_type() == torch::kInt64, "row_of_edge must be int64");
+    TORCH_CHECK(row_of_edge.numel() == n_edges, "row_of_edge must have one entry per edge");
+  }
+}
+
+torch::Tensor channel_rotate_to_blocks_fp32(
+    torch::Tensor src,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    std::vector<int64_t> block_prefix,
+    std::vector<int64_t> block_width,
+    std::vector<int64_t> block_stride,
+    int64_t total_width,
+    torch::Tensor row_of_edge,
+    bool rotate,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(src, "src");
+  TORCH_CHECK(src.scalar_type() == torch::kFloat32 && src.dim() == 2, "src must be a 2-D fp32 tensor");
+  check_channel_plan(ch_base, ch_l, ch_cols);
+  check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
+  check_optional_rows(row_of_edge, src.size(0));
+  return channel_rotate_to_blocks_fp32_cuda(
+      src, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_prefix, block_width,
+      block_stride, total_width, row_of_edge, rotate, wigner_mode, wigner_stride);
+}
+
+torch::Tensor channel_gather_from_blocks_fp32(
+    torch::Tensor src,
+    int64_t n_edges,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    std::vector<int64_t> block_prefix,
+    std::vector<int64_t> block_width,
+    std::vector<int64_t> block_stride,
+    int64_t dst_dim,
+    bool zero_fill,
+    torch::Tensor edge_scale,
+    torch::Tensor accumulate_into,
+    torch::Tensor row_of_edge,
+    bool rotate,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(src, "src");
+  TORCH_CHECK(src.scalar_type() == torch::kFloat32, "src must be fp32");
+  check_channel_plan(ch_base, ch_l, ch_cols);
+  check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
+  check_optional_rows(row_of_edge, n_edges);
+  if (edge_scale.numel() > 0) {
+    check_cuda_contiguous(edge_scale, "edge_scale");
+    TORCH_CHECK(edge_scale.scalar_type() == torch::kFloat32 && edge_scale.numel() == n_edges,
+                "edge_scale must hold one fp32 value per edge");
+  }
+  if (accumulate_into.numel() > 0) {
+    check_cuda_contiguous(accumulate_into, "accumulate_into");
+    TORCH_CHECK(accumulate_into.scalar_type() == torch::kFloat32 && accumulate_into.dim() == 2 &&
+                accumulate_into.size(0) == n_edges && accumulate_into.size(1) == dst_dim,
+                "accumulate_into must be [n_edges, dst_dim] fp32");
+  }
+  return channel_gather_from_blocks_fp32_cuda(
+      src, n_edges, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_prefix,
+      block_width, block_stride, dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge,
+      rotate, wigner_mode, wigner_stride);
+}
+
+torch::Tensor block_complex_weights_fp32(std::vector<torch::Tensor> weights) {
+  for (const auto& weight : weights) {
+    check_cuda_contiguous(weight, "pair weight");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "pair weights must be fp32");
+  }
+  return block_complex_weights_fp32_cuda(weights);
+}
+
+std::vector<torch::Tensor> block_complex_weight_grads_fp32(
+    torch::Tensor grad_flat,
+    std::vector<int64_t> couts,
+    std::vector<int64_t> cins) {
+  check_cuda_contiguous(grad_flat, "grad_flat");
+  TORCH_CHECK(grad_flat.scalar_type() == torch::kFloat32, "grad_flat must be fp32");
+  return block_complex_weight_grads_fp32_cuda(grad_flat, couts, cins);
+}
+
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32(
     torch::Tensor grad_pair_eff,
     torch::Tensor pair_no_radial,
@@ -1639,6 +1789,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scatter_pair_grad_fp32", &scatter_pair_grad_fp32, "SO2 MoE fused P0 scatter pair grad fp32");
   m.def("scatter_pairs_multi_grad_fp32", &scatter_pairs_multi_grad_fp32, "SO2 MoE fused P0 grouped scatter pair grad fp32");
   m.def("channel_pack_grad_fp32", &channel_pack_grad_fp32, "SO2 channel-major gather backward of the multi-m pair pack fp32");
+  m.def("channel_rotate_to_blocks_fp32", &channel_rotate_to_blocks_fp32, "SO2 channel-major rotation of feature rows into m blocks fp32");
+  m.def("channel_gather_from_blocks_fp32", &channel_gather_from_blocks_fp32, "SO2 channel-major gather of m blocks rotated back into feature rows fp32");
+  m.def("block_complex_weights_fp32", &block_complex_weights_fp32, "SO2 [[A,-B],[B,A]] block weights of all m blocks fp32");
+  m.def("block_complex_weight_grads_fp32", &block_complex_weight_grads_fp32, "SO2 stacked [A;B] gradients from block-weight gradients fp32");
   m.def("scatter_pair_grad_radial_input_fp32", &scatter_pair_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter pair grad fp32");
   m.def("block_complex_forward_fp32", &block_complex_forward_fp32, "SO2 compact block-complex pair GEMM forward fp32");
   m.def("block_complex_backward_fp32", &block_complex_backward_fp32, "SO2 compact block-complex pair GEMM backward fp32");

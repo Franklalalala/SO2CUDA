@@ -182,10 +182,9 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
         return None
     if mode in multi and _single_group(x, layout, weights, routing) and _front_radials_fit(x, layout, radial_parts):
         # One group over every row: each m block is one plain GEMM of its pair rows.
-        from ._dense import pair_sandwich
-        contribution = pair_sandwich(x, layout, wigner, (None,) + tuple(w[0] for w in weights[1:]),
-                                     radial_parts)
-        return [] if contribution is None else [contribution]
+        from ._sandwich import block_sandwich, sandwich_plan
+        if sandwich_plan(layout, x.shape[1], x.device).supported:
+            return [block_sandwich(x, layout, wigner, (None,) + tuple(w[0] for w in weights[1:]), radial_parts)]
     linears = tuple(LinearWeights(weight) for weight in weights)
     module = _LayerView(layout, linears, x.device)
     args = (module, x, wigner.values, wigner.compact_offsets, wigner.mode, wigner.stride, routing)
