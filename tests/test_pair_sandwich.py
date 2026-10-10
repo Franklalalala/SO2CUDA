@@ -196,3 +196,63 @@ def test_activation_single_expert_rotated(radial):
     torch.testing.assert_close(actual.double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
     for a, b in zip(grads, ref_grads):
         torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)
+
+
+def _grouped_reference(x, blocks, entries_in, entries_out, weights, radials, front, out_dim, graph):
+    """Sum over groups of the m>0 terms of each group's edges with that group's weights."""
+    out = torch.zeros(x.shape[0], out_dim, dtype=torch.float64)
+    for g in range(weights[1].shape[0]):
+        sel = (graph == g).nonzero().flatten()
+        if sel.numel() == 0:
+            continue
+        sub_blocks = [b[sel] for b in blocks]
+        sub_radials = None if radials is None else [r[sel] for r in radials]
+        part = _reference(x[sel], sub_blocks, entries_in, entries_out,
+                          [weights[0]] + [w[g] for w in weights[1:]], sub_radials, front, out_dim)
+        out = out.index_add(0, sel, part)
+    return out
+
+
+@pytest.mark.parametrize("front", [True, False])
+@pytest.mark.parametrize("radial", [True, False])
+def test_dense_pairs_grouped_rotated(front, radial):
+    entries_in, entries_out, dim_in, dim_out, l_max, m_max, x64, blocks64, w64, r64 = _case(front, radial)
+    n = x64.shape[0]
+    gen = torch.Generator().manual_seed(5)
+    groups = 3
+    graph = torch.randint(0, groups, (n,), generator=gen)
+    graph[0] = 1  # not already sorted
+    wg64 = [w64[0]] + [torch.randn(groups, *w.shape, generator=gen, dtype=torch.float64) for w in w64[1:]]
+    probe = torch.randn(n, dim_out, generator=gen, dtype=torch.float64)
+    leaves = [x64] + wg64[1:] + (list(r64[1:]) if r64 is not None else [])
+    leaves = [t.clone().requires_grad_(True) for t in leaves]
+    xr, wr, rr = leaves[0], leaves[1:len(wg64)], leaves[len(wg64):]
+    ref = _grouped_reference(xr, blocks64, entries_in, entries_out, [wg64[0]] + wr,
+                             [r64[0]] + rr if rr else None, front, dim_out, graph)
+    ref_grads = torch.autograd.grad((ref * probe).sum(), leaves)
+
+    dev = "cuda"
+    cuda = [t.detach().float().to(dev).requires_grad_(True) for t in leaves]
+    x, ws, rs = cuda[0], cuda[1:len(wg64)], cuda[len(wg64):]
+    layout = prepare_layout(entries_in, entries_out, m_max=m_max, l_max=l_max, out_dim=dim_out,
+                            device=dev, front=front)
+    wigner = prepare_wigner(x, tuple(b.float().to(dev) for b in blocks64), l_max=l_max)
+    graph_dev = graph.to(dev)
+    flat = graph_dev.repeat_interleave(2)
+    permute = torch.argsort(flat, stable=True)
+    unpermute = torch.argsort(permute)
+    counts = torch.bincount(flat, minlength=groups).cpu()
+    ptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+    routing = DenseRouting(graph_dev, ptr, permute, unpermute)
+    weights = (torch.zeros(1, 0, 0, device=dev),) + tuple(ws)
+    radials = None if not rs else (torch.zeros(n, 0, device=dev),) + tuple(rs)
+    parts = dense_pairs(x, layout, wigner, weights, radials, routing)
+    assert parts is not None
+    actual = sum(parts)
+    grads = torch.autograd.grad((actual * probe.float().to(dev)).sum(), cuda)
+    scale = ref.detach().abs().max()
+    torch.testing.assert_close(actual.double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
+    for a, b in zip(grads, ref_grads):
+        if b.abs().max() == 0:
+            continue
+        torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)

@@ -318,7 +318,8 @@ torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights
 std::vector<torch::Tensor> block_complex_weight_grads_fp32_cuda(
     torch::Tensor grad_flat,
     std::vector<int64_t> couts,
-    std::vector<int64_t> cins);
+    std::vector<int64_t> cins,
+    int64_t groups);
 
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32_cuda(
     torch::Tensor grad_pair_eff,
@@ -1506,10 +1507,11 @@ torch::Tensor block_complex_weights_fp32(std::vector<torch::Tensor> weights) {
 std::vector<torch::Tensor> block_complex_weight_grads_fp32(
     torch::Tensor grad_flat,
     std::vector<int64_t> couts,
-    std::vector<int64_t> cins) {
+    std::vector<int64_t> cins,
+    int64_t groups) {
   check_cuda_contiguous(grad_flat, "grad_flat");
   TORCH_CHECK(grad_flat.scalar_type() == torch::kFloat32, "grad_flat must be fp32");
-  return block_complex_weight_grads_fp32_cuda(grad_flat, couts, cins);
+  return block_complex_weight_grads_fp32_cuda(grad_flat, couts, cins, groups);
 }
 
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32(

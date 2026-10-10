@@ -491,12 +491,14 @@ __global__ void channel_gather_from_blocks_kernel(
 }
 
 // [[A, -B], [B, A]] for every m block from the stacked [A; B] pair weights.
+// Each block holds `groups` stacked weights (one per routing group).
 struct WeightSet {
   const float* src[kMaxBlocks];
   float* dst[kMaxBlocks];
   int32_t cout[kMaxBlocks];
   int32_t cin[kMaxBlocks];
-  int64_t prefix[kMaxBlocks + 1];  // running count of block-complex entries
+  int32_t groups[kMaxBlocks];
+  int64_t prefix[kMaxBlocks + 1];  // running count of written entries
   int count;
 };
 
@@ -513,13 +515,17 @@ __global__ void block_complex_weights_kernel(WeightSet ws, bool backward) {
   const int co = ws.cout[b];
   const int ci = ws.cin[b];
   if (!backward) {
-    // forward: local indexes the [2co, 2ci] block-complex matrix
-    const int row = static_cast<int>(local / (2 * ci));
-    const int col = static_cast<int>(local - static_cast<int64_t>(row) * 2 * ci);
+    // forward: local indexes [groups, 2co, 2ci] block-complex matrices
+    const int64_t per = 4 * static_cast<int64_t>(co) * ci;
+    const int64_t g = local / per;
+    const int64_t rem = local - g * per;
+    const int row = static_cast<int>(rem / (2 * ci));
+    const int col = static_cast<int>(rem - static_cast<int64_t>(row) * 2 * ci);
     const int o = row < co ? row : row - co;
     const int i = col < ci ? col : col - ci;
-    const float a = ws.src[b][static_cast<int64_t>(o) * ci + i];
-    const float bb = ws.src[b][static_cast<int64_t>(co + o) * ci + i];
+    const float* src = ws.src[b] + g * 2 * static_cast<int64_t>(co) * ci;
+    const float a = src[static_cast<int64_t>(o) * ci + i];
+    const float bb = src[static_cast<int64_t>(co + o) * ci + i];
     float value;
     if (row < co) {
       value = col < ci ? a : -bb;
@@ -528,10 +534,13 @@ __global__ void block_complex_weights_kernel(WeightSet ws, bool backward) {
     }
     ws.dst[b][local] = value;
   } else {
-    // backward: local indexes the [2co, ci] stacked gradient; src is the [2co, 2ci] gradient
-    const int row = static_cast<int>(local / ci);
-    const int i = static_cast<int>(local - static_cast<int64_t>(row) * ci);
-    const float* g = ws.src[b];
+    // backward: local indexes [groups, 2co, ci] stacked gradients from [groups, 2co, 2ci] ones
+    const int64_t per = 2 * static_cast<int64_t>(co) * ci;
+    const int64_t grp = local / per;
+    const int64_t rem = local - grp * per;
+    const int row = static_cast<int>(rem / ci);
+    const int i = static_cast<int>(rem - static_cast<int64_t>(row) * ci);
+    const float* g = ws.src[b] + grp * 4 * static_cast<int64_t>(co) * ci;
     const int64_t w2 = 2 * ci;
     float value;
     if (row < co) {  // d/dA = G11 + G22
@@ -703,10 +712,12 @@ torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights
   ws.prefix[0] = 0;
   for (int b = 0; b < ws.count; ++b) {
     const auto& weight = weights[b];
-    TORCH_CHECK(weight.dim() == 2 && weight.size(0) % 2 == 0, "pair weights must be [2*Cout, Cin]");
-    ws.cout[b] = static_cast<int32_t>(weight.size(0) / 2);
-    ws.cin[b] = static_cast<int32_t>(weight.size(1));
-    ws.prefix[b + 1] = ws.prefix[b] + 4 * static_cast<int64_t>(ws.cout[b]) * ws.cin[b];
+    TORCH_CHECK((weight.dim() == 2 || weight.dim() == 3) && weight.size(-2) % 2 == 0,
+                "pair weights must be [2*Cout, Cin] or [groups, 2*Cout, Cin]");
+    ws.groups[b] = static_cast<int32_t>(weight.dim() == 3 ? weight.size(0) : 1);
+    ws.cout[b] = static_cast<int32_t>(weight.size(-2) / 2);
+    ws.cin[b] = static_cast<int32_t>(weight.size(-1));
+    ws.prefix[b + 1] = ws.prefix[b] + 4 * static_cast<int64_t>(ws.groups[b]) * ws.cout[b] * ws.cin[b];
   }
   auto out = torch::empty({ws.prefix[ws.count]}, weights[0].options());
   for (int b = 0; b < ws.count; ++b) {
@@ -726,23 +737,28 @@ torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights
 std::vector<torch::Tensor> block_complex_weight_grads_fp32_cuda(
     torch::Tensor grad_flat,
     std::vector<int64_t> couts,
-    std::vector<int64_t> cins) {
+    std::vector<int64_t> cins,
+    int64_t groups) {
   TORCH_CHECK(couts.size() == cins.size() && !couts.empty() && static_cast<int>(couts.size()) <= kMaxBlocks,
               "between 1 and ", kMaxBlocks, " blocks are required");
+  TORCH_CHECK(groups >= 0, "groups must be nonnegative (0 = ungrouped)");
   WeightSet ws;
   ws.count = static_cast<int>(couts.size());
   std::vector<torch::Tensor> grads;
   grads.reserve(couts.size());
   int64_t src_offset = 0;
+  const int64_t g = groups > 0 ? groups : 1;
   ws.prefix[0] = 0;
   for (int b = 0; b < ws.count; ++b) {
     ws.cout[b] = static_cast<int32_t>(couts[b]);
     ws.cin[b] = static_cast<int32_t>(cins[b]);
-    grads.push_back(torch::empty({2 * couts[b], cins[b]}, grad_flat.options()));
+    ws.groups[b] = static_cast<int32_t>(g);
+    grads.push_back(groups > 0 ? torch::empty({groups, 2 * couts[b], cins[b]}, grad_flat.options())
+                               : torch::empty({2 * couts[b], cins[b]}, grad_flat.options()));
     ws.src[b] = grad_flat.data_ptr<float>() + src_offset;
     ws.dst[b] = grads.back().data_ptr<float>();
-    src_offset += 4 * couts[b] * cins[b];
-    ws.prefix[b + 1] = ws.prefix[b] + 2 * couts[b] * cins[b];
+    src_offset += 4 * g * couts[b] * cins[b];
+    ws.prefix[b + 1] = ws.prefix[b] + 2 * g * couts[b] * cins[b];
   }
   TORCH_CHECK(src_offset == grad_flat.numel(), "block-complex gradient size mismatch");
   if (ws.prefix[ws.count] == 0) {

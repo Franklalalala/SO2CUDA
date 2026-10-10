@@ -102,18 +102,45 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
     return hit
 
 
-def _rotate(src, side, plan, wigner, rotate, scale=None):
+def _rotate(src, side, plan, wigner, rotate, scale=None, rows=None):
     return _ext().channel_rotate_to_blocks_fp32(
         src, wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
-        side.table, side.total, plan.no_scale if scale is None else scale, plan.no_rows,
-        bool(rotate), int(wigner.mode), int(wigner.stride))
+        side.table, side.total, plan.no_scale if scale is None else scale,
+        plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode), int(wigner.stride))
 
 
-def _gather(src, n, side, plan, wigner, rotate, scale=None):
+def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None):
     return _ext().channel_gather_from_blocks_fp32(
         src, int(n), wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.dim, bool(side.zero_fill), plan.no_scale if scale is None else scale,
-        plan.no_scale, plan.no_rows, bool(rotate), int(wigner.mode), int(wigner.stride))
+        plan.no_scale, plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode),
+        int(wigner.stride))
+
+
+def _gemm_ext():
+    from ._cublas_grouped_gemm import _load_extension
+
+    return _load_extension()
+
+
+def _pair_gemm(block, weight, out, spec, transpose=False):
+    """out = block @ W^T (or @ W when transpose) for one m block; grouped by spec.ptr rows."""
+    if spec.groups:
+        from ._cublas_grouped_gemm import _loop_max
+        _gemm_ext().grouped_gemm_into_fp32(block, spec.ptr, weight, out, bool(transpose), False,
+                                           _loop_max((weight,)))
+    else:
+        torch.mm(block, weight if transpose else weight.t(), out=out)
+
+
+def _pair_weight_grad(grad_block, block, out, spec):
+    """out = grad_block^T @ block per group (or for the single weight)."""
+    if spec.groups:
+        from ._cublas_grouped_gemm import _loop_max
+        _gemm_ext().grouped_gemm_weight_grad_into_fp32(grad_block, block, spec.ptr, out, False,
+                                                       _loop_max((out,)))
+    else:
+        torch.mm(grad_block.t(), block, out=out)
 
 
 def _view(flat, n, prefix, width):
@@ -142,7 +169,11 @@ class _Sandwich(torch.autograd.Function):
     [Cout_0, Cin_0] and bias when present, one stacked pair weight [2*Cout_m, Cin_m]
     per m > 0 block, one radial weight per block (front: [N, Cin_b] scales the
     block's input before its GEMM; back: [N, Cout_b] scales its output), and a
-    per-edge gate [N] that scales the whole result."""
+    per-edge gate [N] that scales the whole result.
+
+    With ``spec.groups`` = G > 0 the pair weights are [G, 2*Cout_m, Cin_m]: edge e
+    is stored in block row ``spec.rows[e]`` (rows sorted by group, ``spec.order``
+    the inverse) and the rows ``spec.ptr[g]:spec.ptr[g+1]`` use weight g."""
 
     @staticmethod
     def forward(ctx, x, plan, layout, wigner, spec, *tensors):
@@ -155,15 +186,19 @@ class _Sandwich(torch.autograd.Function):
         pair_weights = [t.pop(0) for _ in range(spec.n_pairs)]
         radials = [t.pop(0) for _ in range(spec.n_radials)]
         gate = t.pop(0) if spec.has_gate else None
-        packed = _rotate(x, inp, plan, wigner, layout.rotate_in)
+        rows = spec.rows
+        # Radial weights follow the block rows (sorted by group when grouped).
+        block_radials = [r.index_select(0, spec.order) for r in radials] if spec.order is not None else radials
+        packed = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=rows)
         block_weights = (ext.block_complex_weights_fp32([w.contiguous() for w in pair_weights])
                          if pair_weights else None)
         result_blocks = x.new_empty(n * out.total)
+        groups = max(spec.groups, 1)
         cursor = 0
         for b, (m, cin, cout) in enumerate(plan.blocks):
             block = _view(packed, n, inp.prefix[m], inp.stride[m])
             if spec.radial_mode == "front":
-                block = _scale_block(block, radials[b], m > 0)
+                block = _scale_block(block, block_radials[b], m > 0)
             target = _view(result_blocks, n, out.prefix[m], out.stride[m])
             if m == 0:
                 if b0 is not None:
@@ -171,17 +206,19 @@ class _Sandwich(torch.autograd.Function):
                 else:
                     torch.mm(block, w0.t(), out=target)
             else:
-                weight = block_weights[cursor:cursor + 4 * cout * cin].view(2 * cout, 2 * cin)
-                cursor += 4 * cout * cin
-                torch.mm(block, weight.t(), out=target)
+                size = groups * 4 * cout * cin
+                weight = block_weights[cursor:cursor + size]
+                weight = weight.view(groups, 2 * cout, 2 * cin) if spec.groups else weight.view(2 * cout, 2 * cin)
+                cursor += size
+                _pair_gemm(block, weight, target, spec)
         scaled_blocks = result_blocks
         if spec.radial_mode == "back":
             scaled_blocks = torch.empty_like(result_blocks)
             for b, (m, _cin, _cout) in enumerate(plan.blocks):
                 _view(scaled_blocks, n, out.prefix[m], out.stride[m]).copy_(
-                    _scale_block(_view(result_blocks, n, out.prefix[m], out.stride[m]), radials[b], m > 0))
+                    _scale_block(_view(result_blocks, n, out.prefix[m], out.stride[m]), block_radials[b], m > 0))
         result = _gather(scaled_blocks, n, out, plan, wigner, layout.rotate_out,
-                         scale=None if gate is None else gate.contiguous())
+                         scale=None if gate is None else gate.contiguous(), rows=rows)
         needs = ctx.needs_input_grad
         idx = 5
         grad_w0 = bool(spec.has_m0 and needs[idx])
@@ -204,7 +241,7 @@ class _Sandwich(torch.autograd.Function):
                               block_weights if keep_weights else None,
                               w0 if keep_weights else None,
                               result_blocks if keep_result else None,
-                              gate, *radials)
+                              gate, *block_radials)
         ctx.state = (plan, layout, wigner, spec, n)
         return result
 
@@ -216,12 +253,15 @@ class _Sandwich(torch.autograd.Function):
         packed, block_weights, w0, result_blocks, gate, *radials = ctx.saved_tensors
         inp, out = plan.inp, plan.out
         grad_out = grad_out.contiguous()
+        rows = spec.rows
+        groups = max(spec.groups, 1)
         gate_grad = None
         if gate is not None and not grad_gate:
             # d result / d blocks carries the gate as a per-edge scale of the rotation.
-            grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out, scale=gate.contiguous())
+            grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out, scale=gate.contiguous(),
+                                  rows=rows)
         else:
-            grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out)
+            grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out, rows=rows)
             if grad_gate:
                 gate_grad = grad_out.new_zeros(n)
                 for b, (m, _cin, _cout) in enumerate(plan.blocks):
@@ -241,24 +281,33 @@ class _Sandwich(torch.autograd.Function):
                 view.copy_(_scale_block(view, radials[b], m > 0))
         front_grad = spec.radial_mode == "front" and grad_radials
         grad_packed = grad_out.new_empty(n * inp.total) if need_x else None
-        n_pair_entries = sum(4 * co * ci for m, ci, co in plan.blocks if m > 0)
+        n_pair_entries = sum(groups * 4 * co * ci for m, ci, co in plan.blocks if m > 0)
         grad_block_weights = grad_out.new_empty(n_pair_entries) if grad_pairs else None
         grad_w0_value = grad_b0_value = None
         cursor = 0
         for b, (m, cin, cout) in enumerate(plan.blocks):
             win = inp.stride[m]
             grad_block = _view(grad_blocks, n, out.prefix[m], out.stride[m])
-            size = 4 * cout * cin if m > 0 else 0
+            size = groups * 4 * cout * cin if m > 0 else 0
+            shape = (groups, 2 * cout, 2 * cin) if spec.groups else (2 * cout, 2 * cin)
             if need_x or front_grad:
-                weight = w0 if m == 0 else block_weights[cursor:cursor + size].view(2 * cout, 2 * cin)
+                if m == 0:
+                    grad_in = torch.mm(grad_block, w0) if spec.radial_mode == "front" else None
+                    if grad_in is None:
+                        torch.mm(grad_block, w0, out=_view(grad_packed, n, inp.prefix[m], win))
+                else:
+                    weight = block_weights[cursor:cursor + size].view(*shape)
+                    if spec.radial_mode == "front":
+                        grad_in = grad_out.new_empty(n, win)
+                        _pair_gemm(grad_block, weight, grad_in, spec, transpose=True)
+                    else:
+                        _pair_gemm(grad_block, weight, _view(grad_packed, n, inp.prefix[m], win), spec,
+                                   transpose=True)
                 if spec.radial_mode == "front":
-                    grad_in = torch.mm(grad_block, weight)
                     if front_grad:
                         radial_grads[b] = _rowdot(grad_in, _view(packed, n, inp.prefix[m], win), m > 0, n)
                     if need_x:
                         _view(grad_packed, n, inp.prefix[m], win).copy_(_scale_block(grad_in, radials[b], m > 0))
-                else:
-                    torch.mm(grad_block, weight, out=_view(grad_packed, n, inp.prefix[m], win))
             if (m == 0 and grad_w0) or (m > 0 and grad_pairs):
                 block = _view(packed, n, inp.prefix[m], win)
                 if spec.radial_mode == "front":
@@ -266,8 +315,7 @@ class _Sandwich(torch.autograd.Function):
                 if m == 0:
                     grad_w0_value = torch.mm(grad_block.t(), block)
                 else:
-                    torch.mm(grad_block.t(), block,
-                             out=grad_block_weights[cursor:cursor + size].view(2 * cout, 2 * cin))
+                    _pair_weight_grad(grad_block, block, grad_block_weights[cursor:cursor + size].view(*shape), spec)
             if m == 0 and grad_b0:
                 grad_b0_value = grad_block.sum(dim=0)
             cursor += size
@@ -275,8 +323,10 @@ class _Sandwich(torch.autograd.Function):
         if grad_pairs:
             pair_blocks = [(ci, co) for m, ci, co in plan.blocks if m > 0]
             pair_grads = ext.block_complex_weight_grads_fp32(
-                grad_block_weights, [co for _, co in pair_blocks], [ci for ci, _ in pair_blocks])
-        grad_x = _gather(grad_packed, n, inp, plan, wigner, layout.rotate_in) if need_x else None
+                grad_block_weights, [co for _, co in pair_blocks], [ci for ci, _ in pair_blocks], spec.groups)
+        if spec.order is not None:
+            radial_grads = [None if g is None else g.index_select(0, rows) for g in radial_grads]
+        grad_x = _gather(grad_packed, n, inp, plan, wigner, layout.rotate_in, rows=rows) if need_x else None
         grads = [grad_x, None, None, None, None]
         if spec.has_m0:
             grads.append(grad_w0_value)
@@ -289,10 +339,15 @@ class _Sandwich(torch.autograd.Function):
         return tuple(grads)
 
 
-def _apply(x, plan, layout, wigner, *, w0=None, b0=None, pair_weights=(), radials=(), gate=None):
+def _apply(x, plan, layout, wigner, *, w0=None, b0=None, pair_weights=(), radials=(), gate=None,
+           grouping=None):
+    groups, ptr, order, rows = grouping if grouping is not None else (0, None, None, None)
+    if gate is not None and grouping is not None:
+        raise ValueError("a per-edge gate is supported for ungrouped weights only")
     spec = SimpleNamespace(has_m0=w0 is not None, has_bias=b0 is not None, n_pairs=len(pair_weights),
                            radial_mode=("front" if layout.front else "back") if radials else None,
-                           n_radials=len(radials), has_gate=gate is not None)
+                           n_radials=len(radials), has_gate=gate is not None,
+                           groups=int(groups), ptr=ptr, order=order, rows=rows)
     tensors = ([w0] if w0 is not None else []) + ([b0] if b0 is not None else []) + list(pair_weights)
     tensors += list(radials) + ([gate] if gate is not None else [])
     return _Sandwich.apply(x.contiguous(), plan, layout, wigner, spec, *tensors)
@@ -310,6 +365,21 @@ def block_sandwich(x, layout, wigner, weights_by_m, radial_parts=None):
     weights = tuple(weights_by_m[m] for m, _, _ in plan.blocks)
     radials = () if radial_parts is None else tuple(radial_parts[m] for m, _, _ in plan.blocks)
     return _apply(x, plan, layout, wigner, pair_weights=weights, radials=radials)
+
+
+def grouped_sandwich(x, layout, wigner, weights_by_m, radial_parts, ptr_edges, order, rows):
+    """m>0 contribution of [G, 2*Cout_m, Cin_m] pair weights: edges sorted by group
+    (``order``: sorted position -> edge, ``rows``: edge -> sorted position, both None
+    when the edges are already sorted) and group g owning the sorted rows
+    ``ptr_edges[g]:ptr_edges[g+1]`` (CPU int64)."""
+    plan = sandwich_plan(layout, x.shape[1], x.device)
+    if not plan.blocks:
+        return x.new_zeros((x.shape[0], layout.out_dim))
+    weights = tuple(weights_by_m[m] for m, _, _ in plan.blocks)
+    radials = () if radial_parts is None else tuple(radial_parts[m] for m, _, _ in plan.blocks)
+    groups = int(weights[0].shape[0])
+    return _apply(x, plan, layout, wigner, pair_weights=weights, radials=radials,
+                  grouping=(groups, ptr_edges, order, rows))
 
 
 def full_sandwich(x, layout, wigner, w0, b0, pair_weights_by_m, radials_by_m=None, gate=None):

@@ -152,6 +152,37 @@ def _single_group(x, layout, weights, routing):
     return first == 0 and last == 2 * x.shape[0]
 
 
+def _edge_grouping(x, layout, weights, routing):
+    """(ptr over edges, order, rows) of a multi-group route over every pair row, or None.
+
+    The caller sorts pair rows by graph index and gives the CPU pointer over pair
+    rows; both rows of an edge share its group, so the pointer over edges is half of
+    it. The edge order is recomputed here as a stable sort of the graph index, so no
+    property of the caller's pair-row permutation is assumed."""
+    ptr = routing.ptr
+    if ptr.is_cuda or ptr.ndim != 1 or ptr.numel() < 2 or len(weights) != len(layout.maps):
+        return None
+    groups = ptr.numel() - 1
+    for m, w in enumerate(weights[1:], 1):
+        cin, cout = layout.maps[m][0].numel(), layout.maps[m][2].numel()
+        if w.shape != (groups, 2 * cout, cin) or w.device != x.device or w.dtype != x.dtype:
+            return None
+    bounds = [int(v) for v in ptr.tolist()]
+    if (bounds[0] != 0 or bounds[-1] != 2 * x.shape[0] or any(b % 2 for b in bounds)
+            or any(b > c for b, c in zip(bounds, bounds[1:]))):
+        return None
+    ptr_edges = torch.tensor([b // 2 for b in bounds], dtype=torch.long)
+    if routing.permute is None:
+        return ptr_edges, None, None
+    graph = routing.graph_index
+    if graph.ndim != 1 or graph.numel() != x.shape[0] or graph.device != x.device:
+        return None
+    order = torch.argsort(graph.to(torch.long), stable=True)
+    rows = torch.empty_like(order)
+    rows.scatter_(0, order, torch.arange(order.numel(), device=order.device, dtype=order.dtype))
+    return ptr_edges, order, rows
+
+
 def _radials_fit(x, layout, radial_parts, first_m=1):
     """No radial weights, or one radial weight per m block: [N, Cin_m] for front
     layouts, [N, Cout_m] otherwise."""
@@ -182,11 +213,17 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
              'indexed_sandwich_multi_grouped', 'cublas_multi_sandwich_grouped')
     if mode not in ('scalar',) + multi:
         return None
-    if mode in multi and _single_group(x, layout, weights, routing) and _radials_fit(x, layout, radial_parts):
-        # One group over every row: each m block is one plain GEMM of its pair rows.
-        from ._sandwich import block_sandwich, sandwich_plan
-        if sandwich_plan(layout, x.shape[1], x.device).supported:
-            return [block_sandwich(x, layout, wigner, (None,) + tuple(w[0] for w in weights[1:]), radial_parts)]
+    if mode in multi and _radials_fit(x, layout, radial_parts):
+        from ._sandwich import block_sandwich, grouped_sandwich, sandwich_plan
+        if _single_group(x, layout, weights, routing):
+            # One group over every row: each m block is one plain GEMM of its pair rows.
+            if sandwich_plan(layout, x.shape[1], x.device).supported:
+                return [block_sandwich(x, layout, wigner, (None,) + tuple(w[0] for w in weights[1:]),
+                                       radial_parts)]
+        else:
+            grouping = _edge_grouping(x, layout, weights, routing)
+            if grouping is not None and sandwich_plan(layout, x.shape[1], x.device).supported:
+                return [grouped_sandwich(x, layout, wigner, weights, radial_parts, *grouping)]
     linears = tuple(LinearWeights(weight) for weight in weights)
     module = _LayerView(layout, linears, x.device)
     args = (module, x, wigner.values, wigner.compact_offsets, wigner.mode, wigner.stride, routing)
