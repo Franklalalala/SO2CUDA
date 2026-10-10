@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accelerate supported uniform-channel SO(2) rotations with channel-tiled kernels, retaining the general training path for small layouts.
+- Preserve autograd tensor-version checks and respect device shared-memory limits in sandwich operations.
 - Provide uniform and non-uniform SO(2) operator grids, with eager and compiled EquiformerV3, cuEquivariance, and our pure PyTorch reference implementation.
 - Compare UniTB-dense, UniTB, and UniTB-SLEM on the same real training-batch streams for both onsite and hopping heads, using the same HybridMuon optimizer path across backends.
 - Generate the English README performance tables and public numerical evidence from measurement JSON, including timing quartiles, peak memory, unsupported configurations, and out-of-memory results.
