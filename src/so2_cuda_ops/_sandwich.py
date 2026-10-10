@@ -102,19 +102,30 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
     return hit
 
 
-def _rotate(src, side, plan, wigner, rotate, scale=None, rows=None):
+def _rotate(src, side, plan, wigner, rotate, scale=None, rows=None, copies=1):
+    """Rotate ``src`` into the blocks of ``copies`` buffers laid out one after another:
+    copy c stores edge e in row ``rows[c * N + e]``, scaled by ``scale[c * N + e]``."""
     return _ext().channel_rotate_to_blocks_fp32(
         src, wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.total, plan.no_scale if scale is None else scale,
-        plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode), int(wigner.stride))
+        plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode), int(wigner.stride), int(copies))
 
 
-def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None, into=None):
+def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None, into=None, copies=1):
+    """Rotate back sum_c scale_c * (block rows of copy c) into feature rows [N, dim]."""
     return _ext().channel_gather_from_blocks_fp32(
         src, int(n), wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.dim, bool(side.zero_fill), plan.no_scale if scale is None else scale,
         plan.no_scale if into is None else into, plan.no_rows if rows is None else rows, bool(rotate),
-        int(wigner.mode), int(wigner.stride))
+        int(wigner.mode), int(wigner.stride), int(copies))
+
+
+def _copy_rows(slots, n, device):
+    """[K * N] block row of every edge in every slot, or None when every slot keeps the edge order."""
+    if all(slot.rows is None for slot in slots):
+        return None
+    rows = [slot.rows if slot.rows is not None else torch.arange(n, device=device) for slot in slots]
+    return rows[0].contiguous() if len(rows) == 1 else torch.cat(rows)
 
 
 def _gemm_ext():
@@ -197,11 +208,12 @@ class _Sandwich(torch.autograd.Function):
     [N, Cout_b] scales its output) and one per-edge gate [N] per slot.
 
     The result is the sum over ``spec.slots``. Each slot stores edge e in block row
-    ``slot.rows[e]`` (``slot.order`` is the inverse; both None for the edge order)
-    and, when the weights are grouped (``spec.groups`` = G > 0: weights
-    [G, Cout_0, Cin_0], bias [G, Cout_0], pair weights [G, 2*Cout_m, Cin_m]), uses
-    weight g for the block rows ``slot.ptr[g]:slot.ptr[g+1]``. A gated slot is
-    scaled per edge by its gate."""
+    ``slot.rows[e]`` (``slot.order`` is the inverse; both None for the edge order) of
+    its own copy of the block buffer; one rotation writes every copy and one gather
+    reads them all. When the weights are grouped (``spec.groups`` = G > 0: weights
+    [G, Cout_0, Cin_0], bias [G, Cout_0], pair weights [G, 2*Cout_m, Cin_m]), the block
+    rows ``slot.ptr[g]:slot.ptr[g+1]`` use weight g. A gated slot is scaled per edge
+    by its gate."""
 
     @staticmethod
     def forward(ctx, x, plan, layout, wigner, spec, *tensors):
@@ -234,14 +246,21 @@ class _Sandwich(torch.autograd.Function):
         keep_blocks = back_grad or grad_gates
         block_weights = (ext.block_complex_weights_fp32([w.contiguous() for w in pair_weights])
                          if pair_weights else None)
-        result = None
-        saved = []
-        for j, slot in enumerate(spec.slots):
-            gate = gates[j] if gates else None
+        slots = spec.slots
+        copies = len(slots)
+        rows = _copy_rows(slots, n, x.device)
+        gate_scale = torch.stack(gates).reshape(-1).contiguous() if gates else None
+        in_size, out_size = n * inp.total, n * out.total
+        # One rotation writes the block rows of every slot; one gather below reads them all.
+        packed_all = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=rows, copies=copies)
+        blocks_all = x.new_empty(copies * out_size)
+        scaled_all = blocks_all if spec.radial_mode != "back" else torch.empty_like(blocks_all)
+        slot_radials_all = []
+        for j, slot in enumerate(slots):
+            packed = packed_all[j * in_size:(j + 1) * in_size]
+            blocks = blocks_all[j * out_size:(j + 1) * out_size]
             slot_radials = ([r.index_select(0, slot.order) for r in radials]
                             if slot.order is not None else radials)
-            packed = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=slot.rows)
-            blocks = x.new_empty(n * out.total)
             xs, ws, outs = [], [], []
             cursor = 0
             for b, (m, cin, cout) in enumerate(plan.blocks):
@@ -264,36 +283,37 @@ class _Sandwich(torch.autograd.Function):
             _gemm_many(xs, ws, outs, slot.ptr)
             if b0 is not None and slot.ptr is not None:
                 _view(blocks, n, out.prefix[0], out.stride[0]).add_(b0.index_select(0, _rows_of(slot, n)))
-            scaled = blocks
             if spec.radial_mode == "back":
-                scaled = torch.empty_like(blocks)
+                scaled = scaled_all[j * out_size:(j + 1) * out_size]
                 for b, (m, _cin, _cout) in enumerate(plan.blocks):
                     _view(scaled, n, out.prefix[m], out.stride[m]).copy_(
                         _scale_block(_view(blocks, n, out.prefix[m], out.stride[m]), slot_radials[b], m > 0))
-            result = _gather(scaled, n, out, plan, wigner, layout.rotate_out,
-                             scale=None if gate is None else gate.contiguous(), rows=slot.rows, into=result)
-            saved.append((packed if keep_packed else None, blocks if keep_blocks else None, slot_radials))
-            del packed, blocks, scaled
-        tensors_to_save = [block_weights if keep_weights else None, w0 if keep_weights else None, *gates]
-        for packed, blocks, slot_radials in saved:
-            tensors_to_save += [packed, blocks, *slot_radials]
+            slot_radials_all.append(slot_radials)
+        result = _gather(scaled_all, n, out, plan, wigner, layout.rotate_out, scale=gate_scale, rows=rows,
+                         copies=copies)
+        tensors_to_save = [block_weights if keep_weights else None, w0 if keep_weights else None,
+                           packed_all if keep_packed else None, blocks_all if keep_blocks else None, *gates]
+        for slot_radials in slot_radials_all:
+            tensors_to_save += list(slot_radials)
         ctx.flags = (need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates)
         ctx.save_for_backward(*tensors_to_save)
-        ctx.state = (plan, layout, wigner, spec, n)
+        ctx.state = (plan, layout, wigner, spec, n, rows, gate_scale)
         return result
 
     @staticmethod
     def backward(ctx, grad_out):
         ext = _ext()
-        plan, layout, wigner, spec, n = ctx.state
+        plan, layout, wigner, spec, n, rows, gate_scale = ctx.state
         need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates = ctx.flags
         saved = list(ctx.saved_tensors)
-        block_weights, w0 = saved[0], saved[1]
-        gates = saved[2:2 + spec.n_gates]
-        per_slot = saved[2 + spec.n_gates:]
-        width = 2 + spec.n_radials
+        block_weights, w0, packed_all, blocks_all = saved[:4]
+        gates = saved[4:4 + spec.n_gates]
+        radial_saved = saved[4 + spec.n_gates:]
         inp, out = plan.inp, plan.out
         groups = max(spec.groups, 1)
+        slots = spec.slots
+        copies = len(slots)
+        in_size, out_size = n * inp.total, n * out.total
         grad_out = grad_out.contiguous()
         front_grad = spec.radial_mode == "front" and grad_radials
         n_pair_entries = sum(groups * 4 * co * ci for m, ci, co in plan.blocks if m > 0)
@@ -301,28 +321,32 @@ class _Sandwich(torch.autograd.Function):
         grad_w0_value = grad_b0_value = None
         radial_grads = [None] * spec.n_radials
         gate_grads = [None] * spec.n_gates
-        grad_x = None
-        for j, slot in enumerate(spec.slots):
-            packed, blocks, *slot_radials = per_slot[j * width:(j + 1) * width]
-            gate = gates[j] if gates else None
-            rows = slot.rows
-            if gate is not None and not grad_gates:
-                # d result / d blocks carries the gate as a per-edge scale of the rotation.
-                grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out, scale=gate.contiguous(),
-                                      rows=rows)
-            else:
-                grad_blocks = _rotate(grad_out, out, plan, wigner, layout.rotate_out, rows=rows)
-                if gate is not None:
-                    row_sum = grad_out.new_zeros(n)
-                    for b, (m, _cin, _cout) in enumerate(plan.blocks):
-                        produced = _view(blocks, n, out.prefix[m], out.stride[m])
-                        if spec.radial_mode == "back":
-                            produced = _scale_block(produced, slot_radials[b], m > 0)
-                        row_sum += (_view(grad_blocks, n, out.prefix[m], out.stride[m]) * produced).sum(dim=1)
-                    gate_grads[j] = row_sum if rows is None else row_sum.index_select(0, rows)
-                    gate_rows = gate if slot.order is None else gate.index_select(0, slot.order)
-                    for m, _cin, _cout in plan.blocks:
-                        _view(grad_blocks, n, out.prefix[m], out.stride[m]).mul_(gate_rows.unsqueeze(1))
+        if gates and not grad_gates:
+            # d result / d blocks carries each slot's gate as a per-edge scale of its copy.
+            grad_blocks_all = _rotate(grad_out, out, plan, wigner, layout.rotate_out, scale=gate_scale, rows=rows,
+                                      copies=copies)
+        else:
+            grad_blocks_all = _rotate(grad_out, out, plan, wigner, layout.rotate_out, rows=rows, copies=copies)
+        grad_packed_all = grad_out.new_empty(copies * in_size) if need_x else None
+        for j, slot in enumerate(slots):
+            packed = None if packed_all is None else packed_all[j * in_size:(j + 1) * in_size]
+            blocks = None if blocks_all is None else blocks_all[j * out_size:(j + 1) * out_size]
+            grad_blocks = grad_blocks_all[j * out_size:(j + 1) * out_size]
+            grad_packed = None if grad_packed_all is None else grad_packed_all[j * in_size:(j + 1) * in_size]
+            slot_radials = radial_saved[j * spec.n_radials:(j + 1) * spec.n_radials]
+            slot_rows = slot.rows
+            if gates and grad_gates:
+                gate = gates[j]
+                row_sum = grad_out.new_zeros(n)
+                for b, (m, _cin, _cout) in enumerate(plan.blocks):
+                    produced = _view(blocks, n, out.prefix[m], out.stride[m])
+                    if spec.radial_mode == "back":
+                        produced = _scale_block(produced, slot_radials[b], m > 0)
+                    row_sum += (_view(grad_blocks, n, out.prefix[m], out.stride[m]) * produced).sum(dim=1)
+                gate_grads[j] = row_sum if slot_rows is None else row_sum.index_select(0, slot_rows)
+                gate_rows = gate if slot.order is None else gate.index_select(0, slot.order)
+                for m, _cin, _cout in plan.blocks:
+                    _view(grad_blocks, n, out.prefix[m], out.stride[m]).mul_(gate_rows.unsqueeze(1))
             slot_radial_grads = [None] * spec.n_radials
             if spec.radial_mode == "back":
                 for b, (m, _cin, _cout) in enumerate(plan.blocks):
@@ -330,7 +354,6 @@ class _Sandwich(torch.autograd.Function):
                     if grad_radials:
                         slot_radial_grads[b] = _rowdot(view, _view(blocks, n, out.prefix[m], out.stride[m]), m > 0, n)
                     view.copy_(_scale_block(view, slot_radials[b], m > 0))
-            grad_packed = grad_out.new_empty(n * inp.total) if need_x else None
             dx_in, dx_w, dx_out, front_rows = [], [], [], []
             dw_grad, dw_in, dw_out = [], [], []
             cursor = 0
@@ -379,11 +402,13 @@ class _Sandwich(torch.autograd.Function):
             for b, value in enumerate(slot_radial_grads):
                 if value is None:
                     continue
-                if rows is not None:
-                    value = value.index_select(0, rows)
+                if slot_rows is not None:
+                    value = value.index_select(0, slot_rows)
                 radial_grads[b] = value if radial_grads[b] is None else radial_grads[b] + value
-            if need_x:
-                grad_x = _gather(grad_packed, n, inp, plan, wigner, layout.rotate_in, rows=rows, into=grad_x)
+        grad_x = None
+        if need_x:
+            # One gather sums the input gradients of every slot and rotates them back.
+            grad_x = _gather(grad_packed_all, n, inp, plan, wigner, layout.rotate_in, rows=rows, copies=copies)
         pair_grads = [None] * spec.n_pairs
         if grad_pairs:
             pair_blocks = [(ci, co) for m, ci, co in plan.blocks if m > 0]

@@ -183,76 +183,98 @@ __device__ __forceinline__ int block_width(const BlockSet& b, int m) {
   return static_cast<int>(b.table[3 * m + 1]);
 }
 
-// Rotate one channel of degree L into the blocks: r_j = sum_d v[d] D[d][j],
-// r_{L-m} -> pair 0 and r_{L+m} -> pair 1 of block m, r_L -> block 0.
+// Copies of the block buffer: copy c (one per routing slot) starts at c * copy_stride
+// and stores edge e in row rows[c * n_edges + e] (row e when rows is null), scaled by
+// scales[c * n_edges + e] (1 when scales is null).
+struct Copies {
+  const int64_t* __restrict__ rows;
+  const float* __restrict__ scales;
+  int64_t stride;
+  int count;
+};
+
+__device__ __forceinline__ int64_t copy_row(const Copies& c, int i, int64_t n_edges, int64_t edge) {
+  return c.rows == nullptr ? edge : c.rows[i * n_edges + edge];
+}
+
+__device__ __forceinline__ float copy_scale(const Copies& c, int i, int64_t n_edges, int64_t edge) {
+  return c.scales == nullptr ? 1.0f : c.scales[i * n_edges + edge];
+}
+
+// Rotate one channel of degree L into the blocks of every copy: r_j = sum_d v[d] D[d][j],
+// r_{L-m} -> pair 0 and r_{L+m} -> pair 1 of block m, r_L -> block 0. The rotation is
+// computed once and written to each copy.
 template <int L>
 __device__ __forceinline__ void rotate_channel_to_blocks(
-    const float* __restrict__ src,
+    const float* src,
     const int32_t* __restrict__ cols,
     int mtab,
     const BlockSet& blocks,
     float* __restrict__ dst,
+    const Copies& copies,
     int64_t n_edges,
-    int64_t row,
+    int64_t edge,
     const float* __restrict__ D,
-    int64_t rs,
-    float scale) {
+    int64_t rs) {
   constexpr int dim = 2 * L + 1;
+  const int reach = mtab < L ? mtab : L;
   float v[dim];
 #pragma unroll
   for (int d = 0; d < dim; ++d) {
     v[d] = src[d];
   }
-  if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
-    float r = v[L];
-    if (D != nullptr && L > 0) {
-      r = 0.0f;
+  float r[dim];
 #pragma unroll
-      for (int d = 0; d < dim; ++d) {
-        r = fmaf(v[d], __ldg(D + d * rs + L), r);
+  for (int j = 0; j < dim; ++j) {
+    r[j] = 0.0f;
+    if (j - L <= reach && L - j <= reach) {
+      if (D == nullptr || L == 0) {
+        r[j] = v[j];
+      } else {
+#pragma unroll
+        for (int d = 0; d < dim; ++d) {
+          r[j] = fmaf(v[d], __ldg(D + d * rs + j), r[j]);
+        }
       }
     }
-    dst[block_row(blocks, 0, n_edges, row) + cols[0]] = r * scale;
   }
-#pragma unroll
-  for (int m = 1; m <= L; ++m) {
-    if (m > mtab) {
-      break;
+  for (int c = 0; c < copies.count; ++c) {
+    const int64_t row = copy_row(copies, c, n_edges, edge);
+    const float scale = copy_scale(copies, c, n_edges, edge);
+    float* __restrict__ out_copy = dst + c * copies.stride;
+    if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
+      out_copy[block_row(blocks, 0, n_edges, row) + cols[0]] = r[L] * scale;
     }
-    const int col = cols[m];
-    if (col < 0 || block_width(blocks, m) == 0) {
-      continue;
-    }
-    float r0 = v[L - m];
-    float r1 = v[L + m];
-    if (D != nullptr) {
-      r0 = 0.0f;
-      r1 = 0.0f;
 #pragma unroll
-      for (int d = 0; d < dim; ++d) {
-        r0 = fmaf(v[d], __ldg(D + d * rs + (L - m)), r0);
-        r1 = fmaf(v[d], __ldg(D + d * rs + (L + m)), r1);
+    for (int m = 1; m <= L; ++m) {
+      if (m > mtab) {
+        break;
       }
+      const int col = cols[m];
+      if (col < 0 || block_width(blocks, m) == 0) {
+        continue;
+      }
+      float* __restrict__ out = out_copy + block_row(blocks, m, n_edges, row) + col;
+      out[0] = r[L - m] * scale;
+      out[block_width(blocks, m)] = r[L + m] * scale;
     }
-    float* __restrict__ out = dst + block_row(blocks, m, n_edges, row) + col;
-    out[0] = r0 * scale;
-    out[block_width(blocks, m)] = r1 * scale;
   }
 }
 
-// Gather one channel of degree L from the blocks and rotate it back:
-// out[d] = sum_j D[d][j] g[j] with g_{L-m}, g_{L+m} from block m and g_L from block 0.
+// Gather one channel of degree L from the blocks of every copy and rotate it back:
+// g = sum_c scale_c * (g_{L-m}, g_{L+m} from block m, g_L from block 0 of copy c) and
+// out[d] = sum_j D[d][j] g[j].
 template <int L>
 __device__ __forceinline__ void gather_channel_from_blocks(
     const float* __restrict__ src,
     const int32_t* __restrict__ cols,
     int mtab,
     const BlockSet& blocks,
+    const Copies& copies,
     int64_t n_edges,
-    int64_t row,
+    int64_t edge,
     const float* __restrict__ D,
     int64_t rs,
-    float scale,
     bool accumulate,
     float* __restrict__ out) {
   constexpr int dim = 2 * L + 1;
@@ -261,21 +283,26 @@ __device__ __forceinline__ void gather_channel_from_blocks(
   for (int j = 0; j < dim; ++j) {
     g[j] = 0.0f;
   }
-  if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
-    g[L] = src[block_row(blocks, 0, n_edges, row) + cols[0]];
-  }
+  for (int c = 0; c < copies.count; ++c) {
+    const int64_t row = copy_row(copies, c, n_edges, edge);
+    const float scale = copy_scale(copies, c, n_edges, edge);
+    const float* __restrict__ in_copy = src + c * copies.stride;
+    if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
+      g[L] = fmaf(scale, in_copy[block_row(blocks, 0, n_edges, row) + cols[0]], g[L]);
+    }
 #pragma unroll
-  for (int m = 1; m <= L; ++m) {
-    if (m > mtab) {
-      break;
+    for (int m = 1; m <= L; ++m) {
+      if (m > mtab) {
+        break;
+      }
+      const int col = cols[m];
+      if (col < 0 || block_width(blocks, m) == 0) {
+        continue;
+      }
+      const float* __restrict__ in = in_copy + block_row(blocks, m, n_edges, row) + col;
+      g[L - m] = fmaf(scale, in[0], g[L - m]);
+      g[L + m] = fmaf(scale, in[block_width(blocks, m)], g[L + m]);
     }
-    const int col = cols[m];
-    if (col < 0 || block_width(blocks, m) == 0) {
-      continue;
-    }
-    const float* __restrict__ in = src + block_row(blocks, m, n_edges, row) + col;
-    g[L - m] = in[0];
-    g[L + m] = in[block_width(blocks, m)];
   }
   const int reach = mtab < L ? mtab : L;
 #pragma unroll
@@ -292,31 +319,29 @@ __device__ __forceinline__ void gather_channel_from_blocks(
         }
       }
     }
-    acc *= scale;
     out[d] = accumulate ? out[d] + acc : acc;
   }
 }
 
 // Degrees above the unrolled range: same arithmetic without register arrays.
 __device__ void rotate_channel_to_blocks_any(
-    const float* __restrict__ src,
+    const float* src,
     int l,
     const int32_t* __restrict__ cols,
     int mtab,
     const BlockSet& blocks,
     float* __restrict__ dst,
+    const Copies& copies,
     int64_t n_edges,
-    int64_t row,
+    int64_t edge,
     const float* __restrict__ D,
-    int64_t rs,
-    float scale) {
+    int64_t rs) {
   const int dim = 2 * l + 1;
   for (int m = 0; m <= l && m <= mtab; ++m) {
     const int col = cols[m];
     if (col < 0 || block_width(blocks, m) == 0) {
       continue;
     }
-    float* __restrict__ out = dst + block_row(blocks, m, n_edges, row) + col;
     for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
       const int j = p == 0 ? l - m : l + m;
       float r = src[j];
@@ -326,7 +351,11 @@ __device__ void rotate_channel_to_blocks_any(
           r = fmaf(src[d], D[d * rs + j], r);
         }
       }
-      out[p * block_width(blocks, m)] = r * scale;
+      for (int c = 0; c < copies.count; ++c) {
+        float* __restrict__ out = dst + c * copies.stride +
+                                  block_row(blocks, m, n_edges, copy_row(copies, c, n_edges, edge)) + col;
+        out[p * block_width(blocks, m)] = r * copy_scale(copies, c, n_edges, edge);
+      }
     }
   }
 }
@@ -337,29 +366,32 @@ __device__ void gather_channel_from_blocks_any(
     const int32_t* __restrict__ cols,
     int mtab,
     const BlockSet& blocks,
+    const Copies& copies,
     int64_t n_edges,
-    int64_t row,
+    int64_t edge,
     const float* __restrict__ D,
     int64_t rs,
-    float scale,
     bool accumulate,
     float* __restrict__ out) {
   const int dim = 2 * l + 1;
   for (int d = 0; d < dim; ++d) {
     float acc = 0.0f;
-    for (int m = 0; m <= l && m <= mtab; ++m) {
-      const int col = cols[m];
-      if (col < 0 || block_width(blocks, m) == 0) {
-        continue;
-      }
-      const float* __restrict__ in = src + block_row(blocks, m, n_edges, row) + col;
-      for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
-        const int j = p == 0 ? l - m : l + m;
-        const float g = in[p * block_width(blocks, m)];
-        acc = D == nullptr ? (d == j ? acc + g : acc) : fmaf(D[d * rs + j], g, acc);
+    for (int c = 0; c < copies.count; ++c) {
+      const int64_t row = copy_row(copies, c, n_edges, edge);
+      const float scale = copy_scale(copies, c, n_edges, edge);
+      for (int m = 0; m <= l && m <= mtab; ++m) {
+        const int col = cols[m];
+        if (col < 0 || block_width(blocks, m) == 0) {
+          continue;
+        }
+        const float* __restrict__ in = src + c * copies.stride + block_row(blocks, m, n_edges, row) + col;
+        for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
+          const int j = p == 0 ? l - m : l + m;
+          const float g = scale * in[p * block_width(blocks, m)];
+          acc = D == nullptr ? (d == j ? acc + g : acc) : fmaf(D[d * rs + j], g, acc);
+        }
       }
     }
-    acc *= scale;
     out[d] = accumulate ? out[d] + acc : acc;
   }
 }
@@ -419,8 +451,7 @@ __global__ void channel_rotate_to_blocks_kernel(
     int mtab,
     BlockSet blocks,
     float* __restrict__ dst,
-    const float* __restrict__ edge_scale,
-    const int64_t* __restrict__ row_of_edge,
+    Copies copies,
     int64_t n_edges,
     int64_t n_channels) {
   __shared__ float stage_all[kChannelThreads * kStageWidth];
@@ -454,13 +485,11 @@ __global__ void channel_rotate_to_blocks_kernel(
   if (!active) {
     return;
   }
-  const int64_t row = row_of_edge == nullptr ? edge : row_of_edge[edge];
   const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
   int64_t rs = 0;
   const float* __restrict__ D = (w.mode != 0 && l > 0) ? wigner_block(w, edge, l, rs) : nullptr;
-  const float scale = edge_scale == nullptr ? 1.0f : edge_scale[edge];
-  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)),
-                      (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)));
+  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, copies, n_edges, edge, D, rs)),
+                      (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, copies, n_edges, edge, D, rs)));
 }
 
 __global__ void channel_gather_from_blocks_kernel(
@@ -474,9 +503,8 @@ __global__ void channel_gather_from_blocks_kernel(
     BlockSet blocks,
     float* __restrict__ dst,
     int64_t dst_stride,
-    const float* __restrict__ edge_scale,
+    Copies copies,
     bool accumulate,
-    const int64_t* __restrict__ row_of_edge,
     int64_t n_edges,
     int64_t n_channels) {
   // When the 32 lanes of a warp hold consecutive channels of one edge, their outputs
@@ -503,15 +531,13 @@ __global__ void channel_gather_from_blocks_kernel(
   if (!active) {
     return;
   }
-  const int64_t row = row_of_edge == nullptr ? edge : row_of_edge[edge];
   const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
   int64_t rs = 0;
   const float* __restrict__ D = (w.mode != 0 && l > 0) ? wigner_block(w, edge, l, rs) : nullptr;
-  const float scale = edge_scale == nullptr ? 1.0f : edge_scale[edge];
   if (staged) {
     float* __restrict__ stage = stage_all + (threadIdx.x - lane) * kStageWidth;
     float* __restrict__ mine = stage + offset;
-    SO2_DISPATCH_DEGREE(l, (gather_channel_from_blocks<LL>(src, cols, mtab, blocks, n_edges, row, D, rs, scale,
+    SO2_DISPATCH_DEGREE(l, (gather_channel_from_blocks<LL>(src, cols, mtab, blocks, copies, n_edges, edge, D, rs,
                                                            false, mine)),
                         ((void)0));
     __syncwarp();
@@ -528,9 +554,9 @@ __global__ void channel_gather_from_blocks_kernel(
     return;
   }
   float* __restrict__ out = dst + edge * dst_stride + base;
-  SO2_DISPATCH_DEGREE(l, (gather_channel_from_blocks<LL>(src, cols, mtab, blocks, n_edges, row, D, rs, scale,
+  SO2_DISPATCH_DEGREE(l, (gather_channel_from_blocks<LL>(src, cols, mtab, blocks, copies, n_edges, edge, D, rs,
                                                          accumulate, out)),
-                      (gather_channel_from_blocks_any(src, l, cols, mtab, blocks, n_edges, row, D, rs, scale,
+                      (gather_channel_from_blocks_any(src, l, cols, mtab, blocks, copies, n_edges, edge, D, rs,
                                                       accumulate, out)));
 }
 
@@ -677,10 +703,11 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     torch::Tensor row_of_edge,
     bool rotate,
     int64_t wigner_mode,
-    int64_t wigner_stride) {
+    int64_t wigner_stride,
+    int64_t copies) {
   const int64_t n_edges = src.size(0);
   const int64_t n_channels = ch_base.numel();
-  auto dst = torch::empty({n_edges * total_width}, src.options());
+  auto dst = torch::empty({copies * n_edges * total_width}, src.options());
   if (n_edges == 0 || n_channels == 0 || total_width == 0) {
     return dst;
   }
@@ -690,12 +717,13 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
   const int64_t total = n_edges * n_channels;
   const dim3 grid((total + kChannelThreads - 1) / kChannelThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
+                        edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
+                        n_edges * total_width, static_cast<int>(copies)};
   channel_rotate_to_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), src.size(1), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
-      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(),
-      edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
-      row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
+      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set,
       n_edges, n_channels);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dst;
@@ -718,7 +746,8 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor row_of_edge,
     bool rotate,
     int64_t wigner_mode,
-    int64_t wigner_stride) {
+    int64_t wigner_stride,
+    int64_t copies) {
   const int64_t n_channels = ch_base.numel();
   const bool accumulate = accumulate_into.numel() > 0;
   torch::Tensor dst;
@@ -737,13 +766,14 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
   const int64_t total = n_edges * n_channels;
   const dim3 grid((total + kChannelThreads - 1) / kChannelThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
+                        edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
+                        src.numel() / copies, static_cast<int>(copies)};
   channel_gather_from_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
-      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), dst.size(1),
-      edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr, accumulate,
-      row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
-      n_edges, n_channels);
+      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), dst.size(1), copy_set,
+      accumulate, n_edges, n_channels);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dst;
 }
