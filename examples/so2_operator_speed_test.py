@@ -373,9 +373,11 @@ def run(args):
                     "reason": "No correct SO2CUDA candidate completed; see so2cuda_alternatives"}
         elif name == "cueq":
             alternatives = []
-            for descriptor_name, method, rotation in itertools.product(
+            combinations = (list(itertools.product(
                     ("escn_tp", "escn_tp_compact"),
-                    ("naive", "uniform_1d", "fused_tp", "indexed_linear"), ("pytorch", "cueq")):
+                    ("naive", "uniform_1d", "fused_tp", "indexed_linear"), ("pytorch", "cueq")))
+                    if getattr(args, "cueq_choice", None) is None else [tuple(args.cueq_choice.split(","))])
+            for descriptor_name, method, rotation in combinations:
                 row = {"descriptor": descriptor_name, "method": method, "rotation": rotation}
                 key = descriptor_name, method, rotation
                 if key in rejected:
@@ -418,7 +420,10 @@ def run(args):
             if valid:
                 selected = min(valid, key=lambda r: r["forward_backward"]["median_ms"])
                 report["implementations"][name] = dict(selected)
-                report["implementations"][name]["selection"] = "Minimum correct forward+backward median across descriptor/method/rotation candidates"
+                report["implementations"][name]["selection"] = (
+                    "Minimum correct forward+backward median across descriptor/method/rotation candidates"
+                    if getattr(args, "cueq_choice", None) is None else
+                    "Fixed descriptor/method/rotation given by --cueq-choice (selected by an earlier full scan)")
             else:
                 report["implementations"][name] = {"status": "oom" if any(r["status"] == "oom" for r in alternatives) else "failed",
                                                     "reason": "No correct available candidate completed; see cueq_alternatives"}
@@ -485,6 +490,8 @@ def main():
     parser.add_argument("--include-compile", action="store_true")
     parser.add_argument("--cueq-rejections-json", type=Path,
                         help="Reuse matching unsupported/incorrect method evidence; never reuse timings")
+    parser.add_argument("--cueq-choice", help="descriptor,method,rotation: time only this cuEquivariance "
+                        "combination instead of scanning all of them")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
@@ -492,6 +499,12 @@ def main():
         parser.error("Require positive edges/channels and nonnegative lmax")
     if not args.check_only and (args.warmup < 5 or args.iterations < 20):
         parser.error("Timing requires at least 5 warmups and 20 iterations")
+    if args.cueq_choice is not None:
+        choice = tuple(args.cueq_choice.split(","))
+        if (len(choice) != 3 or choice[0] not in ("escn_tp", "escn_tp_compact")
+                or choice[1] not in ("naive", "uniform_1d", "fused_tp", "indexed_linear")
+                or choice[2] not in ("pytorch", "cueq")):
+            parser.error("--cueq-choice must be descriptor,method,rotation")
     run(args)
 
 
