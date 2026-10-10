@@ -151,7 +151,8 @@ def _edge_tiles_fit(plan, wigner, in_dim, device, out_side=False):
     need = max(in_dim + wigner_floats, plan.inp.total + wigner_floats + in_dim)
     if out_side:
         need = max(need, plan.out.total + wigner_floats + plan.out.dim)
-    return need * 4 <= _SHARED_MEMORY[key]
+    # The gather kernel also reserves 32 floats of static reduction scratch.
+    return need * 4 + 32 * 4 <= _SHARED_MEMORY[key]
 
 
 def _radials_by_m(plan, radials):
@@ -358,25 +359,32 @@ class _Sandwich(torch.autograd.Function):
             for slot_radials in slot_radials_all:
                 tensors_to_save += list(slot_radials)
         ctx.flags = (need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates)
-        ctx.save_for_backward(*tensors_to_save)
-        ctx.state = (plan, layout, wigner, spec, n, rows, gate_scale)
+        # Geometry and externally supplied group ids are read again in backward.
+        # Saving their references enables autograd's in-place version checks.
+        ctx.save_for_backward(wigner.values, wigner.compact_offsets,
+                              *(slot.group_rows for slot in slots), *tensors_to_save)
+        ctx.state = (plan, layout, (wigner.mode, wigner.stride), spec, n, rows, gate_scale)
         return result
 
     @staticmethod
     def backward(ctx, grad_out):
         ext = _ext()
-        plan, layout, wigner, spec, n, rows, gate_scale = ctx.state
+        plan, layout, wigner_meta, spec, n, rows, gate_scale = ctx.state
         need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates = ctx.flags
         saved = list(ctx.saved_tensors)
+        wigner = SimpleNamespace(values=saved[0], compact_offsets=saved[1],
+                                 mode=wigner_meta[0], stride=wigner_meta[1])
+        slots = [SimpleNamespace(**{**vars(slot), "group_rows": group_rows})
+                 for slot, group_rows in zip(spec.slots, saved[2:2 + len(spec.slots)])]
+        saved = saved[2 + len(slots):]
         block_weights, w0, packed_all, blocks_all, x_saved, b0_saved = saved[:6]
         gates = saved[6:6 + spec.n_gates]
         radial_saved = saved[6 + spec.n_gates:]
         if spec.fused_radial:
             return _Sandwich._fused_backward(ctx, grad_out, block_weights, w0, x_saved, b0_saved, gates, radial_saved,
-                                             blocks_all)
+                                             blocks_all, wigner, slots)
         inp, out = plan.inp, plan.out
         groups = max(spec.groups, 1)
-        slots = spec.slots
         copies = len(slots)
         in_size, out_size = n * inp.total, n * out.total
         grad_out = grad_out.contiguous()
@@ -490,15 +498,14 @@ class _Sandwich(torch.autograd.Function):
         return tuple(grads)
 
     @staticmethod
-    def _fused_backward(ctx, grad_out, block_weights, w0, x, b0, gates, radials, pre_radial):
+    def _fused_backward(ctx, grad_out, block_weights, w0, x, b0, gates, radials, pre_radial, wigner, slots):
         """Backward of a radial layer whose forward kept only the input (and, with back radial
         weights, the gate-weighted sum of the blocks before the radial scaling)."""
         ext = _ext()
-        plan, layout, wigner, spec, n, rows, gate_scale = ctx.state
+        plan, layout, _wigner_meta, spec, n, rows, gate_scale = ctx.state
         need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates = ctx.flags
         inp, out = plan.inp, plan.out
         groups = max(spec.groups, 1)
-        slots = spec.slots
         copies = len(slots)
         in_size, out_size = n * inp.total, n * out.total
         grad_out = grad_out.contiguous()

@@ -127,7 +127,10 @@ def _env_cuda_paths() -> tuple[list[str], list[str]]:
                 library_paths.append(str(library_dir))
     seen = set(include_paths)
     lib_seen = set(library_paths)
-    for root in _candidate_toolkit_roots():
+    # Do not mix headers from other installed toolkit versions. An older
+    # cudaFuncAttributes layout is incompatible with a newer CUDA runtime.
+    toolkit = os.environ.get("CUDA_HOME") or torch_cpp_extension.CUDA_HOME
+    for root in ([Path(toolkit)] if toolkit else []):
         for include_dir in (root / "include", root / "targets" / "x86_64-linux" / "include"):
             if (include_dir / "cuda_runtime_api.h").is_file() and str(include_dir) not in seen:
                 include_paths.append(str(include_dir))

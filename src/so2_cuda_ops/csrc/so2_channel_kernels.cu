@@ -916,14 +916,17 @@ int edge_block_threads(int64_t n_channels) {
 // Allows `bytes` of dynamic shared memory for `kernel`; false when the device cannot.
 template <typename Kernel>
 bool allow_shared_memory(Kernel kernel, int64_t bytes) {
-  if (bytes <= 48 * 1024) {
+  cudaFuncAttributes attributes;
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+  const int64_t total_bytes = bytes + attributes.sharedSizeBytes;
+  if (total_bytes <= 48 * 1024) {
     return true;
   }
   int device = 0;
   int optin = 0;
   C10_CUDA_CHECK(cudaGetDevice(&device));
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-  if (bytes > optin) {
+  if (total_bytes > optin) {
     return false;
   }
   C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
