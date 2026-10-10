@@ -26,4 +26,4 @@ CPU、非 FP32、autocast、`torch.func` 或 Wigner 求导时，SO2 接口返回
 
 单算子的四种实现、参数映射及计时约定见 [算子对照说明](operator-benchmark.md)；运行 `python examples/so2_operator_speed_test.py --help` 查看形状、可选依赖和等价性检查选项。
 
-各实现的旋转、逐 m 线性与逆旋转调用链见 [源码核查](rotation-implementation-audit.md)，其中区分 Wigner 系数重排、indexed sandwich 的 CUDA pack/scatter 和独立的分组 GEMM。
+各实现的旋转、逐 m 线性与逆旋转调用链见 [源码核查](rotation-implementation-audit.md)，其中区分 Wigner 系数重排、indexed sandwich 的旋转 kernel 和独立的 GEMM。

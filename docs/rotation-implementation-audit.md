@@ -1,6 +1,6 @@
 # 旋转与 SO(2) 线性的源码核查
 
-本页核查指定版本的源码调用链：将特征旋转到边坐标系，执行逐 m 的 SO(2) 线性，再旋转回原坐标系。这里的 **indexed sandwich** 指 SO2CUDA 用通道索引在 CUDA pack 中读取特征并计算所需 Wigner 分量，接分组 GEMM，再在 CUDA scatter 中合并复数线性结果、逆旋转与输出写入。GEMM 与 pack/scatter 是分别调用的阶段。它与把系数排列并入 Wigner 矩阵的优化有明确区别。
+本页核查指定版本的源码调用链：将特征旋转到边坐标系，执行逐 m 的 SO(2) 线性，再旋转回原坐标系。这里的 **indexed sandwich** 指 SO2CUDA 用通道索引表在 CUDA kernel 中读取特征、计算所需的 Wigner 分量并写入每个 m 一块的缓冲，接 cuBLAS GEMM，再由另一个 CUDA kernel 从各块读回、逆旋转并写出特征。GEMM 与两个旋转 kernel 是分别调用的阶段。它与把系数排列并入 Wigner 矩阵的优化有明确区别。
 
 下表中的判断只覆盖所列版本、文件和公开调用链，不是文献新颖性结论，也不推断未读取的底层实现。
 
@@ -14,7 +14,7 @@
 | fairchem-core `2.10.0`，独立 eSEN / eSCN | 所核查的安装包中没有这些独立模块；不能用 UMA 的实现代替其证据 | 该版本安装包范围内不适用；下文另列可复核的历史源码 |
 | e3nn `0.5.8` | 提供 Wigner / irreps 表示矩阵和一般 SO(3) 张量积；所读 API 不是完整 eSCN 型 SO(2) sandwich 层 | 在下文所列 Wigner 和 TensorProduct 代码路径中未见这一组合 |
 | DeePTB 上游 main 快照 `1dcc7f6` | 逐 l `bmm`；布尔掩码提取逐 m 特征；逐 m Linear；写回；逐输出 irrep `einsum` 逆旋转 | 原版使用普通 PyTorch 提取和写回，没有所述 CUDA pack/scatter |
-| SO2CUDA `484b7c7` 的 `dense_pairs` 默认路线 | 逐 m CUDA Wigner pack；多问题分组 GEMM；逐 m CUDA raw scatter；调用方按序相加 | 有；默认不是一个全算子 CUDA 核，也不是默认多 m 输出主序 scatter |
+| SO2CUDA 的 `true_dense_pairs`／`dense_pairs`／`activation_forward` | CUDA kernel 按（边，通道）旋入每个 m 一块的缓冲；每块一次 cuBLAS GEMM（块复数权重）；CUDA kernel 从各块旋回并写出 | 有；旋转 kernel 与 GEMM 是分开的阶段，不是一个全算子 CUDA 核 |
 
 ## EquiformerV3 原版
 
@@ -69,20 +69,14 @@ UMA 的 `_get_rotmat_and_wigner` 构造 Wigner 和其转置；截断 m 时对矩
 
 ## SO2CUDA 的融合边界
 
-以下按 SO2CUDA [`484b7c74bcf48910c6c95b744111d50617ea0682`](https://github.com/Franklalalala/SO2CUDA/tree/484b7c74bcf48910c6c95b744111d50617ea0682) 的 `dense_pairs` 公共入口核查。该入口返回 m>0 的贡献；m=0 由调用方先计算并在之后相加，见 [`deeptb.py:137–158`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/deeptb.py#L137-L158)。
+以下按本仓库当前源码核查：[`_sandwich.py`](../src/so2_cuda_ops/_sandwich.py) 与 [`so2_channel_kernels.cu`](../src/so2_cuda_ops/csrc/so2_channel_kernels.cu)。公开入口 `true_dense_pairs`、`dense_pairs` 与 `activation_forward` 在受支持的输入上都进入同一个自动微分函数。
 
-1. **索引读取与 Wigner pack。** CUDA 根据 `in_base` 和 `in_l` 找到各通道的原始 irrep 块，计算所需 ±m 的 Wigner 收缩并写到成对特征缓冲区，见 [`so2_pack_scatter_kernel.cu:72–114`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/csrc/so2_pack_scatter_kernel.cu#L72-L114) 和 [`489–519`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/csrc/so2_pack_scatter_kernel.cu#L489-L519)。这一步将所需旋转分量的计算与 pack 合在一个 CUDA 核中，无须先生成完整 l 主序旋转特征再做 m 提取；pack 缓冲区本身仍然存在。
-2. **分组 GEMM。** Python 将各 m 的成对特征展平成行，调用公开 `grouped_gemm_multi`；它进入独立的 cuBLAS 分组 GEMM，见 [`grouped_gemm.py:39–74`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/grouped_gemm.py#L39-L74) 和 [`cublas_grouped_gemm.cpp:66`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/csrc/cublas_grouped_gemm.cpp#L66)。GEMM 输出也仍然是中间张量；不是将旋转和 cuBLAS 放进同一个核。
-3. **复数组合、逆旋转与 scatter。** raw scatter 直接读取 GEMM 的四个实值分量，组成两个 SO(2) 输出，用 Wigner 收缩并写到输出通道位置，见 [`so2_pack_scatter_kernel.cu:701–752`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/csrc/so2_pack_scatter_kernel.cu#L701-L752)。
+1. **旋入。** `channel_rotate_to_blocks` kernel 中一个线程负责一个（边，输入 irrep 通道）：读入该通道的 2l+1 个系数，乘逐 l 的 Wigner 块，把 m=0 分量和各 ±m 分量写到对应 m 块的一行；m>0 块每行为 `[x_{-m} | x_{+m}]`。按组或按专家排序时，kernel 直接写到排序后的行，不另做置换。
+2. **逐块 GEMM。** 每个 m 块一次 GEMM。m>0 的权重是由 `[A;B]` 构成的块复数矩阵 `[[A,-B],[B,A]]`，输出直接是成对的 `(y_{-m}, y_{+m})`；m=0 块用实权重与 bias。有多组（或多个专家）时，每块一次 cuBLAS 分组 GEMM。
+3. **旋回与写出。** `channel_gather_from_blocks` kernel 中一个线程负责一个（边，输出 irrep 通道）：从各 m 块收集该通道的分量，乘转置的 Wigner 块后写出 2l+1 个系数；同一 warp 的通道属于同一 l 且首尾相接时，先在共享内存暂存再合并写出。按边门控与径向权重在块上或在 kernel 内完成。
 
-**默认 `indexed_sandwich_multi` 是逐 m pack 和逐 m scatter，加一次多问题分组 GEMM。** `MULTI_PACK` 和 `MULTI_EPILOGUE` 的默认值都是 0；默认分支逐 m 调 `_PackPairFunction` 和 `_ScatterRawPairOutputFunction`，返回各 m 的贡献给调用方按序相加。证据见 [`tensor_product.py:2927–2930`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/tensor_product.py#L2927-L2930)、[`3047–3062`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/tensor_product.py#L3047-L3062) 和 [`3160–3177`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/tensor_product.py#L3160-L3177)。
+反向使用同样的两个 kernel（角色互换）与 GEMM：输出梯度旋入各块，GEMM 给出各块的输入梯度与权重梯度，再旋回为输入梯度。中间只有每个 m 一块的缓冲，不存储完整的 Wigner 矩阵或整段旋转后的特征。
 
-多 m 合并 pack / epilogue 是显式开启的选项；输出主序 raw scatter 分支按输出 feature 遍历需要的 m 贡献后写入，见 [`tensor_product.py:3023–3042`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/tensor_product.py#L3023-L3042)、[`3098–3135`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/tensor_product.py#L3098-L3135) 和 [`so2_pack_scatter_kernel.cu:825–897`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/csrc/so2_pack_scatter_kernel.cu#L825-L897)。不能把这个可选分支当作默认路线，也不能把这里的 dense_pairs 结论直接套到所有 MoE 或 true-dense 入口。
+## 各公开入口
 
-[消融的显式旋转变体](../examples/operator_baselines.py) 将 m 排列并入预计算的完整系数 Wigner，在原生 `[E,(lmax+1)^2,C]` 布局上执行 `bmm`、一次 `split`、同一个公开 `grouped_gemm_multi`、复数结果组合与拼接，最后逆 `bmm`。它不调用 indexed sandwich pack/scatter，m=0 同样用普通 `F.linear`。因此，“EquiformerV3 原版 → 显式旋转 + 分组 GEMM → SO2CUDA 默认路线”记录的是两段实际实现变化；第二段包含旋转、复数结果组合、逆旋转和输出写入的调度与中间张量变化。时延和峰值显存需由该消融的实际数值给出，源码核查本身不证明收益大小。
-
-## 非 MoE dense 与 grouped 候选
-
-同一版本的公开 `true_dense_pairs` 接受非路由的二维权重。无径向调制时，它一次调用多 m Wigner pack，逐 m 使用 `F.linear`，最后一次输出主序 raw scatter；m=0 仍由调用方计算。证据见 [`_dense.py:40–124`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/_dense.py#L40-L124)。它适用于非 MoE dense 层，不使用上述默认路线的分组 GEMM；因此不把它替代到“显式旋转＋分组 GEMM → 默认 indexed sandwich”的消融链中。
-
-`dense_pairs` 的 `forward_mode="indexed_sandwich_multi_grouped"` 属于公开候选。该版本入口用此参数决定是否进入多 m 路线，但内部的 grouped pack/epilogue 选择重新读取环境变量，见前述 `deeptb.py:149–158` 与 `tensor_product.py:2927–2930`。基准在计时区外同步设置公开 `SO2_CUDA_FORWARD_MODE`，使用结束后恢复环境；环境别名定义见 [`config.py:63–80`](https://github.com/Franklalalala/SO2CUDA/blob/484b7c74bcf48910c6c95b744111d50617ea0682/src/so2_cuda_ops/config.py#L63-L80)。等价性工具同时统计实际 pack/scatter 调用，确认三种候选各自执行了预期路线。性能主表取正确候选中前向＋反向中位数最小者，并保留全部计时。
+`true_dense_pairs` 接受非路由的二维权重，适用于非 MoE dense 层；`dense_pairs` 接受每组一个权重，按图分组时块行按组排序；`activation_forward` 接受专家权重与 top-k 路由，每个槽的块行按专家排序，按槽门控求和。`include_m0=True` 时，`true_dense_pairs` 与 `dense_pairs` 在同一次调用中计算 m=0，返回整层输出。`dense_pairs` 的 `forward_mode` 取多 m 取值（默认）时走上述块布局；`scalar` 与块布局不支持的输入走逐 m 路线。单算子测试中各入口执行同一套 kernel，逐配置计时见 [operator-benchmark.md](operator-benchmark.md#各入口计时)。

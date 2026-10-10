@@ -365,13 +365,10 @@
     }
   },
   "input_sha256": {
-    "operator": "ac5618802f7ff52710f6df126a643d374ae63accc017897736adf3f022e6516a",
-    "model": "faff6e8a009b4f56ef55eebccec73ba4a569b5b976e02b49ad18973dcbc6289b",
-    "old_model": "8b170e5ef9d9f4302522b1001b53f4d86c17445e3bd5b03a01c8e16908f7de6b",
-    "equiv_op": "138b53e3dd80e101dba46e85014b500ac229e6852156458e767596336e543d49",
-    "equiv_model": "a11dce99e7df722b9c93901409396de5f1471f2b806b61cd1489e26eaff143c7",
+    "operator": "dc8ae29b62cae470869efa8e6f75e9bfaa2f8fbb75ccdc96076147fc8df44fd0",
+    "model": "3abbc24048d4ba7e40f744d76c1bdb235883bbea478771218257c2b304ff6165",
     "model_eqv3": "d15e2cf2561214dcaaf400a936495cfc8b609ee005c7509baa3751bdd5cd2ea4",
-    "equiv_model_fused": "a3f8951fb3d33fec51187bf4205bbfc1db82fc6f37389d1d5c37eb317cee6d7e",
-    "equiv_op_candidates": "135fff97830ecfef0d325376cb31213c6ddc23f29e81eeef25310b0b7c5cb1f4"
+    "equiv_model": "eb5cc719df1b945a255b64787cda6e7215dd75733f165d934596779b630a8da0",
+    "equiv_model_cueq": "a11dce99e7df722b9c93901409396de5f1471f2b806b61cd1489e26eaff143c7"
   }
 }
