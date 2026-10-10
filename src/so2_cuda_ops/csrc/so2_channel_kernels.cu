@@ -364,6 +364,36 @@ __device__ void gather_channel_from_blocks_any(
   }
 }
 
+// Largest degree whose 2l+1 coefficients a warp stages in shared memory.
+constexpr int kStagedMaxDegree = 8;
+constexpr int kStageWidth = 2 * kStagedMaxDegree + 1;
+
+// The 32 lanes of a warp hold consecutive channels; when they belong to one edge and
+// their feature spans follow each other (consecutive irrep channels, any mix of
+// degrees up to kStagedMaxDegree), the warp's 2l+1 coefficients form one contiguous
+// span of at most 32 * kStageWidth floats. Returns whether the whole warp qualifies;
+// `offset` is the lane's start inside the span and `span` its total length.
+__device__ __forceinline__ bool warp_contiguous_span(
+    bool active, int64_t edge, int l, int base, int& offset, int& span, int& base0) {
+  const unsigned full = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  const int dim = active ? 2 * l + 1 : 0;
+  int scan = dim;
+#pragma unroll
+  for (int step = 1; step < 32; step <<= 1) {
+    const int v = __shfl_up_sync(full, scan, step);
+    if (lane >= step) {
+      scan += v;
+    }
+  }
+  offset = scan - dim;
+  span = __shfl_sync(full, scan, 31);
+  base0 = __shfl_sync(full, base, 0);
+  const long long e0 = __shfl_sync(full, static_cast<long long>(edge), 0);
+  const bool fits = active && static_cast<long long>(edge) == e0 && l <= kStagedMaxDegree && base == base0 + offset;
+  return __all_sync(full, fits);
+}
+
 #define SO2_DISPATCH_DEGREE(l, CALL, GENERIC)            \
   switch (l) {                                     \
     case 0: { constexpr int LL = 0; CALL; } break; \
@@ -393,15 +423,38 @@ __global__ void channel_rotate_to_blocks_kernel(
     const int64_t* __restrict__ row_of_edge,
     int64_t n_edges,
     int64_t n_channels) {
+  __shared__ float stage_all[kChannelThreads * kStageWidth];
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= n_edges * n_channels) {
+  const bool active = idx < n_edges * n_channels;
+  int64_t edge = 0;
+  int64_t k = 0;
+  int l = 0;
+  int base = 0;
+  if (active) {
+    edge = idx / n_channels;
+    k = idx - edge * n_channels;
+    l = ch_l[k];
+    base = ch_base[k];
+  }
+  int offset = 0;
+  int span = 0;
+  int base0 = 0;
+  const bool staged = warp_contiguous_span(active, edge, l, base, offset, span, base0);
+  const float* in = src + edge * src_stride + base;
+  if (staged) {
+    // One coalesced read of the warp's span instead of 2l+1 strided reads per lane.
+    float* __restrict__ stage = stage_all + (threadIdx.x - (threadIdx.x & 31)) * kStageWidth;
+    const float* __restrict__ span_src = src + edge * src_stride + base0;
+    for (int i = threadIdx.x & 31; i < span; i += 32) {
+      stage[i] = span_src[i];
+    }
+    __syncwarp();
+    in = stage + offset;
+  }
+  if (!active) {
     return;
   }
-  const int64_t edge = idx / n_channels;
-  const int64_t k = idx - edge * n_channels;
-  const int l = ch_l[k];
   const int64_t row = row_of_edge == nullptr ? edge : row_of_edge[edge];
-  const float* __restrict__ in = src + edge * src_stride + ch_base[k];
   const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
   int64_t rs = 0;
   const float* __restrict__ D = (w.mode != 0 && l > 0) ? wigner_block(w, edge, l, rs) : nullptr;
@@ -409,10 +462,6 @@ __global__ void channel_rotate_to_blocks_kernel(
   SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)),
                       (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)));
 }
-
-// Largest degree whose 2l+1 outputs a warp stages in shared memory.
-constexpr int kStagedMaxDegree = 8;
-constexpr int kStageWidth = 2 * kStagedMaxDegree + 1;
 
 __global__ void channel_gather_from_blocks_kernel(
     const float* __restrict__ src,
@@ -430,10 +479,9 @@ __global__ void channel_gather_from_blocks_kernel(
     const int64_t* __restrict__ row_of_edge,
     int64_t n_edges,
     int64_t n_channels) {
-  // When the 32 lanes of a warp hold 32 consecutive channels of one degree of one
-  // edge (every multiplicity-32 irrep block), their 32*(2l+1) outputs form one
-  // contiguous span: the warp stages them in shared memory and writes the span with
-  // coalesced stores instead of 2l+1 strided stores per lane.
+  // When the 32 lanes of a warp hold consecutive channels of one edge, their outputs
+  // form one contiguous span: the warp stages them in shared memory and writes the
+  // span with coalesced stores instead of 2l+1 strided stores per lane.
   __shared__ float stage_all[kChannelThreads * kStageWidth];
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const bool active = idx < n_edges * n_channels;
@@ -447,14 +495,11 @@ __global__ void channel_gather_from_blocks_kernel(
     l = ch_l[k];
     base = ch_base[k];
   }
-  const unsigned full = 0xffffffffu;
   const int lane = threadIdx.x & 31;
-  const int l0 = __shfl_sync(full, l, 0);
-  const long long e0 = __shfl_sync(full, static_cast<long long>(edge), 0);
-  const int b0 = __shfl_sync(full, base, 0);
-  const bool fits = active && l == l0 && static_cast<long long>(edge) == e0 && l <= kStagedMaxDegree &&
-                    base == b0 + lane * (2 * l + 1);
-  const bool staged = __all_sync(full, fits);
+  int offset = 0;
+  int span = 0;
+  int b0 = 0;
+  const bool staged = warp_contiguous_span(active, edge, l, base, offset, span, b0);
   if (!active) {
     return;
   }
@@ -465,12 +510,11 @@ __global__ void channel_gather_from_blocks_kernel(
   const float scale = edge_scale == nullptr ? 1.0f : edge_scale[edge];
   if (staged) {
     float* __restrict__ stage = stage_all + (threadIdx.x - lane) * kStageWidth;
-    float* __restrict__ mine = stage + lane * (2 * l + 1);
+    float* __restrict__ mine = stage + offset;
     SO2_DISPATCH_DEGREE(l, (gather_channel_from_blocks<LL>(src, cols, mtab, blocks, n_edges, row, D, rs, scale,
                                                            false, mine)),
                         ((void)0));
     __syncwarp();
-    const int span = 32 * (2 * l + 1);
     float* __restrict__ out = dst + edge * dst_stride + b0;
     if (accumulate) {
       for (int i = lane; i < span; i += 32) {
