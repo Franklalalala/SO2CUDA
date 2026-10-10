@@ -170,14 +170,17 @@ __global__ void channel_pack_grad_kernel(
 
 constexpr int kMaxBlocks = 16;
 
+// Device table of the blocks, three int64 per m: prefix, c_m (0 when absent), stride.
 struct BlockSet {
-  int64_t prefix[kMaxBlocks];
-  int32_t width[kMaxBlocks];   // c_m; 0 when block m is absent
-  int32_t stride[kMaxBlocks];  // per-edge floats of block m
+  const int64_t* __restrict__ table;
 };
 
 __device__ __forceinline__ int64_t block_row(const BlockSet& b, int m, int64_t n_edges, int64_t row) {
-  return n_edges * b.prefix[m] + row * static_cast<int64_t>(b.stride[m]);
+  return n_edges * b.table[3 * m] + row * b.table[3 * m + 2];
+}
+
+__device__ __forceinline__ int block_width(const BlockSet& b, int m) {
+  return static_cast<int>(b.table[3 * m + 1]);
 }
 
 // Rotate one channel of degree L into the blocks: r_j = sum_d v[d] D[d][j],
@@ -199,7 +202,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
   for (int d = 0; d < dim; ++d) {
     v[d] = src[d];
   }
-  if (blocks.width[0] > 0 && cols[0] >= 0) {
+  if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
     float r = v[L];
     if (D != nullptr && L > 0) {
       r = 0.0f;
@@ -216,7 +219,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
       break;
     }
     const int col = cols[m];
-    if (col < 0 || blocks.width[m] == 0) {
+    if (col < 0 || block_width(blocks, m) == 0) {
       continue;
     }
     float r0 = v[L - m];
@@ -232,7 +235,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
     }
     float* __restrict__ out = dst + block_row(blocks, m, n_edges, row) + col;
     out[0] = r0;
-    out[blocks.width[m]] = r1;
+    out[block_width(blocks, m)] = r1;
   }
 }
 
@@ -257,7 +260,7 @@ __device__ __forceinline__ void gather_channel_from_blocks(
   for (int j = 0; j < dim; ++j) {
     g[j] = 0.0f;
   }
-  if (blocks.width[0] > 0 && cols[0] >= 0) {
+  if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
     g[L] = src[block_row(blocks, 0, n_edges, row) + cols[0]];
   }
 #pragma unroll
@@ -266,12 +269,12 @@ __device__ __forceinline__ void gather_channel_from_blocks(
       break;
     }
     const int col = cols[m];
-    if (col < 0 || blocks.width[m] == 0) {
+    if (col < 0 || block_width(blocks, m) == 0) {
       continue;
     }
     const float* __restrict__ in = src + block_row(blocks, m, n_edges, row) + col;
     g[L - m] = in[0];
-    g[L + m] = in[blocks.width[m]];
+    g[L + m] = in[block_width(blocks, m)];
   }
   const int reach = mtab < L ? mtab : L;
 #pragma unroll
@@ -308,7 +311,7 @@ __device__ void rotate_channel_to_blocks_any(
   const int dim = 2 * l + 1;
   for (int m = 0; m <= l && m <= mtab; ++m) {
     const int col = cols[m];
-    if (col < 0 || blocks.width[m] == 0) {
+    if (col < 0 || block_width(blocks, m) == 0) {
       continue;
     }
     float* __restrict__ out = dst + block_row(blocks, m, n_edges, row) + col;
@@ -321,7 +324,7 @@ __device__ void rotate_channel_to_blocks_any(
           r = fmaf(src[d], D[d * rs + j], r);
         }
       }
-      out[p * blocks.width[m]] = r;
+      out[p * block_width(blocks, m)] = r;
     }
   }
 }
@@ -344,13 +347,13 @@ __device__ void gather_channel_from_blocks_any(
     float acc = 0.0f;
     for (int m = 0; m <= l && m <= mtab; ++m) {
       const int col = cols[m];
-      if (col < 0 || blocks.width[m] == 0) {
+      if (col < 0 || block_width(blocks, m) == 0) {
         continue;
       }
       const float* __restrict__ in = src + block_row(blocks, m, n_edges, row) + col;
       for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
         const int j = p == 0 ? l - m : l + m;
-        const float g = in[p * blocks.width[m]];
+        const float g = in[p * block_width(blocks, m)];
         acc = D == nullptr ? (d == j ? acc + g : acc) : fmaf(D[d * rs + j], g, acc);
       }
     }
@@ -550,24 +553,9 @@ torch::Tensor channel_pack_grad_fp32_cuda(
 
 namespace {
 
-BlockSet make_block_set(
-    const std::vector<int64_t>& prefix,
-    const std::vector<int64_t>& width,
-    const std::vector<int64_t>& stride) {
-  TORCH_CHECK(prefix.size() == width.size() && prefix.size() == stride.size(),
-              "block prefix/width/stride lists must be aligned");
-  TORCH_CHECK(static_cast<int>(prefix.size()) <= kMaxBlocks, "at most ", kMaxBlocks, " m blocks are supported");
+BlockSet make_block_set(const torch::Tensor& block_table) {
   BlockSet b;
-  for (int m = 0; m < kMaxBlocks; ++m) {
-    b.prefix[m] = 0;
-    b.width[m] = 0;
-    b.stride[m] = 0;
-  }
-  for (size_t m = 0; m < prefix.size(); ++m) {
-    b.prefix[m] = prefix[m];
-    b.width[m] = static_cast<int32_t>(width[m]);
-    b.stride[m] = static_cast<int32_t>(stride[m]);
-  }
+  b.table = block_table.data_ptr<int64_t>();
   return b;
 }
 
@@ -581,9 +569,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t total_width,
     torch::Tensor row_of_edge,
     bool rotate,
@@ -596,7 +582,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     return dst;
   }
   const int cols_per_channel = static_cast<int>(ch_cols.numel() / n_channels);
-  const BlockSet blocks = make_block_set(block_prefix, block_width, block_stride);
+  const BlockSet blocks = make_block_set(block_table);
   const WignerRef w = make_wigner_ref(wigner, offsets, compact_offsets, wigner_mode, wigner_stride, rotate);
   const int64_t total = n_edges * n_channels;
   const dim3 grid((total + kChannelThreads - 1) / kChannelThreads);
@@ -620,9 +606,7 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t dst_dim,
     bool zero_fill,
     torch::Tensor edge_scale,
@@ -644,7 +628,7 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     return dst;
   }
   const int cols_per_channel = static_cast<int>(ch_cols.numel() / n_channels);
-  const BlockSet blocks = make_block_set(block_prefix, block_width, block_stride);
+  const BlockSet blocks = make_block_set(block_table);
   const WignerRef w = make_wigner_ref(wigner, offsets, compact_offsets, wigner_mode, wigner_stride, rotate);
   const int64_t total = n_edges * n_channels;
   const dim3 grid((total + kChannelThreads - 1) / kChannelThreads);

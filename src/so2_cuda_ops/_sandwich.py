@@ -61,8 +61,10 @@ def _side(all_bases, all_ls, block_members, dim, device):
     def as_int(values):
         return torch.tensor(values, dtype=torch.int32, device=device).contiguous()
 
+    table = [v for m in range(width) for v in (prefix[m], widths[m], strides[m])]
     return SimpleNamespace(
         base=as_int(bases), l=as_int(levels), cols=as_int([c for row in cols for c in row]),
+        table=torch.tensor(table, dtype=torch.long, device=device),
         prefix=prefix, width=widths, stride=strides, total=total,
         zero_fill=any(c != 1 for c in covered), dim=int(dim))
 
@@ -74,6 +76,10 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
     hit = cache.get(key)
     if hit is not None:
         return hit
+    # Load (on first use, build) the extension before any table reaches the device.
+    # Loading it right after the tables' host-to-device copies, in a process that
+    # had run a CUDA profiling tool, crashed the first kernel launch in the driver.
+    _ext()
     maps = layout.maps
     in_members, out_members, blocks = [], [], []
     for m, (in_base, _in_l, out_base, _out_l, _offsets) in enumerate(maps):
@@ -99,14 +105,14 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
 def _rotate(src, side, plan, wigner, rotate, rows=None):
     return _ext().channel_rotate_to_blocks_fp32(
         src, wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
-        side.prefix, side.width, side.stride, side.total,
-        plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode), int(wigner.stride))
+        side.table, side.total, plan.no_rows if rows is None else rows, bool(rotate),
+        int(wigner.mode), int(wigner.stride))
 
 
 def _gather(src, n, side, plan, wigner, rotate, rows=None, scale=None, into=None):
     return _ext().channel_gather_from_blocks_fp32(
         src, int(n), wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
-        side.prefix, side.width, side.stride, side.dim, bool(side.zero_fill),
+        side.table, side.dim, bool(side.zero_fill),
         plan.no_scale if scale is None else scale, plan.no_scale if into is None else into,
         plan.no_rows if rows is None else rows, bool(rotate), int(wigner.mode), int(wigner.stride))
 

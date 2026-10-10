@@ -286,9 +286,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t total_width,
     torch::Tensor row_of_edge,
     bool rotate,
@@ -304,9 +302,7 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t dst_dim,
     bool zero_fill,
     torch::Tensor edge_scale,
@@ -1411,6 +1407,14 @@ static void check_wigner_inputs(const torch::Tensor& wigner, const torch::Tensor
   }
 }
 
+static void check_block_table(const torch::Tensor& block_table, const torch::Tensor& ch_base,
+                              const torch::Tensor& ch_cols) {
+  check_cuda_contiguous(block_table, "block_table");
+  TORCH_CHECK(block_table.scalar_type() == torch::kInt64, "block_table must be int64");
+  const int64_t blocks = ch_base.numel() > 0 ? ch_cols.numel() / ch_base.numel() : 0;
+  TORCH_CHECK(block_table.numel() == 3 * blocks, "block_table must hold (prefix, width, stride) per m block");
+}
+
 static void check_optional_rows(const torch::Tensor& row_of_edge, int64_t n_edges) {
   if (row_of_edge.numel() > 0) {
     check_cuda_contiguous(row_of_edge, "row_of_edge");
@@ -1427,9 +1431,7 @@ torch::Tensor channel_rotate_to_blocks_fp32(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t total_width,
     torch::Tensor row_of_edge,
     bool rotate,
@@ -1438,11 +1440,12 @@ torch::Tensor channel_rotate_to_blocks_fp32(
   check_cuda_contiguous(src, "src");
   TORCH_CHECK(src.scalar_type() == torch::kFloat32 && src.dim() == 2, "src must be a 2-D fp32 tensor");
   check_channel_plan(ch_base, ch_l, ch_cols);
+  check_block_table(block_table, ch_base, ch_cols);
   check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
   check_optional_rows(row_of_edge, src.size(0));
   return channel_rotate_to_blocks_fp32_cuda(
-      src, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_prefix, block_width,
-      block_stride, total_width, row_of_edge, rotate, wigner_mode, wigner_stride);
+      src, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table, total_width,
+      row_of_edge, rotate, wigner_mode, wigner_stride);
 }
 
 torch::Tensor channel_gather_from_blocks_fp32(
@@ -1454,9 +1457,7 @@ torch::Tensor channel_gather_from_blocks_fp32(
     torch::Tensor ch_base,
     torch::Tensor ch_l,
     torch::Tensor ch_cols,
-    std::vector<int64_t> block_prefix,
-    std::vector<int64_t> block_width,
-    std::vector<int64_t> block_stride,
+    torch::Tensor block_table,
     int64_t dst_dim,
     bool zero_fill,
     torch::Tensor edge_scale,
@@ -1468,6 +1469,7 @@ torch::Tensor channel_gather_from_blocks_fp32(
   check_cuda_contiguous(src, "src");
   TORCH_CHECK(src.scalar_type() == torch::kFloat32, "src must be fp32");
   check_channel_plan(ch_base, ch_l, ch_cols);
+  check_block_table(block_table, ch_base, ch_cols);
   check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
   check_optional_rows(row_of_edge, n_edges);
   if (edge_scale.numel() > 0) {
@@ -1482,9 +1484,8 @@ torch::Tensor channel_gather_from_blocks_fp32(
                 "accumulate_into must be [n_edges, dst_dim] fp32");
   }
   return channel_gather_from_blocks_fp32_cuda(
-      src, n_edges, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_prefix,
-      block_width, block_stride, dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge,
-      rotate, wigner_mode, wigner_stride);
+      src, n_edges, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table,
+      dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge, rotate, wigner_mode, wigner_stride);
 }
 
 torch::Tensor block_complex_weights_fp32(std::vector<torch::Tensor> weights) {
