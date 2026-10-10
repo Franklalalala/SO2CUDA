@@ -1,51 +1,3 @@
-# SO2CUDA
-
-SO2CUDA 为 SO(2) 张量积和专家线性层提供 CUDA 加速，包括分组 GEMM、旋转后的张量打包与输出 scatter，以及 DeePTB 的 UniTB / UniTB-dense 执行接口。UniTB 使用 PDQ-MoE 专家层。Python 包名为 `so2_cuda_ops`，当前版本为 **0.2.0**。
-
-## 安装
-
-需要 Python 3.9 或更高版本、支持 CUDA 的 PyTorch、包含 `nvcc` 的 CUDA Toolkit 和 cuBLAS 开发库。首次调用 CUDA 算子时通过 PyTorch JIT 编译；Ninja 随本包安装。编译器与 CUDA Toolkit 应彼此兼容；PyTorch 找不到 Toolkit 时可设置 `CUDA_HOME`。
-
-```bash
-pip install git+https://github.com/Franklalalala/SO2CUDA.git
-```
-
-在本仓库中开发或运行示例：
-
-```bash
-git clone https://github.com/Franklalalala/SO2CUDA.git
-cd SO2CUDA
-pip install -e '.[dev]'
-```
-
-检查导入和 CUDA 设备可用性：
-
-```bash
-python -c "import so2_cuda_ops; print('CUDA available:', so2_cuda_ops.is_available())"
-python -m pytest tests -q
-```
-
-无 CUDA 设备时可以导入本包，`is_available()` 返回 `False`，GPU 测试会跳过。`is_available()` 检查设备可用性；实际 JIT 构建和算子执行由测试或下方模型示例验证。
-
-## 与 DeePTB 配合
-
-SO2CUDA 0.2.0 与 DeePTB 的 `1006-stable` 分支配合使用。DeePTB 不安装 SO2CUDA 也能通过纯 PyTorch 运行；安装后，符合 CUDA FP32、布局与路由条件的层自动调用加速接口。CPU、其他 dtype 或不支持的调用使用参考实现，实际 CUDA 执行错误会直接抛出。
-
-DeePTB 通过 `dptb.nn.so2_backend` 调用 `so2_cuda_ops.deeptb`：UniTB-dense 使用 `dense_pairs`，UniTB 的 PDQ-MoE 使用 `activation_forward` 和分组 GEMM；扩展的非 MoE dense 层使用 `true_dense_pairs`。接口只接受张量与数据描述对象，SO2CUDA 本身不导入 DeePTB。模型参数与检查点结构由 DeePTB 管理。
-
-分组线性层也可以直接使用：
-
-```python
-import torch
-from so2_cuda_ops.deeptb import grouped_gemm
-
-x = torch.randn(1024, 32, device="cuda", dtype=torch.float32)
-weight = torch.randn(2, 64, 32, device="cuda", dtype=torch.float32)
-# Each contiguous group of input rows uses its own [out, in] weight.
-ptr = torch.tensor([0, 512, 1024], dtype=torch.long)
-y = grouped_gemm(x, ptr, weight)  # [1024, 64], supports autograd
-```
-
 <!-- SO2CUDA_BENCHMARKS_BEGIN -->
 ## 性能测试
 
@@ -371,16 +323,3 @@ cuEquivariance 路线以标准子模块替换 SO(2) 算子，路由器、电荷�
 
 完整计时、四分位与误差见 [模型 JSON](docs/benchmarks/MODEL_SPEED_H200.json)、[算子数值证据](docs/benchmarks/EQUIV_OP_L40S.json) 和 [模型数值证据](docs/benchmarks/EQUIV_MODEL_L40S.json)。
 <!-- SO2CUDA_BENCHMARKS_END -->
-
-## 构建与运行设置
-
-- `CUDA_HOME`：CUDA Toolkit 目录。
-- `TORCH_EXTENSIONS_DIR`：PyTorch JIT 扩展缓存目录。
-- `SO2_CUDA_PACK_SCATTER_BUILD_DIR`：张量打包与 scatter 扩展构建目录。
-- `SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`：分组 GEMM 扩展构建目录。
-- `SO2_CUDA_BACKEND`：DeePTB 后端策略，默认 `auto`，`off` 强制纯 PyTorch。
-- `SO2_CUDA_FAST_TF32`：TF32 开关；上述示例固定为 `0`。
-
-需要把全部 JIT 产物放到指定位置时，同时设置两个算子构建目录与 `TORCH_EXTENSIONS_DIR`。`CC` / `CXX` 可选择与 Toolkit 兼容的编译器，`MAX_JOBS` 控制并行编译数。更多接口约定见 [docs/usage.md](docs/usage.md)。
-
-通用张量积算子的最小示例见 [examples/minimal_so2_tp.py](examples/minimal_so2_tp.py)。

@@ -1,0 +1,377 @@
+{
+  "schema": "ob-model-eqv3-applicability-v1",
+  "models": {
+    "dense": {
+      "applicable": false,
+      "status": "not_applicable",
+      "layers": [
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              30,
+              30,
+              30,
+              30,
+              30,
+              30,
+              30
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              224,
+              32,
+              32,
+              32,
+              32,
+              32,
+              32
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": true,
+          "extra_m0_out_channels": 192
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              42,
+              42,
+              42,
+              42,
+              42,
+              42,
+              42
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              224,
+              32,
+              32,
+              32,
+              32,
+              32,
+              32
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": true,
+          "extra_m0_out_channels": 192
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              96,
+              96,
+              96,
+              96,
+              96,
+              96,
+              96
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              224,
+              32,
+              32,
+              32,
+              32,
+              32,
+              32
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": true,
+          "extra_m0_out_channels": 192
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              64,
+              64,
+              64,
+              64,
+              64,
+              64,
+              64
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              224,
+              32,
+              32,
+              32,
+              32,
+              32,
+              32
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": true,
+          "extra_m0_out_channels": 192
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              96,
+              96,
+              96,
+              96,
+              96,
+              96,
+              96
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              151,
+              37,
+              41,
+              29,
+              13,
+              5,
+              1
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              57,
+              69,
+              73,
+              61,
+              45,
+              37,
+              33
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              151,
+              37,
+              41,
+              29,
+              13,
+              5,
+              1
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        }
+      ],
+      "reason": "最终边更新与节点更新的 SO(2) 输出按 l=0..6 合并后为 [151, 37, 41, 29, 13, 5, 1] 通道，最终节点更新的输入也不均匀；EquiformerV3 原版要求输入与输出各自跨 l 统一通道数。其额外 m=0 输出接口可容纳前面 dense 层的标量门控，但无法表达最终层，故完整模型列为 N/A，不补零。"
+    },
+    "unitb": {
+      "applicable": false,
+      "status": "not_applicable",
+      "layers": [
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              30,
+              30,
+              30,
+              30,
+              30,
+              30,
+              30
+            ],
+            "uniform": true
+          },
+          "output": {
+            "channels_by_l": [
+              288,
+              24,
+              16,
+              16,
+              32,
+              24,
+              48
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              138,
+              34,
+              26,
+              26,
+              42,
+              34,
+              58
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              288,
+              24,
+              16,
+              16,
+              32,
+              24,
+              48
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              384,
+              72,
+              48,
+              48,
+              96,
+              72,
+              144
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              288,
+              24,
+              16,
+              16,
+              32,
+              24,
+              48
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              256,
+              48,
+              32,
+              32,
+              64,
+              48,
+              96
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              288,
+              24,
+              16,
+              16,
+              32,
+              24,
+              48
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              384,
+              72,
+              48,
+              48,
+              96,
+              72,
+              144
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              151,
+              37,
+              41,
+              29,
+              13,
+              5,
+              1
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        },
+        {
+          "applicable": false,
+          "input": {
+            "channels_by_l": [
+              153,
+              61,
+              57,
+              45,
+              45,
+              29,
+              49
+            ],
+            "uniform": false
+          },
+          "output": {
+            "channels_by_l": [
+              151,
+              37,
+              41,
+              29,
+              13,
+              5,
+              1
+            ],
+            "uniform": false
+          },
+          "extra_m0_api_shape_possible": false,
+          "extra_m0_out_channels": null
+        }
+      ],
+      "reason": "UniTB 的 V 形隐藏通道、门控后的实际 SO(2) 输出以及最终目标层均跨 l 不均匀，EquiformerV3 原版无法直接表达，完整模型列为 N/A，不补零。"
+    }
+  },
+  "input_sha256": {
+    "operator": "ac5618802f7ff52710f6df126a643d374ae63accc017897736adf3f022e6516a",
+    "model": "faff6e8a009b4f56ef55eebccec73ba4a569b5b976e02b49ad18973dcbc6289b",
+    "old_model": "8b170e5ef9d9f4302522b1001b53f4d86c17445e3bd5b03a01c8e16908f7de6b",
+    "equiv_op": "138b53e3dd80e101dba46e85014b500ac229e6852156458e767596336e543d49",
+    "equiv_model": "a11dce99e7df722b9c93901409396de5f1471f2b806b61cd1489e26eaff143c7",
+    "model_eqv3": "d15e2cf2561214dcaaf400a936495cfc8b609ee005c7509baa3751bdd5cd2ea4",
+    "equiv_model_fused": "a3f8951fb3d33fec51187bf4205bbfc1db82fc6f37389d1d5c37eb317cee6d7e",
+    "equiv_op_candidates": "135fff97830ecfef0d325376cb31213c6ddc23f29e81eeef25310b0b7c5cb1f4"
+  }
+}
