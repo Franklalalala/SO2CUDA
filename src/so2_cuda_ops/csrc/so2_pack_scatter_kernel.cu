@@ -2292,7 +2292,13 @@ torch::Tensor pack_pairs_multi_fp32_cuda(
   const int64_t n_edges = x.size(0);
   const int64_t in_dim = x.size(1);
   const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
-  const int64_t total_cin = cin_prefix[cin_prefix.numel() - 1].item<int64_t>();
+  // cin_prefix is the running sum of the block sizes; reading the sizes from the
+  // host-side shapes avoids a device-to-host synchronization per call.
+  int64_t total_cin = 0;
+  for (const auto& in_base : in_bases) {
+    total_cin += in_base.numel();
+  }
+  TORCH_CHECK(cin_prefix.numel() == n_m + 1, "cin_prefix must have one entry per block plus the end");
   auto pair_flat = torch::empty({n_edges, 2, total_cin}, x.options());
   if (n_edges == 0 || total_cin == 0) {
     return pair_flat;
@@ -2535,7 +2541,10 @@ torch::Tensor scatter_raw_pairs_multi_forward_fp32_cuda(
   TORCH_CHECK(static_cast<int64_t>(out_ls.size()) == n_m, "out_ls length mismatch");
   const int64_t n_edges = raws[0].size(0);
   const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
-  const int64_t total_cout = cout_prefix[cout_prefix.numel() - 1].item<int64_t>();
+  int64_t total_cout = 0;
+  for (const auto& out_base : out_bases) {
+    total_cout += out_base.numel();
+  }
   auto out = torch::zeros({n_edges, out_dim}, raws[0].options());
   if (n_edges == 0 || total_cout == 0) {
     return out;
@@ -3140,7 +3149,7 @@ torch::Tensor scatter_pairs_multi_grad_fp32_cuda(
   TORCH_CHECK(n_m > 0, "m_values must be non-empty");
   TORCH_CHECK(cin_prefix.numel() == n_m + 1, "cin_prefix length must be n_m + 1");
   const int64_t n_edges = grad_packed.size(0);
-  const int64_t total_cin = cin_prefix[cin_prefix.numel() - 1].item<int64_t>();
+  const int64_t total_cin = in_base_all.numel();
   TORCH_CHECK(in_base_all.numel() == total_cin && in_l_all.numel() == total_cin,
               "flat input maps must have total_cin entries");
   TORCH_CHECK(grad_packed.dim() == 3 && grad_packed.size(1) == 2 && grad_packed.size(2) == total_cin,

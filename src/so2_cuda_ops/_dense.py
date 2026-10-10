@@ -49,6 +49,100 @@ def _input_channel_plan(layout, plan, in_dim, device):
     return hit
 
 
+class _PairSandwich(torch.autograd.Function):
+    """Multi-m pack, one GEMM per m block on its view of the packed rows, and the
+    output-major scatter, with the backward written out.
+
+    Every m block stays a column range of one packed [N, 2, sum Cin] buffer: each
+    GEMM reads its block with the buffer's row stride, and the backward writes each
+    block's input gradient into its columns of one gradient buffer that the pack's
+    channel-major gather consumes. No block is copied and no full-width gradient is
+    formed per block. Front radial weights scale a block before its GEMM; the scaled
+    block is recomputed for the weight gradient instead of being kept."""
+
+    @staticmethod
+    def forward(ctx, x, plan, layout, wigner, in_plan, n_blocks, *tensors):
+        from . import tensor_product as tp
+        weights = tensors[:n_blocks]
+        radials = tensors[n_blocks:]
+        offsets = layout.maps[plan.values[0]][-1]
+        packed = tp._pack_pairs_multi_cuda(
+            x, wigner.values, plan.in_bases, plan.in_ls, offsets, wigner.compact_offsets,
+            plan.cin_prefix_t, plan.m_values_t, layout.rotate_in, wigner.mode, wigner.stride)
+        n = x.shape[0]
+        rows = packed.view(2 * n, packed.shape[2])
+        raws = []
+        for i, weight in enumerate(weights):
+            a, b = plan.cin_prefix[i], plan.cin_prefix[i + 1]
+            block = rows[:, a:b]
+            if radials:
+                block = (packed[:, :, a:b] * radials[i].unsqueeze(1)).view(2 * n, b - a)
+            raws.append(torch.mm(block, weight.t()).view(n, 2, weight.shape[0]))
+        out = tp._scatter_raw_pairs_multi_output_major_forward_cuda(
+            raws, wigner.values, offsets, wigner.compact_offsets, plan.cout_prefix_t,
+            plan.m_values_t, *plan.entries, layout.out_dim, layout.rotate_out,
+            wigner.mode, wigner.stride)
+        keep_packed = any(ctx.needs_input_grad[6:])
+        ctx.save_for_backward(packed if keep_packed else None, *tensors)
+        ctx.state = (plan, layout, wigner, in_plan, n_blocks, offsets, int(x.shape[1]), packed.shape)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from . import tensor_product as tp
+        plan, layout, wigner, in_plan, n_blocks, offsets, in_dim, packed_shape = ctx.state
+        saved = ctx.saved_tensors
+        packed, weights, radials = saved[0], saved[1:1 + n_blocks], saved[1 + n_blocks:]
+        needs = ctx.needs_input_grad
+        n = packed_shape[0]
+        grad_raws = tp._raw_pairs_multi_output_grad_cuda(
+            grad_out.contiguous(), wigner.values, list(plan.out_bases), list(plan.out_ls), offsets,
+            wigner.compact_offsets, plan.cout_prefix_t, plan.m_values_t, layout.rotate_out,
+            wigner.mode, wigner.stride)
+        grad_packed = grad_out.new_empty(packed_shape) if needs[0] else None
+        grad_rows = None if grad_packed is None else grad_packed.view(2 * n, packed_shape[2])
+        rows = None if packed is None else packed.view(2 * n, packed_shape[2])
+        grad_weights = [None] * n_blocks
+        grad_radials = [None] * len(radials)
+        for i, weight in enumerate(weights):
+            a, b = plan.cin_prefix[i], plan.cin_prefix[i + 1]
+            grad_raw = grad_raws[i].view(2 * n, weight.shape[0])
+            radial_grad = bool(radials) and needs[6 + n_blocks + i]
+            if radials and (needs[0] or radial_grad):
+                grad_block = torch.mm(grad_raw, weight).view(n, 2, b - a)
+                if radial_grad:
+                    grad_radials[i] = (grad_block * packed[:, :, a:b]).sum(dim=1)
+                if needs[0]:
+                    torch.mul(grad_block, radials[i].unsqueeze(1), out=grad_packed[:, :, a:b])
+            elif needs[0]:
+                torch.mm(grad_raw, weight, out=grad_rows[:, a:b])
+            if needs[6 + i]:
+                block = rows[:, a:b]
+                if radials:
+                    block = (packed[:, :, a:b] * radials[i].unsqueeze(1)).view(2 * n, b - a)
+                grad_weights[i] = torch.mm(grad_raw.t(), block)
+        grad_x = None
+        if needs[0]:
+            grad_x = tp._channel_pack_grad_cuda(
+                grad_packed, wigner.values, offsets, wigner.compact_offsets, in_plan, in_dim,
+                layout.rotate_in, wigner.mode, wigner.stride)
+        return (grad_x, None, None, None, None, None, *grad_weights, *grad_radials)
+
+
+def pair_sandwich(x, layout, wigner, weights_by_m, radial_parts=None):
+    """m>0 contribution of one weight per m block through ``_PairSandwich``.
+
+    ``weights_by_m[m]`` is the [2*Cout, Cin] pair weight of block m (index 0 unused);
+    ``radial_parts[m]`` scales the block's input channels (front layouts only)."""
+    plan = _plan(layout, x.device)
+    if not plan.values:
+        return None
+    in_plan = _input_channel_plan(layout, plan, x.shape[1], x.device)
+    weights = tuple(weights_by_m[m] for m in plan.values)
+    radials = () if radial_parts is None else tuple(radial_parts[m] for m in plan.values)
+    return _PairSandwich.apply(x.contiguous(), plan, layout, wigner, in_plan, len(weights), *weights, *radials)
+
+
 def true_dense_pairs(x, layout, wigner, linears, radial_parts=None):
     """Return ordered m>0 contributions using the qualified raw epilogue.
 
@@ -76,10 +170,7 @@ def true_dense_pairs(x, layout, wigner, linears, radial_parts=None):
             if (radial.shape != (x.shape[0], width) or radial.device != x.device
                     or radial.dtype != x.dtype):
                 return None
-    from .tensor_product import (
-        _PackPairFunction, _PackPairsMultiFunction,
-        _ScatterPairOutputFunction, _ScatterRawPairsMultiOutputMajorFunction,
-    )
+    from .tensor_product import _PackPairFunction, _ScatterPairOutputFunction
     if radial_parts is not None and not layout.front:
         outputs = []
         for m, params in enumerate(linears[1:], 1):
@@ -100,26 +191,5 @@ def true_dense_pairs(x, layout, wigner, linears, radial_parts=None):
                 m, layout.rotate_out, wigner.mode, wigner.stride,
             ))
         return tuple(outputs)
-    plan = _plan(layout, x.device)
-    if not plan.values:
-        return ()
-    offsets = layout.maps[plan.values[0]][-1]
-    packed = _PackPairsMultiFunction.apply(
-        x.contiguous(), wigner.values, plan.in_bases, plan.in_ls, offsets,
-        wigner.compact_offsets, plan.cin_prefix_t, plan.m_values_t,
-        layout.rotate_in, wigner.mode, wigner.stride,
-        _input_channel_plan(layout, plan, x.shape[1], x.device),
-    )
-    raw = []
-    for i, m in enumerate(plan.values):
-        pair = packed[:, :, plan.cin_prefix[i]:plan.cin_prefix[i + 1]]
-        if radial_parts is not None:
-            pair = pair * radial_parts[m].unsqueeze(1)
-        raw.append(F.linear(pair, linears[m].weight).contiguous())
-    contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
-        wigner.values, offsets, wigner.compact_offsets,
-        plan.cout_prefix_t, plan.m_values_t, *plan.entries, layout.out_dim,
-        layout.rotate_out, wigner.mode, wigner.stride, len(raw),
-        *raw, *plan.out_bases, *plan.out_ls,
-    )
-    return (contribution,)
+    contribution = pair_sandwich(x, layout, wigner, tuple(params.weight for params in linears), radial_parts)
+    return () if contribution is None else (contribution,)

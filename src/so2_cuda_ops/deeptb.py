@@ -136,6 +136,33 @@ def _supported(x, wigner):
             and not getattr(torch._C, '_are_functorch_transforms_active', lambda: False)())
 
 
+def _single_group(x, layout, weights, routing):
+    """True when one routed group covers all 2N pair rows in their own order and
+    every m>0 weight is [1, 2*Cout_m, Cin_m] on the input's device and dtype.
+
+    Only a host-side pointer is inspected, so the check never synchronizes."""
+    ptr = routing.ptr
+    if routing.permute is not None or ptr.is_cuda or ptr.numel() != 2 or len(weights) != len(layout.maps):
+        return False
+    for m, w in enumerate(weights[1:], 1):
+        cin, cout = layout.maps[m][0].numel(), layout.maps[m][2].numel()
+        if w.shape != (1, 2 * cout, cin) or w.device != x.device or w.dtype != x.dtype:
+            return False
+    first, last = (int(v) for v in ptr.tolist())
+    return first == 0 and last == 2 * x.shape[0]
+
+
+def _front_radials_fit(x, layout, radial_parts):
+    """No radial weights, or front radial weights of shape [N, Cin_m] for every m>0."""
+    if radial_parts is None:
+        return True
+    if not layout.front or len(radial_parts) < len(layout.maps):
+        return False
+    return all(radial_parts[m].shape == (x.shape[0], layout.maps[m][0].numel())
+               and radial_parts[m].device == x.device and radial_parts[m].dtype == x.dtype
+               for m in range(1, len(layout.maps)))
+
+
 def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
                 weights: tuple[torch.Tensor, ...], radial_parts: tuple[torch.Tensor, ...] | None,
                 routing: DenseRouting, *, forward_mode: str | None = None):
@@ -153,6 +180,12 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
              'indexed_sandwich_multi_grouped', 'cublas_multi_sandwich_grouped')
     if mode not in ('scalar',) + multi:
         return None
+    if mode in multi and _single_group(x, layout, weights, routing) and _front_radials_fit(x, layout, radial_parts):
+        # One group over every row: each m block is one plain GEMM of its pair rows.
+        from ._dense import pair_sandwich
+        contribution = pair_sandwich(x, layout, wigner, (None,) + tuple(w[0] for w in weights[1:]),
+                                     radial_parts)
+        return [] if contribution is None else [contribution]
     linears = tuple(LinearWeights(weight) for weight in weights)
     module = _LayerView(layout, linears, x.device)
     args = (module, x, wigner.values, wigner.compact_offsets, wigner.mode, wigner.stride, routing)
