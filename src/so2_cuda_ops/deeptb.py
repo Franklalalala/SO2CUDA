@@ -126,6 +126,8 @@ class _LayerView:
         self._so2_activation_pair_maps = self._so2_moe_fused_p0_pair_maps
         self._so2_activation_layout = layout.activation_layout if layout.activation_layout is not None else {}
         layout.activation_layout = self._so2_activation_layout
+        # Layout-derived index maps are cached on the persistent layout, not on this per-call view.
+        self._cache_owner = layout
 
 
 def _supported(x, wigner):

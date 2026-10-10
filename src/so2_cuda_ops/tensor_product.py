@@ -58,6 +58,7 @@ def _load_extension():
         source_files=[
             here / "csrc" / "so2_pack_scatter.cpp",
             here / "csrc" / "so2_pack_scatter_kernel.cu",
+            here / "csrc" / "so2_channel_kernels.cu",
         ],
         build_dir_env="SO2_CUDA_PACK_SCATTER_BUILD_DIR",
         default_build_dir=Path.home() / ".cache" / "so2_cuda_ops" / "pack_scatter",
@@ -435,6 +436,68 @@ def _scatter_pairs_multi_grad_cuda(
         int(wigner_mode),
         int(wigner_stride),
     )
+
+
+def _channel_pack_grad_cuda(
+    grad_packed: torch.Tensor,
+    wigner: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    plan,
+    in_dim: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().channel_pack_grad_fp32(
+        grad_packed.contiguous(),
+        wigner,
+        offsets,
+        compact_offsets,
+        plan.base,
+        plan.l,
+        plan.cols,
+        int(in_dim),
+        bool(plan.zero_fill),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def channel_plan(all_bases, all_ls, block_bases, block_prefix, block_m, dim, device):
+    """Per-channel tables of the channel-major pack/scatter kernels.
+
+    ``all_bases``/``all_ls`` list every irrep channel (first feature, degree) of the
+    feature row; ``block_bases[i]`` the channels of m block i (m = ``block_m[i]``)
+    in their column order and ``block_prefix[i]`` the block's first column.
+    ``cols[k, m - 1]`` is the absolute column of channel k in the block of m, or -1.
+    ``zero_fill`` is set when the channels do not tile all ``dim`` features."""
+    from types import SimpleNamespace
+
+    bases = [int(b) for b in all_bases.detach().cpu().tolist()]
+    levels = [int(v) for v in all_ls.detach().cpu().tolist()]
+    mtab = max((int(m) for m in block_m), default=0)
+    cols = [[-1] * mtab for _ in bases]
+    index = {b: k for k, b in enumerate(bases)}
+    for i, (m, members) in enumerate(zip(block_m, block_bases)):
+        start = int(block_prefix[i])
+        for c, b in enumerate(int(v) for v in members.detach().cpu().tolist()):
+            cols[index[b]][int(m) - 1] = start + c
+    covered = [0] * int(dim)
+    for b, l in zip(bases, levels):
+        for f in range(b, b + 2 * l + 1):
+            if 0 <= f < int(dim):
+                covered[f] += 1
+    zero_fill = any(c != 1 for c in covered)
+    with torch.inference_mode(False), torch.no_grad():
+        def as_int(values):
+            return torch.tensor(values, dtype=torch.int32, device=device).contiguous()
+        flat = [c for row in cols for c in row]
+        return SimpleNamespace(
+            base=as_int(bases), l=as_int(levels),
+            cols=as_int(flat) if flat else torch.zeros(0, dtype=torch.int32, device=device),
+            zero_fill=zero_fill, mtab=mtab)
 
 
 def _output_pair_grad_torch(
@@ -1749,6 +1812,7 @@ class _PackPairsMultiFunction(torch.autograd.Function):
         rotate_in: bool,
         wigner_mode: int,
         wigner_stride: int,
+        pack_plan=None,
     ):
         packed = record_cuda_span(
             "so2.forward.pack_all_m",
@@ -1767,6 +1831,15 @@ class _PackPairsMultiFunction(torch.autograd.Function):
                 int(wigner_stride),
             ),
         )
+        if pack_plan is not None:
+            # Channel-major backward: one thread gathers every m block of one input
+            # channel and writes its 2l+1 gradient coefficients once (no atomics).
+            ctx.gather = True
+            ctx.pack_plan = pack_plan
+            ctx.save_for_backward(wigner, offsets, compact_offsets)
+            ctx.meta = (int(x.shape[1]), bool(rotate_in), int(wigner_mode), int(wigner_stride))
+            return packed
+        ctx.gather = False
         use_multi_backward = _flag("DPTB_SO2_MOE_FUSED_P0_PACK_MULTI_BACKWARD", "1")
         if use_multi_backward:
             in_base_all = torch.cat(tuple(t.contiguous() for t in in_bases), dim=0).contiguous()
@@ -1793,6 +1866,25 @@ class _PackPairsMultiFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_packed):
         tensors = ctx.saved_tensors
+        if ctx.gather:
+            wigner, offsets, compact_offsets = tensors
+            in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
+            grad_x = record_cuda_span(
+                "so2.backward.pack_all_m",
+                grad_packed,
+                lambda: _channel_pack_grad_cuda(
+                    grad_packed,
+                    wigner,
+                    offsets,
+                    compact_offsets,
+                    ctx.pack_plan,
+                    int(in_dim),
+                    bool(rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                ),
+            )
+            return grad_x, None, None, None, None, None, None, None, None, None, None, None
         wigner, offsets, compact_offsets, cin_prefix, m_values, in_base_all, in_l_all = tensors[:7]
         n = ctx.in_count
         in_bases = tensors[7:7 + n]
@@ -1817,7 +1909,7 @@ class _PackPairsMultiFunction(torch.autograd.Function):
                     int(wigner_stride),
                 ),
             )
-            return grad_x, None, None, None, None, None, None, None, None, None, None
+            return grad_x, None, None, None, None, None, None, None, None, None, None, None
         grad_x = None
         for i in range(n):
             start = int(cin_prefix[i].item())
@@ -1841,7 +1933,7 @@ class _PackPairsMultiFunction(torch.autograd.Function):
                 ),
             )
             grad_x = part if grad_x is None else grad_x + part
-        return grad_x, None, None, None, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None
 
 
 class _PackPairsMultiDescFunction(torch.autograd.Function):
@@ -2844,10 +2936,11 @@ def _multi_output_entry_map(
     out_dim: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    cache = getattr(module, "_fused_p0_multi_output_entry_cache", None)
+    owner = getattr(module, "_cache_owner", module)
+    cache = getattr(owner, "_fused_p0_multi_output_entry_cache", None)
     if cache is None:
         cache = {}
-        setattr(module, "_fused_p0_multi_output_entry_cache", cache)
+        setattr(owner, "_fused_p0_multi_output_entry_cache", cache)
     key = (tuple(int(v) for v in m_values_host), int(out_dim), str(device))
     cached = cache.get(key)
     if cached is not None:
@@ -2886,6 +2979,22 @@ def _multi_output_entry_map(
     )
     cache[key] = cached
     return cached
+
+
+def _multi_input_channel_plan(module, m_values_host, in_bases, cin_prefix, in_dim, device):
+    """Channel plan of the multi-m pack backward, cached on the persistent layout owner."""
+    owner = getattr(module, "_cache_owner", module)
+    cache = getattr(owner, "_fused_p0_multi_input_channel_plan", None)
+    if cache is None:
+        cache = {}
+        setattr(owner, "_fused_p0_multi_input_channel_plan", cache)
+    key = (tuple(int(v) for v in m_values_host), int(in_dim), str(device))
+    hit = cache.get(key)
+    if hit is None:
+        all_bases, all_ls = _pair_maps(module, 0, device)[:2]
+        hit = channel_plan(all_bases, all_ls, in_bases, cin_prefix[:-1], m_values_host, in_dim, device)
+        cache[key] = hit
+    return hit
 
 
 def _radial_parts(module, weights):
@@ -3038,6 +3147,7 @@ def _fused_pairs_indexed_sandwich_multi(
             bool(module.rotate_in),
             int(wigner_mode),
             int(wigner_stride),
+            _multi_input_channel_plan(module, m_values_host, in_bases, cin_prefix, int(x.shape[1]), x.device),
         )
         packed_parts = torch.split(packed_all, cin_values, dim=-1)
         for i, m in enumerate(m_values_host):

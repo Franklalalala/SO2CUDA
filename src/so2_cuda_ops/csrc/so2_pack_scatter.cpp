@@ -264,6 +264,20 @@ torch::Tensor scatter_pairs_multi_grad_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor channel_pack_grad_fp32_cuda(
+    torch::Tensor grad_packed,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    int64_t in_dim,
+    bool zero_fill,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32_cuda(
     torch::Tensor grad_pair_eff,
     torch::Tensor pair_no_radial,
@@ -1298,6 +1312,48 @@ torch::Tensor scatter_pairs_multi_grad_fp32(
       cin_prefix, m_values, in_dim, rotate_in, wigner_mode, wigner_stride);
 }
 
+static void check_channel_plan(const torch::Tensor& ch_base, const torch::Tensor& ch_l, const torch::Tensor& ch_cols) {
+  check_cuda_contiguous(ch_base, "ch_base");
+  check_cuda_contiguous(ch_l, "ch_l");
+  check_cuda_contiguous(ch_cols, "ch_cols");
+  TORCH_CHECK(ch_base.scalar_type() == torch::kInt32, "ch_base must be int32");
+  TORCH_CHECK(ch_l.scalar_type() == torch::kInt32, "ch_l must be int32");
+  TORCH_CHECK(ch_cols.scalar_type() == torch::kInt32, "ch_cols must be int32");
+  TORCH_CHECK(ch_base.numel() == ch_l.numel(), "channel base/l tables must be aligned");
+  TORCH_CHECK(ch_base.numel() == 0 || ch_cols.numel() % ch_base.numel() == 0,
+              "ch_cols must hold the same number of m columns per channel");
+}
+
+torch::Tensor channel_pack_grad_fp32(
+    torch::Tensor grad_packed,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor ch_base,
+    torch::Tensor ch_l,
+    torch::Tensor ch_cols,
+    int64_t in_dim,
+    bool zero_fill,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(grad_packed, "grad_packed");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  check_channel_plan(ch_base, ch_l, ch_cols);
+  TORCH_CHECK(grad_packed.scalar_type() == torch::kFloat32, "grad_packed must be fp32");
+  TORCH_CHECK(grad_packed.dim() == 3 && grad_packed.size(1) == 2, "grad_packed must be [N, 2, total_cin]");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  if (rotate_in) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return channel_pack_grad_fp32_cuda(
+      grad_packed, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols,
+      in_dim, zero_fill, rotate_in, wigner_mode, wigner_stride);
+}
+
 std::vector<torch::Tensor> scatter_pair_grad_radial_input_fp32(
     torch::Tensor grad_pair_eff,
     torch::Tensor pair_no_radial,
@@ -1582,6 +1638,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("m0_raw_pairs_multi_output_grad_flat_fp32", &m0_raw_pairs_multi_output_grad_flat_fp32, "SO2 fused m0 plus multi raw pair output grad fp32 with flat output maps");
   m.def("scatter_pair_grad_fp32", &scatter_pair_grad_fp32, "SO2 MoE fused P0 scatter pair grad fp32");
   m.def("scatter_pairs_multi_grad_fp32", &scatter_pairs_multi_grad_fp32, "SO2 MoE fused P0 grouped scatter pair grad fp32");
+  m.def("channel_pack_grad_fp32", &channel_pack_grad_fp32, "SO2 channel-major gather backward of the multi-m pair pack fp32");
   m.def("scatter_pair_grad_radial_input_fp32", &scatter_pair_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter pair grad fp32");
   m.def("block_complex_forward_fp32", &block_complex_forward_fp32, "SO2 compact block-complex pair GEMM forward fp32");
   m.def("block_complex_backward_fp32", &block_complex_backward_fp32, "SO2 compact block-complex pair GEMM backward fp32");

@@ -37,6 +37,18 @@ def _plan(layout, device):
     return cached
 
 
+def _input_channel_plan(layout, plan, in_dim, device):
+    """Channel tables of the pack's channel-major backward for an input width."""
+    cache = plan.__dict__.setdefault("input_channel_plans", {})
+    hit = cache.get(int(in_dim))
+    if hit is None:
+        from .tensor_product import channel_plan
+        all_bases, all_ls = layout.maps[0][0], layout.maps[0][1]
+        hit = channel_plan(all_bases, all_ls, plan.in_bases, plan.cin_prefix[:-1], plan.values, in_dim, device)
+        cache[int(in_dim)] = hit
+    return hit
+
+
 def true_dense_pairs(x, layout, wigner, linears, radial_parts=None):
     """Return ordered m>0 contributions using the qualified raw epilogue.
 
@@ -96,6 +108,7 @@ def true_dense_pairs(x, layout, wigner, linears, radial_parts=None):
         x.contiguous(), wigner.values, plan.in_bases, plan.in_ls, offsets,
         wigner.compact_offsets, plan.cin_prefix_t, plan.m_values_t,
         layout.rotate_in, wigner.mode, wigner.stride,
+        _input_channel_plan(layout, plan, x.shape[1], x.device),
     )
     raw = []
     for i, m in enumerate(plan.values):
