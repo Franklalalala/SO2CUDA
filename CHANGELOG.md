@@ -1,13 +1,13 @@
 # 更新记录
 
-## 未发布
+## 0.3.0（2026-10-10）
 
-- 增加单个 SO(2) 卷积的 EquiformerV3 原版基线、我们自己的纯 PyTorch 实现和 cuEquivariance 对照，核对输出、输入梯度、参数梯度及旋转等变性。
-- 增加显式 Wigner 旋转加分组 GEMM 的消融，比较 indexed sandwich 的时间和峰值显存，并给出各实现的源码路径说明。
-- 单算子以各实现的原生特征布局计时，布局转换放在计时区外；峰值显存只包含当前实现的数据与几何量。
-- 增加 UniTB 的 cuEquivariance 执行示例，层间共享每次前向构建的 Wigner，保留原模型参数、径向调制与专家混合顺序。
-- 公开 SO2CUDA pair 接口与 cuEquivariance 整模型组合按实际测试规模选择，保留所有候选计时和错误。
-- 性能表由 JSON 生成，分别呈现单算子与模型测试，记录严格 FP32 下的时间和峰值显存。
+- 新的块布局 sandwich 内核：每个 m 一块缓冲，(−m, +m) 成对存放，m>0 块的 2×2 复结构写成一个实数块权重，每块做一次 GEMM。旋入与收集各由一个按（边，通道）并行的 kernel 完成，反向复用同一套 kernel，不使用原子加。
+- `true_dense_pairs` 与 `dense_pairs` 增加仅关键字参数 `include_m0`：设为 `True` 时，m=0 项（含偏置）在同一次调用中完成；默认 `False`，行为与 0.2.0 相同。
+- 单专家与 top-k 路由的 `activation_forward`、按组的 `dense_pairs` 使用同一套块布局内核，径向权重与逐边门控在内核中处理。
+- FP32 下单组 GEMM 逐问题调用 cuBLAS；分组 GEMM 的反向只计算需要的梯度。
+- 增加单个 SO(2) 卷积的对照：EquiformerV3 原版（eager 与 `torch.compile`）、按 DeePTB 上游写法的纯 PyTorch 实现、cuEquivariance 0.12.0；逐项核对输出、输入梯度、参数梯度与旋转等变性。
+- 性能表由同一块 H200、同一次会话的 JSON 生成，分为单算子与 UniTB 模型两节，记录严格 FP32 下的时间与峰值显存。
 
 ## 0.2.0（2026-10-07）
 

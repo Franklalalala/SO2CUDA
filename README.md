@@ -1,6 +1,6 @@
 # SO2CUDA
 
-SO2CUDA 为 SO(2) 张量积和专家线性层提供 CUDA 加速，包括分组 GEMM、旋转后的张量打包与输出 scatter，以及 DeePTB 的 UniTB / UniTB-dense 执行接口。UniTB 使用 PDQ-MoE 专家层。Python 包名为 `so2_cuda_ops`，当前版本为 **0.2.0**。
+SO2CUDA 为 SO(2) 张量积和专家线性层提供 CUDA 加速，包括分组 GEMM、旋转后的张量打包与输出 scatter，以及 DeePTB 的 UniTB / UniTB-dense 执行接口。UniTB 使用 PDQ-MoE 专家层。Python 包名为 `so2_cuda_ops`，当前版本为 **0.3.0**。
 
 ## 安装
 
@@ -29,7 +29,7 @@ python -m pytest tests -q
 
 ## 与 DeePTB 配合
 
-SO2CUDA 0.2.0 与 DeePTB 的 `1006-stable` 分支配合使用。DeePTB 不安装 SO2CUDA 也能通过纯 PyTorch 运行；安装后，符合 CUDA FP32、布局与路由条件的层自动调用加速接口。CPU、其他 dtype 或不支持的调用使用参考实现，实际 CUDA 执行错误会直接抛出。
+SO2CUDA 0.3.0 与 DeePTB 的 `1006-stable` 分支配合使用。DeePTB 不安装 SO2CUDA 也能通过纯 PyTorch 运行；安装后，符合 CUDA FP32、布局与路由条件的层自动调用加速接口。CPU、其他 dtype 或不支持的调用使用参考实现，实际 CUDA 执行错误会直接抛出。
 
 DeePTB 通过 `dptb.nn.so2_backend` 调用 `so2_cuda_ops.deeptb`：UniTB-dense 使用 `dense_pairs`，UniTB 的 PDQ-MoE 使用 `activation_forward` 和分组 GEMM；扩展的非 MoE dense 层使用 `true_dense_pairs`。接口只接受张量与数据描述对象，SO2CUDA 本身不导入 DeePTB。模型参数与检查点结构由 DeePTB 管理。
 
