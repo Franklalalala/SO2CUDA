@@ -525,118 +525,142 @@ std::vector<torch::Tensor> grouped_gemm_multi_backward_weight_fp32(
   return grad_weights;
 }
 
-// out[start:end] = x[start:end] @ W[g]^T (or @ W[g] when transpose_weight), per segment,
-// written into a given contiguous output. Same problem policy as grouped_gemm.
+// For every problem p: outs[p][start:end] = xs[p][start:end] @ W_p[g]^T (or @ W_p[g] when
+// transpose_weight) for the row segments ptr[g]:ptr[g+1] shared by all problems, written into
+// given contiguous outputs. All problems and groups go to one cuBLAS call (same policy as
+// grouped_gemm_multi).
 void grouped_gemm_into_fp32(
-    torch::Tensor x,
+    std::vector<torch::Tensor> xs,
     torch::Tensor ptr,
-    torch::Tensor weight,
-    torch::Tensor out,
+    std::vector<torch::Tensor> weights,
+    std::vector<torch::Tensor> outs,
     bool transpose_weight,
     bool fast_tf32,
     int64_t loop_max) {
-  TORCH_CHECK(x.is_cuda() && weight.is_cuda() && out.is_cuda(), "x, weight and out must be CUDA");
+  TORCH_CHECK(!xs.empty() && xs.size() == weights.size() && xs.size() == outs.size(), "inconsistent problem lists");
   TORCH_CHECK(!ptr.is_cuda() && ptr.scalar_type() == torch::kInt64, "ptr must be CPU int64");
-  TORCH_CHECK(x.scalar_type() == torch::kFloat32 && weight.scalar_type() == torch::kFloat32 &&
-              out.scalar_type() == torch::kFloat32, "fp32 tensors are required");
-  TORCH_CHECK(x.is_contiguous() && weight.is_contiguous() && out.is_contiguous(), "contiguous tensors are required");
-  TORCH_CHECK(x.dim() == 2 && out.dim() == 2 && weight.dim() == 3, "x/out must be 2-D and weight 3-D");
-  const int64_t groups = weight.size(0);
-  const int64_t k_dim = transpose_weight ? weight.size(1) : weight.size(2);
-  const int64_t n_dim = transpose_weight ? weight.size(2) : weight.size(1);
-  TORCH_CHECK(x.size(1) == k_dim && out.size(1) == n_dim && out.size(0) == x.size(0), "shape mismatch");
-  TORCH_CHECK(ptr.numel() == groups + 1, "ptr must have G + 1 entries");
-  const int64_t n_rows = x.size(0);
-  c10::cuda::CUDAGuard device_guard(x.device());
-  auto handle = at::cuda::getCurrentCUDABlasHandle();
-  configure_math(handle, fast_tf32);
   const int64_t* ptr_data = ptr.data_ptr<int64_t>();
+  const int64_t groups = ptr.numel() - 1;
   std::vector<cublasOperation_t> transa, transb;
   std::vector<int> m, n, k, lda, ldb, ldc, group_size;
   std::vector<int64_t> a_array, b_array, c_array;
   std::vector<float> alpha, beta;
-  for (int64_t g = 0; g < groups; ++g) {
-    const int64_t start = ptr_data[g];
-    const int64_t end = ptr_data[g + 1];
-    TORCH_CHECK(end >= start && start >= 0 && end <= n_rows, "ptr must be a nondecreasing partition");
-    if (end == start) {
-      continue;
+  for (size_t p = 0; p < xs.size(); ++p) {
+    const auto& x = xs[p];
+    const auto& weight = weights[p];
+    const auto& out = outs[p];
+    TORCH_CHECK(x.is_cuda() && weight.is_cuda() && out.is_cuda(), "x, weight and out must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 && weight.scalar_type() == torch::kFloat32 &&
+                out.scalar_type() == torch::kFloat32, "fp32 tensors are required");
+    TORCH_CHECK(x.is_contiguous() && weight.is_contiguous() && out.is_contiguous(), "contiguous tensors are required");
+    TORCH_CHECK(x.dim() == 2 && out.dim() == 2 && weight.dim() == 3 && weight.size(0) == groups,
+                "x/out must be 2-D and weight [G, *, *] with one matrix per segment");
+    const int64_t k_dim = transpose_weight ? weight.size(1) : weight.size(2);
+    const int64_t n_dim = transpose_weight ? weight.size(2) : weight.size(1);
+    TORCH_CHECK(x.size(1) == k_dim && out.size(1) == n_dim && out.size(0) == x.size(0), "shape mismatch");
+    const int64_t n_rows = x.size(0);
+    for (int64_t g = 0; g < groups; ++g) {
+      const int64_t start = ptr_data[g];
+      const int64_t end = ptr_data[g + 1];
+      TORCH_CHECK(end >= start && start >= 0 && end <= n_rows, "ptr must be a nondecreasing partition");
+      if (end == start) {
+        continue;
+      }
+      transa.push_back(transpose_weight ? CUBLAS_OP_N : CUBLAS_OP_T);
+      transb.push_back(CUBLAS_OP_N);
+      m.push_back(static_cast<int>(n_dim));
+      n.push_back(static_cast<int>(end - start));
+      k.push_back(static_cast<int>(k_dim));
+      lda.push_back(static_cast<int>(weight.size(2)));
+      ldb.push_back(static_cast<int>(k_dim));
+      ldc.push_back(static_cast<int>(n_dim));
+      group_size.push_back(1);
+      alpha.push_back(1.0f);
+      beta.push_back(0.0f);
+      a_array.push_back(reinterpret_cast<int64_t>(weight.data_ptr<float>() + g * weight.size(1) * weight.size(2)));
+      b_array.push_back(reinterpret_cast<int64_t>(x.data_ptr<float>() + start * k_dim));
+      c_array.push_back(reinterpret_cast<int64_t>(out.data_ptr<float>() + start * n_dim));
     }
-    transa.push_back(transpose_weight ? CUBLAS_OP_N : CUBLAS_OP_T);
-    transb.push_back(CUBLAS_OP_N);
-    m.push_back(static_cast<int>(n_dim));
-    n.push_back(static_cast<int>(end - start));
-    k.push_back(static_cast<int>(k_dim));
-    lda.push_back(static_cast<int>(weight.size(2)));
-    ldb.push_back(static_cast<int>(k_dim));
-    ldc.push_back(static_cast<int>(n_dim));
-    group_size.push_back(1);
-    alpha.push_back(1.0f);
-    beta.push_back(0.0f);
-    a_array.push_back(reinterpret_cast<int64_t>(weight.data_ptr<float>() + g * weight.size(1) * weight.size(2)));
-    b_array.push_back(reinterpret_cast<int64_t>(x.data_ptr<float>() + start * k_dim));
-    c_array.push_back(reinterpret_cast<int64_t>(out.data_ptr<float>() + start * n_dim));
   }
+  if (group_size.empty()) {
+    return;
+  }
+  c10::cuda::CUDAGuard device_guard(xs[0].device());
+  auto handle = at::cuda::getCurrentCUDABlasHandle();
+  configure_math(handle, fast_tf32);
   const cublasComputeType_t compute_type = fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   run_grouped_or_loop_gemm_fp32(
       handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
-      c_array, ldc, group_size, compute_type, x);
+      c_array, ldc, group_size, compute_type, xs[0]);
 }
 
-// grad_weight[g] = grad[start:end]^T @ x[start:end] per segment, into a given [G, N, K] output;
-// groups without rows get zeros.
+// For every problem p: outs[p][g] = grads[p][start:end]^T @ xs[p][start:end] per row segment,
+// into given [G, N, K] outputs, accumulated onto them when `accumulate`; with accumulate false
+// groups without rows are set to zero.
 void grouped_gemm_weight_grad_into_fp32(
-    torch::Tensor grad,
-    torch::Tensor x,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> xs,
     torch::Tensor ptr,
-    torch::Tensor out,
+    std::vector<torch::Tensor> outs,
+    bool accumulate,
     bool fast_tf32,
     int64_t loop_max) {
-  TORCH_CHECK(grad.is_cuda() && x.is_cuda() && out.is_cuda(), "grad, x and out must be CUDA");
+  TORCH_CHECK(!xs.empty() && xs.size() == grads.size() && xs.size() == outs.size(), "inconsistent problem lists");
   TORCH_CHECK(!ptr.is_cuda() && ptr.scalar_type() == torch::kInt64, "ptr must be CPU int64");
-  TORCH_CHECK(grad.is_contiguous() && x.is_contiguous() && out.is_contiguous(), "contiguous tensors are required");
-  TORCH_CHECK(grad.dim() == 2 && x.dim() == 2 && out.dim() == 3, "grad/x must be 2-D and out 3-D");
-  const int64_t groups = out.size(0);
-  const int64_t n_dim = grad.size(1);
-  const int64_t k_dim = x.size(1);
-  TORCH_CHECK(out.size(1) == n_dim && out.size(2) == k_dim && grad.size(0) == x.size(0), "shape mismatch");
-  TORCH_CHECK(ptr.numel() == groups + 1, "ptr must have G + 1 entries");
-  const int64_t n_rows = x.size(0);
-  c10::cuda::CUDAGuard device_guard(x.device());
-  auto handle = at::cuda::getCurrentCUDABlasHandle();
-  configure_math(handle, fast_tf32);
   const int64_t* ptr_data = ptr.data_ptr<int64_t>();
+  const int64_t groups = ptr.numel() - 1;
   std::vector<cublasOperation_t> transa, transb;
   std::vector<int> m, n, k, lda, ldb, ldc, group_size;
   std::vector<int64_t> a_array, b_array, c_array;
   std::vector<float> alpha, beta;
-  for (int64_t g = 0; g < groups; ++g) {
-    const int64_t start = ptr_data[g];
-    const int64_t end = ptr_data[g + 1];
-    TORCH_CHECK(end >= start && start >= 0 && end <= n_rows, "ptr must be a nondecreasing partition");
-    if (end == start) {
-      out[g].zero_();
-      continue;
+  for (size_t p = 0; p < xs.size(); ++p) {
+    const auto& grad = grads[p];
+    const auto& x = xs[p];
+    const auto& out = outs[p];
+    TORCH_CHECK(grad.is_cuda() && x.is_cuda() && out.is_cuda(), "grad, x and out must be CUDA");
+    TORCH_CHECK(grad.is_contiguous() && x.is_contiguous() && out.is_contiguous(), "contiguous tensors are required");
+    TORCH_CHECK(grad.dim() == 2 && x.dim() == 2 && out.dim() == 3 && out.size(0) == groups,
+                "grad/x must be 2-D and out [G, N, K] with one matrix per segment");
+    const int64_t n_dim = grad.size(1);
+    const int64_t k_dim = x.size(1);
+    TORCH_CHECK(out.size(1) == n_dim && out.size(2) == k_dim && grad.size(0) == x.size(0), "shape mismatch");
+    const int64_t n_rows = x.size(0);
+    for (int64_t g = 0; g < groups; ++g) {
+      const int64_t start = ptr_data[g];
+      const int64_t end = ptr_data[g + 1];
+      TORCH_CHECK(end >= start && start >= 0 && end <= n_rows, "ptr must be a nondecreasing partition");
+      if (end == start) {
+        if (!accumulate) {
+          out[g].zero_();
+        }
+        continue;
+      }
+      transa.push_back(CUBLAS_OP_N);
+      transb.push_back(CUBLAS_OP_T);
+      m.push_back(static_cast<int>(k_dim));
+      n.push_back(static_cast<int>(n_dim));
+      k.push_back(static_cast<int>(end - start));
+      lda.push_back(static_cast<int>(k_dim));
+      ldb.push_back(static_cast<int>(n_dim));
+      ldc.push_back(static_cast<int>(k_dim));
+      group_size.push_back(1);
+      alpha.push_back(1.0f);
+      beta.push_back(accumulate ? 1.0f : 0.0f);
+      a_array.push_back(reinterpret_cast<int64_t>(x.data_ptr<float>() + start * k_dim));
+      b_array.push_back(reinterpret_cast<int64_t>(grad.data_ptr<float>() + start * n_dim));
+      c_array.push_back(reinterpret_cast<int64_t>(out.data_ptr<float>() + g * n_dim * k_dim));
     }
-    transa.push_back(CUBLAS_OP_N);
-    transb.push_back(CUBLAS_OP_T);
-    m.push_back(static_cast<int>(k_dim));
-    n.push_back(static_cast<int>(n_dim));
-    k.push_back(static_cast<int>(end - start));
-    lda.push_back(static_cast<int>(k_dim));
-    ldb.push_back(static_cast<int>(n_dim));
-    ldc.push_back(static_cast<int>(k_dim));
-    group_size.push_back(1);
-    alpha.push_back(1.0f);
-    beta.push_back(0.0f);
-    a_array.push_back(reinterpret_cast<int64_t>(x.data_ptr<float>() + start * k_dim));
-    b_array.push_back(reinterpret_cast<int64_t>(grad.data_ptr<float>() + start * n_dim));
-    c_array.push_back(reinterpret_cast<int64_t>(out.data_ptr<float>() + g * n_dim * k_dim));
   }
+  if (group_size.empty()) {
+    return;
+  }
+  c10::cuda::CUDAGuard device_guard(xs[0].device());
+  auto handle = at::cuda::getCurrentCUDABlasHandle();
+  configure_math(handle, fast_tf32);
   const cublasComputeType_t compute_type = fast_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   run_grouped_or_loop_gemm_fp32(
       handle, loop_max, transa, transb, m, n, k, alpha, a_array, lda, b_array, ldb, beta,
-      c_array, ldc, group_size, compute_type, x);
+      c_array, ldc, group_size, compute_type, xs[0]);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

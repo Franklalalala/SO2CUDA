@@ -261,19 +261,9 @@ def _single_expert_forward(x, layout, wigner, linears, radials, routing):
             return None
     if layout.maps[0][0].numel() == 0 or layout.maps[0][2].numel() == 0:
         return None
-    radials_by_m = None
-    if radials is not None:
-        if layout.front and len(layout.maps) > 1:
-            if len(radials) != 2:
-                return None
-            sizes = [layout.maps[m][0].numel() for m in range(1, len(layout.maps))]
-            if radials[1].shape != (x.shape[0], sum(sizes)):
-                return None
-            radials_by_m = (radials[0],) + tuple(torch.split(radials[1], sizes, dim=-1))
-        else:
-            radials_by_m = tuple(radials)
-        if not _radials_fit(x, layout, radials_by_m, first_m=0):
-            return None
+    radials_by_m = _routed_radials(x, layout, radials)
+    if radials_by_m is False:
+        return None
     from ._sandwich import full_sandwich, sandwich_plan
     if not sandwich_plan(layout, x.shape[1], x.device, with_m0=True).supported:
         return None
@@ -281,7 +271,68 @@ def _single_expert_forward(x, layout, wigner, linears, radials, routing):
     w0 = linears[0].weight[0]
     b0 = None if linears[0].bias is None else linears[0].bias[0]
     pairs = (None,) + tuple(params.weight[0] for params in linears[1:])
-    return full_sandwich(x, layout, wigner, w0, b0, pairs, radials_by_m, gate)
+    return full_sandwich(x, layout, wigner, w0, b0, pairs, radials_by_m, gates=(gate,))
+
+
+def _routed_radials(x, layout, radials):
+    """Per-block radial weights of an activation layer, or False when they do not fit."""
+    if radials is None:
+        return None
+    if layout.front and len(layout.maps) > 1:
+        if len(radials) != 2:
+            return False
+        sizes = [layout.maps[m][0].numel() for m in range(1, len(layout.maps))]
+        if radials[1].shape != (x.shape[0], sum(sizes)):
+            return False
+        radials_by_m = (radials[0],) + tuple(torch.split(radials[1], sizes, dim=-1))
+    else:
+        radials_by_m = tuple(radials)
+    return radials_by_m if _radials_fit(x, layout, radials_by_m, first_m=0) else False
+
+
+def _routed_forward(x, layout, wigner, linears, radials, routing, schedule):
+    """Top-k routed experts, every block routed, no separate shared term: per slot,
+    rotate the input into expert-sorted block rows, one grouped GEMM per block over
+    the experts' row segments, and add gate * (rotated-back output). Returns None for
+    every other case."""
+    if schedule != 'per_slot' or routing.branch != 'all':
+        return None
+    idx = routing.indices
+    n = x.shape[0]
+    if idx.ndim != 2 or idx.shape[0] != n or len(routing.slots) != idx.shape[1] or len(linears) != len(layout.maps):
+        return None
+    experts = int(linears[0].weight.shape[0]) if linears[0].weight.ndim == 3 else 0
+    fold = bool(routing.coefficients_sum_to_one)
+    for m, params in enumerate(linears):
+        cin, cout = layout.maps[m][0].numel(), layout.maps[m][2].numel()
+        weight = params.weight
+        if (not params.routed or weight.ndim != 3 or weight.shape != (experts, cout * (2 if m else 1), cin)
+                or weight.device != x.device or weight.dtype != x.dtype):
+            return None
+        if params.bias is not None and (m > 0 or params.bias.shape != (experts, cout)):
+            return None
+        if params.shared_weight is not None and not fold:
+            return None
+    if experts == 0 or layout.maps[0][0].numel() == 0 or layout.maps[0][2].numel() == 0:
+        return None
+    radials_by_m = _routed_radials(x, layout, radials)
+    if radials_by_m is False:
+        return None
+    from ._sandwich import _slot, full_sandwich, sandwich_plan
+    slots = []
+    for order, inverse, ptr, *_ in routing.slots:
+        if (ptr.is_cuda or ptr.ndim != 1 or ptr.numel() != experts + 1 or int(ptr[0]) != 0
+                or int(ptr[-1]) != n or order.numel() != n or inverse.numel() != n):
+            return None
+        slots.append(_slot(inverse.to(device=x.device, dtype=torch.long),
+                           order.to(device=x.device, dtype=torch.long), ptr.to(torch.long), x.device))
+    if not sandwich_plan(layout, x.shape[1], x.device, with_m0=True).supported:
+        return None
+    values = routing.values.to(device=x.device, dtype=x.dtype)
+    gates = tuple(values[:, j] for j in range(values.shape[1]))
+    pairs = (None,) + tuple(params.weight for params in linears[1:])
+    return full_sandwich(x, layout, wigner, linears[0].weight, linears[0].bias, pairs, radials_by_m,
+                         gates=gates, slots=slots)
 
 
 def activation_forward(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
@@ -297,9 +348,11 @@ def activation_forward(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
         return None
     if schedule not in ('per_slot', 'expanded'):
         raise ValueError('schedule must be per_slot or expanded')
-    single = _single_expert_forward(x, layout, wigner, linears, radials, routing)
-    if single is not None:
-        return single
+    fused = _single_expert_forward(x, layout, wigner, linears, radials, routing)
+    if fused is None:
+        fused = _routed_forward(x, layout, wigner, linears, radials, routing, schedule)
+    if fused is not None:
+        return fused
     from . import _activation as activation
     from . import tensor_product as tp
     module = _LayerView(layout, linears, x.device)

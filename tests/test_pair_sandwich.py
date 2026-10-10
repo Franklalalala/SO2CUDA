@@ -256,3 +256,60 @@ def test_dense_pairs_grouped_rotated(front, radial):
         if b.abs().max() == 0:
             continue
         torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("radial", [None, "front", "back"])
+def test_activation_routed_experts_rotated(radial):
+    from so2_cuda_ops.deeptb import ActivationRouting, activation_forward
+    front = radial != "back"
+    entries_in, entries_out, dim_in, dim_out, l_max, m_max, x64, blocks64, w64, r64 = _case(
+        front, radial is not None)
+    n = x64.shape[0]
+    experts, k = 3, 2
+    g = torch.Generator().manual_seed(13)
+    idx = torch.stack([torch.randperm(experts, generator=g)[:k] for _ in range(n)])
+    we64 = [torch.randn(experts, *w.shape, generator=g, dtype=torch.float64) for w in w64]
+    be64 = torch.randn(experts, w64[0].shape[0], generator=g, dtype=torch.float64)
+    gate64 = torch.rand(n, k, generator=g, dtype=torch.float64) + 0.25
+    probe = torch.randn(n, dim_out, generator=g, dtype=torch.float64)
+    leaves = [x64, be64, gate64] + we64 + (list(r64) if r64 is not None else [])
+    leaves = [t.clone().requires_grad_(True) for t in leaves]
+    xr, br, gr, wr, rr = leaves[0], leaves[1], leaves[2], leaves[3:3 + len(we64)], leaves[3 + len(we64):]
+    ref = torch.zeros(n, dim_out, dtype=torch.float64)
+    for j in range(k):
+        for e in range(experts):
+            sel = (idx[:, j] == e).nonzero().flatten()
+            if sel.numel() == 0:
+                continue
+            part = _reference_layer(xr[sel], [b[sel] for b in blocks64], entries_in, entries_out,
+                                    [w[e] for w in wr], br[e], [r[sel] for r in rr] if rr else None, front,
+                                    dim_out, gr[sel, j])
+            ref = ref.index_add(0, sel, part)
+    ref_grads = torch.autograd.grad((ref * probe).sum(), leaves)
+
+    dev = "cuda"
+    cuda = [t.detach().float().to(dev).requires_grad_(True) for t in leaves]
+    x, b0, gate, ws, rs = cuda[0], cuda[1], cuda[2], cuda[3:3 + len(we64)], cuda[3 + len(we64):]
+    layout = prepare_layout(entries_in, entries_out, m_max=m_max, l_max=l_max, out_dim=dim_out,
+                            device=dev, front=front)
+    wigner = prepare_wigner(x, tuple(b.float().to(dev) for b in blocks64), l_max=l_max)
+    linears = (LinearWeights(ws[0], b0),) + tuple(LinearWeights(w) for w in ws[1:])
+    radials = None
+    if rs:
+        radials = (rs[0], torch.cat(rs[1:], dim=-1)) if front else tuple(rs)
+    idx_dev = idx.to(dev)
+    slots = []
+    for j in range(k):
+        order = torch.argsort(idx_dev[:, j], stable=True)
+        inverse = torch.argsort(order)
+        counts = torch.bincount(idx_dev[:, j], minlength=experts).cpu()
+        ptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+        slots.append((order, inverse, ptr, idx_dev[:, j][order]))
+    routing = ActivationRouting(idx_dev, gate, tuple(slots), coefficients_sum_to_one=False)
+    actual = activation_forward(x, layout, wigner, linears, radials, routing)
+    assert actual is not None
+    grads = torch.autograd.grad((actual * probe.float().to(dev)).sum(), cuda)
+    scale = ref.detach().abs().max()
+    torch.testing.assert_close(actual.double().cpu(), ref.detach(), atol=2e-5 * float(scale), rtol=0)
+    for a, b in zip(grads, ref_grads):
+        torch.testing.assert_close(a.double().cpu(), b, atol=3e-5 * float(b.abs().max()) + 1e-6, rtol=0)
