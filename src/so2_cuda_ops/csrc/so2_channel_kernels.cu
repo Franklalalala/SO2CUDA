@@ -195,7 +195,8 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
     int64_t n_edges,
     int64_t row,
     const float* __restrict__ D,
-    int64_t rs) {
+    int64_t rs,
+    float scale) {
   constexpr int dim = 2 * L + 1;
   float v[dim];
 #pragma unroll
@@ -211,7 +212,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
         r = fmaf(v[d], __ldg(D + d * rs + L), r);
       }
     }
-    dst[block_row(blocks, 0, n_edges, row) + cols[0]] = r;
+    dst[block_row(blocks, 0, n_edges, row) + cols[0]] = r * scale;
   }
 #pragma unroll
   for (int m = 1; m <= L; ++m) {
@@ -234,8 +235,8 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
       }
     }
     float* __restrict__ out = dst + block_row(blocks, m, n_edges, row) + col;
-    out[0] = r0;
-    out[block_width(blocks, m)] = r1;
+    out[0] = r0 * scale;
+    out[block_width(blocks, m)] = r1 * scale;
   }
 }
 
@@ -307,7 +308,8 @@ __device__ void rotate_channel_to_blocks_any(
     int64_t n_edges,
     int64_t row,
     const float* __restrict__ D,
-    int64_t rs) {
+    int64_t rs,
+    float scale) {
   const int dim = 2 * l + 1;
   for (int m = 0; m <= l && m <= mtab; ++m) {
     const int col = cols[m];
@@ -324,7 +326,7 @@ __device__ void rotate_channel_to_blocks_any(
           r = fmaf(src[d], D[d * rs + j], r);
         }
       }
-      out[p * block_width(blocks, m)] = r;
+      out[p * block_width(blocks, m)] = r * scale;
     }
   }
 }
@@ -387,6 +389,7 @@ __global__ void channel_rotate_to_blocks_kernel(
     int mtab,
     BlockSet blocks,
     float* __restrict__ dst,
+    const float* __restrict__ edge_scale,
     const int64_t* __restrict__ row_of_edge,
     int64_t n_edges,
     int64_t n_channels) {
@@ -402,8 +405,9 @@ __global__ void channel_rotate_to_blocks_kernel(
   const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
   int64_t rs = 0;
   const float* __restrict__ D = (w.mode != 0 && l > 0) ? wigner_block(w, edge, l, rs) : nullptr;
-  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, n_edges, row, D, rs)),
-                (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, n_edges, row, D, rs)));
+  const float scale = edge_scale == nullptr ? 1.0f : edge_scale[edge];
+  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)),
+                      (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, n_edges, row, D, rs, scale)));
 }
 
 // Largest degree whose 2l+1 outputs a warp stages in shared memory.
@@ -616,6 +620,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     torch::Tensor ch_cols,
     torch::Tensor block_table,
     int64_t total_width,
+    torch::Tensor edge_scale,
     torch::Tensor row_of_edge,
     bool rotate,
     int64_t wigner_mode,
@@ -636,6 +641,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
       src.data_ptr<float>(), src.size(1), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
       cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(),
+      edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
       row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
       n_edges, n_channels);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

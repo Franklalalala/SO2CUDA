@@ -288,6 +288,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     torch::Tensor ch_cols,
     torch::Tensor block_table,
     int64_t total_width,
+    torch::Tensor edge_scale,
     torch::Tensor row_of_edge,
     bool rotate,
     int64_t wigner_mode,
@@ -1433,6 +1434,7 @@ torch::Tensor channel_rotate_to_blocks_fp32(
     torch::Tensor ch_cols,
     torch::Tensor block_table,
     int64_t total_width,
+    torch::Tensor edge_scale,
     torch::Tensor row_of_edge,
     bool rotate,
     int64_t wigner_mode,
@@ -1443,9 +1445,14 @@ torch::Tensor channel_rotate_to_blocks_fp32(
   check_block_table(block_table, ch_base, ch_cols);
   check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
   check_optional_rows(row_of_edge, src.size(0));
+  if (edge_scale.numel() > 0) {
+    check_cuda_contiguous(edge_scale, "edge_scale");
+    TORCH_CHECK(edge_scale.scalar_type() == torch::kFloat32 && edge_scale.numel() == src.size(0),
+                "edge_scale must hold one fp32 value per edge");
+  }
   return channel_rotate_to_blocks_fp32_cuda(
       src, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table, total_width,
-      row_of_edge, rotate, wigner_mode, wigner_stride);
+      edge_scale, row_of_edge, rotate, wigner_mode, wigner_stride);
 }
 
 torch::Tensor channel_gather_from_blocks_fp32(

@@ -152,15 +152,17 @@ def _single_group(x, layout, weights, routing):
     return first == 0 and last == 2 * x.shape[0]
 
 
-def _front_radials_fit(x, layout, radial_parts):
-    """No radial weights, or front radial weights of shape [N, Cin_m] for every m>0."""
+def _radials_fit(x, layout, radial_parts, first_m=1):
+    """No radial weights, or one radial weight per m block: [N, Cin_m] for front
+    layouts, [N, Cout_m] otherwise."""
     if radial_parts is None:
         return True
-    if not layout.front or len(radial_parts) < len(layout.maps):
+    if len(radial_parts) < len(layout.maps):
         return False
-    return all(radial_parts[m].shape == (x.shape[0], layout.maps[m][0].numel())
+    side = 0 if layout.front else 2
+    return all(radial_parts[m].shape == (x.shape[0], layout.maps[m][side].numel())
                and radial_parts[m].device == x.device and radial_parts[m].dtype == x.dtype
-               for m in range(1, len(layout.maps)))
+               for m in range(first_m, len(layout.maps)))
 
 
 def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
@@ -180,7 +182,7 @@ def dense_pairs(x: torch.Tensor, layout: PairLayout, wigner: WignerData,
              'indexed_sandwich_multi_grouped', 'cublas_multi_sandwich_grouped')
     if mode not in ('scalar',) + multi:
         return None
-    if mode in multi and _single_group(x, layout, weights, routing) and _front_radials_fit(x, layout, radial_parts):
+    if mode in multi and _single_group(x, layout, weights, routing) and _radials_fit(x, layout, radial_parts):
         # One group over every row: each m block is one plain GEMM of its pair rows.
         from ._sandwich import block_sandwich, sandwich_plan
         if sandwich_plan(layout, x.shape[1], x.device).supported:
