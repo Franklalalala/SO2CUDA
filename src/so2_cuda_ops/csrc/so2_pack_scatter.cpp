@@ -293,7 +293,9 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies);
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    bool plain);
 
 torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor src,
@@ -313,7 +315,13 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies);
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    torch::Tensor plain,
+    torch::Tensor radial_grad,
+    std::vector<int64_t> radial_offsets,
+    torch::Tensor dot_src,
+    torch::Tensor dot_out);
 
 torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights);
 
@@ -1427,6 +1435,18 @@ static void check_optional_rows(const torch::Tensor& row_of_edge, int64_t n_edge
   }
 }
 
+static void check_radials(const std::vector<torch::Tensor>& radials, int64_t n_edges) {
+  TORCH_CHECK(radials.size() <= 16, "at most 16 radial blocks");
+  for (const auto& radial : radials) {
+    if (!radial.defined() || radial.numel() == 0) {
+      continue;
+    }
+    TORCH_CHECK(radial.is_cuda() && radial.scalar_type() == torch::kFloat32 && radial.dim() == 2 &&
+                radial.size(0) == n_edges && radial.stride(1) == 1,
+                "radial weights must be [n_edges, width] fp32 CUDA rows with unit column stride");
+  }
+}
+
 static void check_optional_scale(const torch::Tensor& edge_scale, int64_t n_edges, int64_t copies) {
   if (edge_scale.numel() > 0) {
     check_cuda_contiguous(edge_scale, "edge_scale");
@@ -1450,9 +1470,12 @@ torch::Tensor channel_rotate_to_blocks_fp32(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies) {
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    bool plain) {
   check_cuda_contiguous(src, "src");
   TORCH_CHECK(src.scalar_type() == torch::kFloat32 && src.dim() == 2, "src must be a 2-D fp32 tensor");
+  check_radials(radials, src.size(0));
   TORCH_CHECK(copies >= 1, "copies must be positive");
   check_channel_plan(ch_base, ch_l, ch_cols);
   check_block_table(block_table, ch_base, ch_cols);
@@ -1461,7 +1484,7 @@ torch::Tensor channel_rotate_to_blocks_fp32(
   check_optional_scale(edge_scale, src.size(0), copies);
   return channel_rotate_to_blocks_fp32_cuda(
       src, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table, total_width,
-      edge_scale, row_of_edge, rotate, wigner_mode, wigner_stride, copies);
+      edge_scale, row_of_edge, rotate, wigner_mode, wigner_stride, copies, radials, plain);
 }
 
 torch::Tensor channel_gather_from_blocks_fp32(
@@ -1482,9 +1505,35 @@ torch::Tensor channel_gather_from_blocks_fp32(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies) {
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    torch::Tensor plain,
+    torch::Tensor radial_grad,
+    std::vector<int64_t> radial_offsets,
+    torch::Tensor dot_src,
+    torch::Tensor dot_out) {
   check_cuda_contiguous(src, "src");
   TORCH_CHECK(src.scalar_type() == torch::kFloat32, "src must be fp32");
+  check_radials(radials, n_edges);
+  if (plain.numel() > 0) {
+    check_cuda_contiguous(plain, "plain");
+    TORCH_CHECK(plain.scalar_type() == torch::kFloat32 && plain.numel() * copies == src.numel(),
+                "plain must hold one block buffer");
+  }
+  if (radial_grad.numel() > 0) {
+    check_cuda_contiguous(radial_grad, "radial_grad");
+    TORCH_CHECK(radial_grad.scalar_type() == torch::kFloat32 && radial_grad.dim() == 2 &&
+                radial_grad.size(0) == n_edges, "radial_grad must be [n_edges, width] fp32");
+    TORCH_CHECK(plain.numel() > 0, "radial gradients need the unscaled block buffer");
+  }
+  if (dot_src.numel() > 0) {
+    check_cuda_contiguous(dot_src, "dot_src");
+    check_cuda_contiguous(dot_out, "dot_out");
+    TORCH_CHECK(dot_src.scalar_type() == torch::kFloat32 && dot_src.numel() == src.numel(),
+                "dot_src must match src");
+    TORCH_CHECK(dot_out.scalar_type() == torch::kFloat32 && dot_out.numel() == copies * n_edges,
+                "dot_out must hold one value per edge and copy");
+  }
   TORCH_CHECK(copies >= 1 && src.numel() % copies == 0, "src must hold the given number of block copies");
   check_channel_plan(ch_base, ch_l, ch_cols);
   check_block_table(block_table, ch_base, ch_cols);
@@ -1499,7 +1548,8 @@ torch::Tensor channel_gather_from_blocks_fp32(
   }
   return channel_gather_from_blocks_fp32_cuda(
       src, n_edges, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table,
-      dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge, rotate, wigner_mode, wigner_stride, copies);
+      dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge, rotate, wigner_mode, wigner_stride, copies,
+      radials, plain, radial_grad, radial_offsets, dot_src, dot_out);
 }
 
 torch::Tensor block_complex_weights_fp32(std::vector<torch::Tensor> weights) {

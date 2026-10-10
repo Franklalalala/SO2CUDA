@@ -201,6 +201,20 @@ __device__ __forceinline__ float copy_scale(const Copies& c, int i, int64_t n_ed
   return c.scales == nullptr ? 1.0f : c.scales[i * n_edges + edge];
 }
 
+// Per-block radial weights of the input side: column c of block m is scaled by
+// ptr[m][edge * stride[m] + c] (no scaling when ptr[m] is null). `plain`, when set,
+// receives the unscaled rotated values in edge order (one more block buffer).
+struct RadialSet {
+  const float* ptr[kMaxBlocks];
+  int64_t stride[kMaxBlocks];
+  float* plain;
+};
+
+__device__ __forceinline__ float radial_value(const RadialSet& r, int m, int64_t edge, int col) {
+  const float* p = r.ptr[m];
+  return p == nullptr ? 1.0f : p[edge * r.stride[m] + col];
+}
+
 // Rotate one channel of degree L into the blocks of every copy: r_j = sum_d v[d] D[d][j],
 // r_{L-m} -> pair 0 and r_{L+m} -> pair 1 of block m, r_L -> block 0. The rotation is
 // computed once and written to each copy.
@@ -212,6 +226,7 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
     const BlockSet& blocks,
     float* __restrict__ dst,
     const Copies& copies,
+    const RadialSet& radial,
     int64_t n_edges,
     int64_t edge,
     const float* __restrict__ D,
@@ -238,12 +253,35 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
       }
     }
   }
+  if (radial.plain != nullptr) {
+    if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
+      radial.plain[block_row(blocks, 0, n_edges, edge) + cols[0]] = r[L];
+    }
+#pragma unroll
+    for (int m = 1; m <= L; ++m) {
+      if (m > mtab) {
+        break;
+      }
+      const int col = cols[m];
+      if (col < 0 || block_width(blocks, m) == 0) {
+        continue;
+      }
+      float* __restrict__ out = radial.plain + block_row(blocks, m, n_edges, edge) + col;
+      out[0] = r[L - m];
+      out[block_width(blocks, m)] = r[L + m];
+    }
+  }
+  float w[L + 1];
+#pragma unroll
+  for (int m = 0; m <= L; ++m) {
+    w[m] = (m <= mtab && cols[m] >= 0) ? radial_value(radial, m, edge, cols[m]) : 1.0f;
+  }
   for (int c = 0; c < copies.count; ++c) {
     const int64_t row = copy_row(copies, c, n_edges, edge);
     const float scale = copy_scale(copies, c, n_edges, edge);
     float* __restrict__ out_copy = dst + c * copies.stride;
     if (block_width(blocks, 0) > 0 && cols[0] >= 0) {
-      out_copy[block_row(blocks, 0, n_edges, row) + cols[0]] = r[L] * scale;
+      out_copy[block_row(blocks, 0, n_edges, row) + cols[0]] = r[L] * (scale * w[0]);
     }
 #pragma unroll
     for (int m = 1; m <= L; ++m) {
@@ -255,8 +293,8 @@ __device__ __forceinline__ void rotate_channel_to_blocks(
         continue;
       }
       float* __restrict__ out = out_copy + block_row(blocks, m, n_edges, row) + col;
-      out[0] = r[L - m] * scale;
-      out[block_width(blocks, m)] = r[L + m] * scale;
+      out[0] = r[L - m] * (scale * w[m]);
+      out[block_width(blocks, m)] = r[L + m] * (scale * w[m]);
     }
   }
 }
@@ -332,6 +370,7 @@ __device__ void rotate_channel_to_blocks_any(
     const BlockSet& blocks,
     float* __restrict__ dst,
     const Copies& copies,
+    const RadialSet& radial,
     int64_t n_edges,
     int64_t edge,
     const float* __restrict__ D,
@@ -342,6 +381,7 @@ __device__ void rotate_channel_to_blocks_any(
     if (col < 0 || block_width(blocks, m) == 0) {
       continue;
     }
+    const float w = radial_value(radial, m, edge, col);
     for (int p = 0; p < (m == 0 ? 1 : 2); ++p) {
       const int j = p == 0 ? l - m : l + m;
       float r = src[j];
@@ -351,10 +391,13 @@ __device__ void rotate_channel_to_blocks_any(
           r = fmaf(src[d], D[d * rs + j], r);
         }
       }
+      if (radial.plain != nullptr) {
+        radial.plain[block_row(blocks, m, n_edges, edge) + col + p * block_width(blocks, m)] = r;
+      }
       for (int c = 0; c < copies.count; ++c) {
         float* __restrict__ out = dst + c * copies.stride +
                                   block_row(blocks, m, n_edges, copy_row(copies, c, n_edges, edge)) + col;
-        out[p * block_width(blocks, m)] = r * copy_scale(copies, c, n_edges, edge);
+        out[p * block_width(blocks, m)] = r * (copy_scale(copies, c, n_edges, edge) * w);
       }
     }
   }
@@ -452,6 +495,7 @@ __global__ void channel_rotate_to_blocks_kernel(
     BlockSet blocks,
     float* __restrict__ dst,
     Copies copies,
+    RadialSet radial,
     int64_t n_edges,
     int64_t n_channels) {
   __shared__ float stage_all[kChannelThreads * kStageWidth];
@@ -488,8 +532,10 @@ __global__ void channel_rotate_to_blocks_kernel(
   const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
   int64_t rs = 0;
   const float* __restrict__ D = (w.mode != 0 && l > 0) ? wigner_block(w, edge, l, rs) : nullptr;
-  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, copies, n_edges, edge, D, rs)),
-                      (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, copies, n_edges, edge, D, rs)));
+  SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(in, cols, mtab, blocks, dst, copies, radial, n_edges, edge, D,
+                                                       rs)),
+                      (rotate_channel_to_blocks_any(in, l, cols, mtab, blocks, dst, copies, radial, n_edges, edge, D,
+                                                    rs)));
 }
 
 __global__ void channel_gather_from_blocks_kernel(
@@ -666,6 +712,7 @@ __global__ void channel_rotate_edge_kernel(
     BlockSet blocks,
     float* __restrict__ dst,
     Copies copies,
+    RadialSet radial,
     int64_t n_edges,
     int n_channels) {
   extern __shared__ float smem[];
@@ -685,11 +732,48 @@ __global__ void channel_rotate_edge_kernel(
     const float* v = sx + ch_base[k];
     const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
     const float* D = (wigner_floats > 0 && l > 0) ? sw + w.compact_offsets[l] : nullptr;
-    SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(v, cols, mtab, blocks, dst, copies, n_edges, edge, D,
-                                                         2 * LL + 1)),
-                        (rotate_channel_to_blocks_any(v, l, cols, mtab, blocks, dst, copies, n_edges, edge, D,
+    SO2_DISPATCH_DEGREE(l, (rotate_channel_to_blocks<LL>(v, cols, mtab, blocks, dst, copies, radial, n_edges, edge,
+                                                         D, 2 * LL + 1)),
+                        (rotate_channel_to_blocks_any(v, l, cols, mtab, blocks, dst, copies, radial, n_edges, edge, D,
                                                       2 * l + 1)));
   }
+}
+
+// Extras of the backward gather of a front-radial layer: the staged sum S over the copies
+// is the gradient of the radial-scaled blocks; grad[e, offset[m] + c] = sum over the pair
+// halves of S * plain (the unscaled rotated input) and S is then scaled by the radial
+// weight before the rotation back. dot_out[c * N + e] = <copy c row of src, copy c row of
+// dot_src> (the gate gradients of the slots).
+struct GatherExtras {
+  RadialSet radial;
+  bool scale_radial;
+  float* radial_grad;
+  int64_t radial_grad_stride;
+  int radial_offset[kMaxBlocks];
+  const float* dot_src;
+  float* dot_out;
+};
+
+__device__ __forceinline__ float block_sum(float v, float* scratch) {
+  const unsigned full = 0xffffffffu;
+#pragma unroll
+  for (int step = 16; step > 0; step >>= 1) {
+    v += __shfl_down_sync(full, v, step);
+  }
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    scratch[warp] = v;
+  }
+  __syncthreads();
+  float total = 0.0f;
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < static_cast<int>((blockDim.x + 31) / 32); ++i) {
+      total += scratch[i];
+    }
+  }
+  __syncthreads();
+  return total;
 }
 
 __global__ void channel_gather_edge_kernel(
@@ -709,10 +793,12 @@ __global__ void channel_gather_edge_kernel(
     int dst_dim,
     bool zero_fill,
     Copies copies,
+    GatherExtras extras,
     bool accumulate,
     int64_t n_edges,
     int n_channels) {
   extern __shared__ float smem[];
+  __shared__ float scratch[32];
   float* sg = smem;
   float* sw = sg + total_width;
   float* so = sw + wigner_floats;
@@ -725,12 +811,30 @@ __global__ void channel_gather_edge_kernel(
     const int64_t row = copy_row(copies, c, n_edges, edge);
     const float scale = copy_scale(copies, c, n_edges, edge);
     const float* __restrict__ in_copy = src + c * copies.stride;
+    const float* __restrict__ dot_copy = extras.dot_src == nullptr ? nullptr : extras.dot_src + c * copies.stride;
+    float dot = 0.0f;
     for (int m = 0; m < n_blocks; ++m) {
       const int64_t prefix = blocks.table[3 * m];
       const int stride = static_cast<int>(blocks.table[3 * m + 2]);
-      const float* __restrict__ seg = in_copy + n_edges * prefix + row * stride;
-      for (int i = threadIdx.x; i < stride; i += blockDim.x) {
-        sg[prefix + i] = fmaf(scale, seg[i], sg[prefix + i]);
+      const int64_t offset = n_edges * prefix + row * stride;
+      const float* __restrict__ seg = in_copy + offset;
+      if (dot_copy != nullptr) {
+        const float* __restrict__ xseg = dot_copy + offset;
+        for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+          const float v = seg[i];
+          dot = fmaf(v, xseg[i], dot);
+          sg[prefix + i] = fmaf(scale, v, sg[prefix + i]);
+        }
+      } else {
+        for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+          sg[prefix + i] = fmaf(scale, seg[i], sg[prefix + i]);
+        }
+      }
+    }
+    if (dot_copy != nullptr) {
+      const float total = block_sum(dot, scratch);
+      if (threadIdx.x == 0) {
+        extras.dot_out[c * n_edges + edge] = total;
       }
     }
   }
@@ -743,6 +847,35 @@ __global__ void channel_gather_edge_kernel(
     }
   }
   __syncthreads();
+  if (extras.scale_radial) {
+    // Radial gradients from the unscaled rotated input, then the radial scaling of S.
+    for (int m = 0; m < n_blocks; ++m) {
+      const int width = block_width(blocks, m);
+      if (width == 0) {
+        continue;
+      }
+      const int64_t prefix = blocks.table[3 * m];
+      const int stride = static_cast<int>(blocks.table[3 * m + 2]);
+      const float* __restrict__ u = extras.radial.plain == nullptr ? nullptr
+                                    : extras.radial.plain + n_edges * prefix + edge * stride;
+      for (int c = threadIdx.x; c < width; c += blockDim.x) {
+        const float r = radial_value(extras.radial, m, edge, c);
+        float* __restrict__ s0 = sg + prefix + c;
+        if (extras.radial_grad != nullptr && u != nullptr) {
+          float g = s0[0] * u[c];
+          if (m > 0) {
+            g = fmaf(s0[width], u[c + width], g);
+          }
+          extras.radial_grad[edge * extras.radial_grad_stride + extras.radial_offset[m] + c] = g;
+        }
+        s0[0] *= r;
+        if (m > 0) {
+          s0[width] *= r;
+        }
+      }
+    }
+    __syncthreads();
+  }
   for (int k = threadIdx.x; k < n_channels; k += blockDim.x) {
     const int l = ch_l[k];
     const int32_t* __restrict__ cols = ch_cols + k * cols_per_channel;
@@ -914,6 +1047,17 @@ BlockSet make_block_set(const torch::Tensor& block_table) {
   return b;
 }
 
+RadialSet make_radial_set(const std::vector<torch::Tensor>& radials, float* plain) {
+  RadialSet r;
+  for (int m = 0; m < kMaxBlocks; ++m) {
+    const bool given = m < static_cast<int>(radials.size()) && radials[m].defined() && radials[m].numel() > 0;
+    r.ptr[m] = given ? radials[m].data_ptr<float>() : nullptr;
+    r.stride[m] = given ? radials[m].stride(0) : 0;
+  }
+  r.plain = plain;
+  return r;
+}
+
 }  // namespace
 
 torch::Tensor channel_rotate_to_blocks_fp32_cuda(
@@ -931,10 +1075,12 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies) {
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    bool plain) {
   const int64_t n_edges = src.size(0);
   const int64_t n_channels = ch_base.numel();
-  auto dst = torch::empty({copies * n_edges * total_width}, src.options());
+  auto dst = torch::empty({(copies + (plain ? 1 : 0)) * n_edges * total_width}, src.options());
   if (n_edges == 0 || n_channels == 0 || total_width == 0) {
     return dst;
   }
@@ -947,6 +1093,8 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
   const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
                         edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
                         n_edges * total_width, static_cast<int>(copies)};
+  const RadialSet radial_set =
+      make_radial_set(radials, plain ? dst.data_ptr<float>() + copies * n_edges * total_width : nullptr);
   // Edge-tiled rotation for identity or compact Wigner data that fit in shared memory.
   const int wigner_floats = w.mode == 2 ? static_cast<int>(w.compact_stride) : 0;
   const int64_t edge_bytes = (src.size(1) + wigner_floats) * static_cast<int64_t>(sizeof(float));
@@ -956,7 +1104,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
                                  stream>>>(
         src.data_ptr<float>(), src.size(1), static_cast<int>(src.size(1)), w, wigner_floats,
         ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
-        cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set,
+        cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set, radial_set,
         n_edges, static_cast<int>(n_channels));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dst;
@@ -964,7 +1112,7 @@ torch::Tensor channel_rotate_to_blocks_fp32_cuda(
   channel_rotate_to_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), src.size(1), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
-      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set,
+      cols_per_channel, cols_per_channel - 1, blocks, dst.data_ptr<float>(), copy_set, radial_set,
       n_edges, n_channels);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dst;
@@ -988,7 +1136,13 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     bool rotate,
     int64_t wigner_mode,
     int64_t wigner_stride,
-    int64_t copies) {
+    int64_t copies,
+    std::vector<torch::Tensor> radials,
+    torch::Tensor plain,
+    torch::Tensor radial_grad,
+    std::vector<int64_t> radial_offsets,
+    torch::Tensor dot_src,
+    torch::Tensor dot_out) {
   const int64_t n_channels = ch_base.numel();
   const bool accumulate = accumulate_into.numel() > 0;
   torch::Tensor dst;
@@ -1010,6 +1164,18 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
   const Copies copy_set{row_of_edge.numel() > 0 ? row_of_edge.data_ptr<int64_t>() : nullptr,
                         edge_scale.numel() > 0 ? edge_scale.data_ptr<float>() : nullptr,
                         src.numel() / copies, static_cast<int>(copies)};
+  GatherExtras extras;
+  extras.radial = make_radial_set(radials, plain.numel() > 0 ? plain.data_ptr<float>() : nullptr);
+  extras.scale_radial = false;
+  for (int m = 0; m < kMaxBlocks; ++m) {
+    extras.scale_radial = extras.scale_radial || extras.radial.ptr[m] != nullptr;
+    extras.radial_offset[m] = m < static_cast<int>(radial_offsets.size()) ? static_cast<int>(radial_offsets[m]) : 0;
+  }
+  extras.radial_grad = radial_grad.numel() > 0 ? radial_grad.data_ptr<float>() : nullptr;
+  extras.radial_grad_stride = radial_grad.numel() > 0 ? radial_grad.stride(0) : 0;
+  extras.dot_src = dot_src.numel() > 0 ? dot_src.data_ptr<float>() : nullptr;
+  extras.dot_out = dot_out.numel() > 0 ? dot_out.data_ptr<float>() : nullptr;
+  const bool needs_edge_kernel = extras.scale_radial || extras.dot_src != nullptr;
   // Edge-tiled gather for identity or compact Wigner data that fit in shared memory.
   const int64_t total_width = n_edges > 0 ? src.numel() / copies / n_edges : 0;
   const int n_blocks = cols_per_channel;
@@ -1023,11 +1189,13 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
         src.data_ptr<float>(), w, wigner_floats,
         ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
         cols_per_channel, cols_per_channel - 1, blocks, n_blocks, static_cast<int>(total_width),
-        dst.data_ptr<float>(), dst.size(1), static_cast<int>(dst.size(1)), zero_fill, copy_set,
+        dst.data_ptr<float>(), dst.size(1), static_cast<int>(dst.size(1)), zero_fill, copy_set, extras,
         accumulate, n_edges, static_cast<int>(n_channels));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dst;
   }
+  TORCH_CHECK(!needs_edge_kernel, "radial or dot gather extras need the edge-tiled kernel (compact Wigner data "
+              "whose staged row fits in shared memory)");
   channel_gather_from_blocks_kernel<<<grid, kChannelThreads, 0, stream>>>(
       src.data_ptr<float>(), w,
       ch_base.data_ptr<int32_t>(), ch_l.data_ptr<int32_t>(), ch_cols.data_ptr<int32_t>(),
