@@ -321,7 +321,8 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor radial_grad,
     std::vector<int64_t> radial_offsets,
     torch::Tensor dot_src,
-    torch::Tensor dot_out);
+    torch::Tensor dot_out,
+    torch::Tensor sum_out);
 
 torch::Tensor block_complex_weights_fp32_cuda(std::vector<torch::Tensor> weights);
 
@@ -1511,7 +1512,8 @@ torch::Tensor channel_gather_from_blocks_fp32(
     torch::Tensor radial_grad,
     std::vector<int64_t> radial_offsets,
     torch::Tensor dot_src,
-    torch::Tensor dot_out) {
+    torch::Tensor dot_out,
+    torch::Tensor sum_out) {
   check_cuda_contiguous(src, "src");
   TORCH_CHECK(src.scalar_type() == torch::kFloat32, "src must be fp32");
   check_radials(radials, n_edges);
@@ -1535,6 +1537,11 @@ torch::Tensor channel_gather_from_blocks_fp32(
                 "dot_out must hold one value per edge and copy");
   }
   TORCH_CHECK(copies >= 1 && src.numel() % copies == 0, "src must hold the given number of block copies");
+  if (sum_out.numel() > 0) {
+    check_cuda_contiguous(sum_out, "sum_out");
+    TORCH_CHECK(sum_out.scalar_type() == torch::kFloat32 && sum_out.numel() * copies == src.numel(),
+                "sum_out must hold one block buffer");
+  }
   check_channel_plan(ch_base, ch_l, ch_cols);
   check_block_table(block_table, ch_base, ch_cols);
   check_wigner_inputs(wigner, offsets, compact_offsets, rotate);
@@ -1549,7 +1556,7 @@ torch::Tensor channel_gather_from_blocks_fp32(
   return channel_gather_from_blocks_fp32_cuda(
       src, n_edges, wigner, offsets, compact_offsets, ch_base, ch_l, ch_cols, block_table,
       dst_dim, zero_fill, edge_scale, accumulate_into, row_of_edge, rotate, wigner_mode, wigner_stride, copies,
-      radials, plain, radial_grad, radial_offsets, dot_src, dot_out);
+      radials, plain, radial_grad, radial_offsets, dot_src, dot_out, sum_out);
 }
 
 torch::Tensor block_complex_weights_fp32(std::vector<torch::Tensor> weights) {

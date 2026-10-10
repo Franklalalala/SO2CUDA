@@ -739,11 +739,12 @@ __global__ void channel_rotate_edge_kernel(
   }
 }
 
-// Extras of the backward gather of a front-radial layer: the staged sum S over the copies
-// is the gradient of the radial-scaled blocks; grad[e, offset[m] + c] = sum over the pair
-// halves of S * plain (the unscaled rotated input) and S is then scaled by the radial
-// weight before the rotation back. dot_out[c * N + e] = <copy c row of src, copy c row of
-// dot_src> (the gate gradients of the slots).
+// Extras of the gather. The staged sum S over the copies is scaled by the radial weights
+// before the rotation back. In the backward of a front-radial layer S is the gradient of
+// the radial-scaled blocks and grad[e, offset[m] + c] = sum over the pair halves of
+// S * plain (the unscaled rotated input). In the forward of a back-radial layer sum_out
+// receives S before the scaling (edge-order block rows, for the radial gradients).
+// dot_out[c * N + e] = <copy c row of src, copy c row of dot_src> (the gate gradients).
 struct GatherExtras {
   RadialSet radial;
   bool scale_radial;
@@ -752,6 +753,7 @@ struct GatherExtras {
   int radial_offset[kMaxBlocks];
   const float* dot_src;
   float* dot_out;
+  float* sum_out;
 };
 
 __device__ __forceinline__ float block_sum(float v, float* scratch) {
@@ -858,9 +860,17 @@ __global__ void channel_gather_edge_kernel(
       const int stride = static_cast<int>(blocks.table[3 * m + 2]);
       const float* __restrict__ u = extras.radial.plain == nullptr ? nullptr
                                     : extras.radial.plain + n_edges * prefix + edge * stride;
+      float* __restrict__ keep = extras.sum_out == nullptr ? nullptr
+                                 : extras.sum_out + n_edges * prefix + edge * stride;
       for (int c = threadIdx.x; c < width; c += blockDim.x) {
         const float r = radial_value(extras.radial, m, edge, c);
         float* __restrict__ s0 = sg + prefix + c;
+        if (keep != nullptr) {
+          keep[c] = s0[0];
+          if (m > 0) {
+            keep[c + width] = s0[width];
+          }
+        }
         if (extras.radial_grad != nullptr && u != nullptr) {
           float g = s0[0] * u[c];
           if (m > 0) {
@@ -1142,7 +1152,8 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
     torch::Tensor radial_grad,
     std::vector<int64_t> radial_offsets,
     torch::Tensor dot_src,
-    torch::Tensor dot_out) {
+    torch::Tensor dot_out,
+    torch::Tensor sum_out) {
   const int64_t n_channels = ch_base.numel();
   const bool accumulate = accumulate_into.numel() > 0;
   torch::Tensor dst;
@@ -1175,6 +1186,8 @@ torch::Tensor channel_gather_from_blocks_fp32_cuda(
   extras.radial_grad_stride = radial_grad.numel() > 0 ? radial_grad.stride(0) : 0;
   extras.dot_src = dot_src.numel() > 0 ? dot_src.data_ptr<float>() : nullptr;
   extras.dot_out = dot_out.numel() > 0 ? dot_out.data_ptr<float>() : nullptr;
+  extras.sum_out = sum_out.numel() > 0 ? sum_out.data_ptr<float>() : nullptr;
+  TORCH_CHECK(extras.sum_out == nullptr || extras.scale_radial, "sum_out is written with the radial scaling");
   const bool needs_edge_kernel = extras.scale_radial || extras.dot_src != nullptr;
   // Edge-tiled gather for identity or compact Wigner data that fit in shared memory.
   const int64_t total_width = n_edges > 0 ? src.numel() / copies / n_edges : 0;

@@ -116,13 +116,14 @@ def _rotate(src, side, plan, wigner, rotate, scale=None, rows=None, copies=1, ra
 
 
 def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None, into=None, copies=1, radials=(),
-            plain=None, radial_grad=None, dot_src=None, dot_out=None):
+            plain=None, radial_grad=None, dot_src=None, dot_out=None, sum_out=None):
     """Rotate back sum_c scale_c * (block rows of copy c) into feature rows [N, dim].
 
     With ``radials`` the sum is first scaled per block column by the radial weights and,
     when ``radial_grad`` is given, the radial gradients are written from ``plain`` (the
-    unscaled rotated input). ``dot_out[c * N + e]`` receives the dot product of edge e's
-    rows of copy c in ``src`` and ``dot_src``."""
+    unscaled rotated input); ``sum_out`` receives the sum before that scaling (edge-order
+    block rows). ``dot_out[c * N + e]`` receives the dot product of edge e's rows of copy c
+    in ``src`` and ``dot_src``."""
     return _ext().channel_gather_from_blocks_fp32(
         src, int(n), wigner.values, plan.offsets, wigner.compact_offsets, side.base, side.l, side.cols,
         side.table, side.dim, bool(side.zero_fill), plan.no_scale if scale is None else scale,
@@ -130,15 +131,15 @@ def _gather(src, n, side, plan, wigner, rotate, scale=None, rows=None, into=None
         int(wigner.mode), int(wigner.stride), int(copies), list(radials),
         plan.no_scale if plain is None else plain, plan.no_scale if radial_grad is None else radial_grad,
         list(side.radial_offsets), plan.no_scale if dot_src is None else dot_src,
-        plan.no_scale if dot_out is None else dot_out)
+        plan.no_scale if dot_out is None else dot_out, plan.no_scale if sum_out is None else sum_out)
 
 
 _SHARED_MEMORY = {}
 
 
-def _edge_tiles_fit(plan, wigner, in_dim, device):
-    """Whether the edge-tiled kernels can stage the input side of this layer (they carry the
-    fused radial weights and gate products)."""
+def _edge_tiles_fit(plan, wigner, in_dim, device, out_side=False):
+    """Whether the edge-tiled kernels can stage the input side of this layer and, with
+    ``out_side``, its output side (they carry the fused radial weights and gate products)."""
     mode = int(wigner.mode)
     if mode not in (0, 2):
         return False
@@ -147,8 +148,10 @@ def _edge_tiles_fit(plan, wigner, in_dim, device):
         props = torch.cuda.get_device_properties(device)
         _SHARED_MEMORY[key] = int(getattr(props, "shared_memory_per_block_optin", 48 * 1024))
     wigner_floats = int(wigner.stride) if mode == 2 else 0
-    need = max(in_dim + wigner_floats, plan.inp.total + wigner_floats + in_dim) * 4
-    return need <= _SHARED_MEMORY[key]
+    need = max(in_dim + wigner_floats, plan.inp.total + wigner_floats + in_dim)
+    if out_side:
+        need = max(need, plan.out.total + wigner_floats + plan.out.dim)
+    return need * 4 <= _SHARED_MEMORY[key]
 
 
 def _radials_by_m(plan, radials):
@@ -281,9 +284,12 @@ class _Sandwich(torch.autograd.Function):
         front_grad = spec.radial_mode == "front" and grad_radials
         back_grad = spec.radial_mode == "back" and grad_radials
         fused = spec.fused_radial
+        fused_back = fused and spec.radial_mode == "back"
         if fused:
-            # Front radial weights are applied by the rotation kernel. Only the input is kept;
-            # the backward rotates it again, and the gate gradients come from the gather.
+            # Only the input is kept and the backward rotates it again. Front radial weights
+            # are applied by the rotation kernel; back radial weights by the gather, which also
+            # keeps the summed blocks before that scaling for the radial gradients. The gate
+            # gradients come from the backward gather.
             keep_packed = keep_blocks = False
             keep_input = grad_w0 or grad_pairs or front_grad or grad_gates
             keep_weights = need_x or front_grad or grad_gates
@@ -301,9 +307,9 @@ class _Sandwich(torch.autograd.Function):
         in_size, out_size = n * inp.total, n * out.total
         # One rotation writes the block rows of every slot; one gather below reads them all.
         packed_all = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=rows, copies=copies,
-                             radials=_radials_by_m(plan, radials) if fused else ())
+                             radials=_radials_by_m(plan, radials) if fused and not fused_back else ())
         blocks_all = x.new_empty(copies * out_size)
-        scaled_all = blocks_all if spec.radial_mode != "back" else torch.empty_like(blocks_all)
+        scaled_all = blocks_all if spec.radial_mode != "back" or fused else torch.empty_like(blocks_all)
         slot_radials_all = []
         for j, slot in enumerate(slots):
             packed = packed_all[j * in_size:(j + 1) * in_size]
@@ -332,19 +338,22 @@ class _Sandwich(torch.autograd.Function):
             _gemm_many(xs, ws, outs, slot.ptr)
             if b0 is not None and slot.ptr is not None:
                 _view(blocks, n, out.prefix[0], out.stride[0]).add_(b0.index_select(0, _rows_of(slot, n)))
-            if spec.radial_mode == "back":
+            if spec.radial_mode == "back" and not fused:
                 scaled = scaled_all[j * out_size:(j + 1) * out_size]
                 for b, (m, _cin, _cout) in enumerate(plan.blocks):
                     _view(scaled, n, out.prefix[m], out.stride[m]).copy_(
                         _scale_block(_view(blocks, n, out.prefix[m], out.stride[m]), slot_radials[b], m > 0))
             slot_radials_all.append(slot_radials)
+        pre_radial = x.new_empty(out_size) if fused_back and back_grad else None
         result = _gather(scaled_all, n, out, plan, wigner, layout.rotate_out, scale=gate_scale, rows=rows,
-                         copies=copies)
+                         copies=copies, radials=_radials_by_m(plan, radials) if fused_back else (),
+                         sum_out=pre_radial)
         tensors_to_save = [block_weights if keep_weights else None, w0 if keep_weights else None,
-                           packed_all if keep_packed else None, blocks_all if keep_blocks else None,
+                           packed_all if keep_packed else None, blocks_all if keep_blocks else pre_radial,
                            x if keep_input else None, b0 if (fused and grad_gates) else None, *gates]
         if fused:
-            tensors_to_save += list(radials) if (keep_input or need_x) else [None] * len(radials)
+            keep_radials = keep_input or need_x or (fused_back and grad_b0)
+            tensors_to_save += list(radials) if keep_radials else [None] * len(radials)
         else:
             for slot_radials in slot_radials_all:
                 tensors_to_save += list(slot_radials)
@@ -363,7 +372,8 @@ class _Sandwich(torch.autograd.Function):
         gates = saved[6:6 + spec.n_gates]
         radial_saved = saved[6 + spec.n_gates:]
         if spec.fused_radial:
-            return _Sandwich._fused_backward(ctx, grad_out, block_weights, w0, x_saved, b0_saved, gates, radial_saved)
+            return _Sandwich._fused_backward(ctx, grad_out, block_weights, w0, x_saved, b0_saved, gates, radial_saved,
+                                             blocks_all)
         inp, out = plan.inp, plan.out
         groups = max(spec.groups, 1)
         slots = spec.slots
@@ -480,8 +490,9 @@ class _Sandwich(torch.autograd.Function):
         return tuple(grads)
 
     @staticmethod
-    def _fused_backward(ctx, grad_out, block_weights, w0, x, b0, gates, radials):
-        """Backward of a front-radial layer whose forward kept only the input."""
+    def _fused_backward(ctx, grad_out, block_weights, w0, x, b0, gates, radials, pre_radial):
+        """Backward of a radial layer whose forward kept only the input (and, with back radial
+        weights, the gate-weighted sum of the blocks before the radial scaling)."""
         ext = _ext()
         plan, layout, wigner, spec, n, rows, gate_scale = ctx.state
         need_x, grad_w0, grad_b0, grad_pairs, grad_radials, grad_gates = ctx.flags
@@ -491,17 +502,29 @@ class _Sandwich(torch.autograd.Function):
         copies = len(slots)
         in_size, out_size = n * inp.total, n * out.total
         grad_out = grad_out.contiguous()
-        front_grad = grad_radials
+        back = spec.radial_mode == "back"
+        front_grad = grad_radials and not back
+        back_grad = grad_radials and back
         gate_grad = bool(gates) and grad_gates
         need_inputs = grad_w0 or grad_pairs or front_grad or gate_grad
         need_dx = need_x or front_grad or gate_grad
         radial_by_m = _radials_by_m(plan, radials) if radials and radials[0] is not None else ()
-        # Rotated output gradient (not gate-scaled) and the recomputed radial-scaled inputs.
-        grad_blocks_all = _rotate(grad_out, out, plan, wigner, layout.rotate_out, rows=rows, copies=copies)
+        radial_grads = [None] * spec.n_radials
+        # Rotated output gradient, not gate-scaled; back radial weights scale it, and their
+        # gradients pair its unscaled edge-order copy with the kept pre-radial sum.
+        rotated = _rotate(grad_out, out, plan, wigner, layout.rotate_out, rows=rows, copies=copies,
+                          radials=radial_by_m if back else (), plain=back_grad)
+        grad_blocks_all = rotated[:copies * out_size]
+        if back_grad:
+            plain_out = rotated[copies * out_size:]
+            for b, (m, _cin, _cout) in enumerate(plan.blocks):
+                radial_grads[b] = _rowdot(_view(plain_out, n, out.prefix[m], out.stride[m]),
+                                          _view(pre_radial, n, out.prefix[m], out.stride[m]), m > 0, n)
+        # Recomputed inputs, scaled by front radial weights.
         inputs_all = plain = None
         if need_inputs:
-            rotated = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=rows, copies=copies, radials=radial_by_m,
-                              plain=front_grad)
+            rotated = _rotate(x, inp, plan, wigner, layout.rotate_in, rows=rows, copies=copies,
+                              radials=() if back else radial_by_m, plain=front_grad)
             inputs_all = rotated[:copies * in_size]
             plain = rotated[copies * in_size:] if front_grad else None
         grad_packed_all = grad_out.new_empty(copies * in_size) if need_dx else None
@@ -555,7 +578,6 @@ class _Sandwich(torch.autograd.Function):
                     value = grad_m0.sum(dim=0)
                 grad_b0_value = value if grad_b0_value is None else grad_b0_value + value
         grad_x = None
-        radial_grads = [None] * spec.n_radials
         gate_grads = [None] * spec.n_gates
         if need_dx:
             radial_grad = grad_out.new_empty(n, sum(inp.width)) if front_grad else None
@@ -563,7 +585,7 @@ class _Sandwich(torch.autograd.Function):
             # Sum of the gated slot input gradients, radial gradients and scaling, gate
             # products and the rotation back, in one pass over every copy.
             grad_x = _gather(grad_packed_all, n, inp, plan, wigner, layout.rotate_in, scale=gate_scale, rows=rows,
-                             copies=copies, radials=radial_by_m, plain=plain, radial_grad=radial_grad,
+                             copies=copies, radials=() if back else radial_by_m, plain=plain, radial_grad=radial_grad,
                              dot_src=inputs_all if gate_grad else None, dot_out=gate_dots)
             if front_grad:
                 for b, (m, _cin, _cout) in enumerate(plan.blocks):
@@ -601,8 +623,8 @@ def _apply(x, plan, layout, wigner, *, w0=None, b0=None, pair_weights=(), radial
     if gates and len(gates) != len(slots):
         raise ValueError("one gate per slot is required")
     radial_mode = ("front" if layout.front else "back") if radials else None
-    fused = (radial_mode == "front" and all(r.stride(-1) == 1 for r in radials)
-             and _edge_tiles_fit(plan, wigner, x.shape[1], x.device))
+    fused = (radial_mode is not None and all(r.stride(-1) == 1 for r in radials)
+             and _edge_tiles_fit(plan, wigner, x.shape[1], x.device, out_side=radial_mode == "back"))
     spec = SimpleNamespace(has_m0=w0 is not None, has_bias=b0 is not None, n_pairs=len(pair_weights),
                            radial_mode=radial_mode, n_radials=len(radials), n_gates=len(gates),
                            groups=int(groups), slots=slots, fused_radial=fused)
