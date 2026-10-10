@@ -113,6 +113,12 @@ def sandwich_plan(layout, in_dim, device, *, with_m0=False):
         )
     cache[key] = hit
     hit.uniform = hit.inp.uniform is not None and hit.inp.uniform == hit.out.uniform
+    if hit.uniform:
+        channels, lmax = hit.inp.uniform
+        # Small angular/channel layouts do not amortize the channel-tile
+        # scheduling cost in backward. Keep their edge-tiled implementation;
+        # decide once here, outside the forward/backward hot path.
+        hit.uniform = channels > 32 or lmax > 2
     return hit
 
 
