@@ -213,7 +213,15 @@ class Eqv3Operator(NativeOperator, nn.Module):
             "compile_options": {"dynamic": True} if compile_model else None,
         })
         self.metadata = metadata
-        self._execute = torch.compile(self._forward_original, dynamic=True) if compile_model else self._forward_original
+        if compile_model:
+            # Every benchmark shape gets a fresh Dynamo cache. A long suite
+            # otherwise exhausts the per-code-object cache and silently
+            # measures eager execution for later bound-method instances.
+            torch._dynamo.reset()
+            self.metadata["compile_cache_reset"] = True
+            self._execute = torch.compile(self._forward_original, dynamic=True)
+        else:
+            self._execute = self._forward_original
 
     def _forward_original(self, x):
         return self.rotation.rotate_inv(self.linear(self.rotation.rotate(x)))

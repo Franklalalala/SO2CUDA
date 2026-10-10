@@ -20,7 +20,7 @@ import time
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("unitb", "dense", "both"), default="both")
+    parser.add_argument("--model", choices=("unitb", "dense", "slem", "both", "all"), default="both")
     parser.add_argument("--backend", choices=("reference", "cuda", "cueq", "both", "cueq-check"), default="both")
     parser.add_argument("--cueq-method", default="auto", help="Auto selects descriptors and methods on at most 64 layer edges")
     parser.add_argument("--cueq-descriptor", choices=("escn_tp", "escn_tp_compact"), default="escn_tp",
@@ -307,7 +307,9 @@ def measure(model, data, backend, args, torch, counters):
     if backend == "cueq":
         from cueq_baseline import cueq_execution_metadata
         result["cueq_execution"] = cueq_execution_metadata(model)
-        if len(result["cueq_execution"]) != 6 or any(row["calls"] == 0 for row in result["cueq_execution"].values()):
+        embedding = model.model_options["embedding"]
+        expected_layers = int(embedding.get("n_layers", 3)) * (3 if embedding.get("layer_topology", "lem") == "slem" else 2)
+        if len(result["cueq_execution"]) != expected_layers or any(row["calls"] == 0 for row in result["cueq_execution"].values()):
             raise RuntimeError("cuEquivariance did not execute every UniTB SO2 layer")
     if args.device.startswith("cuda"):
         result["peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
@@ -410,7 +412,8 @@ def main():
         "quantile_method": "statistics.quantiles(n=4, method='inclusive')",
         "models": {},
     }
-    models = ("unitb", "dense") if args.model == "both" else (args.model,)
+    models = (("unitb", "dense") if args.model == "both" else
+              ("unitb", "dense", "slem") if args.model == "all" else (args.model,))
     selection_document = json.loads(args.cueq_selection.read_text()) if args.cueq_selection else None
     for name in models:
         if selection_document is None:
@@ -421,7 +424,7 @@ def main():
             args.cueq_selection_data = selection_document["models"][name]["cueq_execution"]
         else:
             args.cueq_selection_data = selection_document
-        config_path = Path(__file__).parent / "configs" / ("unitb_dense.json" if name == "dense" else "unitb.json")
+        config_path = Path(__file__).parent / "configs" / ({"dense": "unitb_dense.json", "slem": "unitb_slem.json"}.get(name, "unitb.json"))
         config = json.loads(config_path.read_text(encoding="utf-8"))
         common = copy.deepcopy(config["common_options"])
         common["device"] = args.device
@@ -430,7 +433,7 @@ def main():
         model = build_model(common_options=common, model_options=options, train_options={}, no_check=False)
         data, shape = periodic_batch(model, args, torch)
         effective_embedding = unitb_options(config["model_options"]["embedding"])
-        label = "UniTB-dense" if name == "dense" else "UniTB"
+        label = {"dense": "UniTB-dense", "unitb": "UniTB", "slem": "UniTB-SLEM"}[name]
         evidence = {"label": label, "shape": shape, "irreps_hidden": effective_embedding["irreps_hidden"],
                     "embedding_options": effective_embedding,
                     "embedding_method": config["model_options"]["embedding"]["method"],

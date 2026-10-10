@@ -404,6 +404,13 @@ class CueqSO2Linear(NaiveSO2Linear):
             latents = mole_globals
         self.forward_calls += 1
         radial = self.radial_emb(latents) if self.radial_emb else None
+        # A later output head may require higher l than a preceding hidden
+        # update. Rebuild geometry when its shared cache does not cover that l.
+        if wigner_D_all is not None:
+            enough_blocks = (len(wigner_D_all.blocks) > self.l_max if hasattr(wigner_D_all, "blocks")
+                             else wigner_D_all.shape[-1] >= (self.l_max + 1) ** 2)
+            if not enough_blocks:
+                wigner_D_all = None
         if wigner_D_all is not None:
             self.wigner_cache_hits += 1
         elif (self.rotate_in or self.rotate_out) and self.l_max > 0:

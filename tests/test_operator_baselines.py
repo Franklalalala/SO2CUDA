@@ -321,3 +321,103 @@ def test_so2cuda_candidate_control_restores_environment(monkeypatch):
             raise RuntimeError("candidate unavailable")
     assert os.environ["SO2_CUDA_FORWARD_MODE"] == "scalar"
     assert "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE" not in os.environ
+
+
+def test_requested_suite_reuses_shared_uniform_rows_and_covers_all_groups():
+    cases = speed.benchmark_cases("all")
+    assert len(cases) == 26
+    counts = {group: sum(group in case["groups"] for case in cases) for group in ("A1", "A2", "A3", "A4")}
+    assert counts == {"A1": 9, "A2": 6, "A3": 1, "A4": 12}
+    assert len(speed.benchmark_cases("uniform")) == 14
+    assert len(speed.benchmark_cases("nonuniform")) == 12
+    shared = [case for case in cases if case["groups"] == ["A1", "A2"]]
+    assert {case["config"]["channels"] for case in shared} == {32, 128}
+    assert all(case["config"]["edges"] == 50000 for case in shared)
+    assert all(case["config"]["mmax"] == 2 for case in cases if "A3" in case["groups"])
+
+
+@pytest.mark.parametrize("case_name,label,irreps_in,irreps_out", speed.NONUNIFORM_CASES)
+def test_requested_nonuniform_shape_small_cuda_equivalence(case_name, label, irreps_in, irreps_out):
+    if not torch.cuda.is_available():
+        pytest.skip("Public dense operator equivalence requires CUDA")
+    # Preserve the degree/channel pattern with smaller multiplicities so this
+    # regression exercises every new shape without allocating benchmark sizes.
+    reduce = lambda irreps: o3.Irreps([(max(1, mul // 16), ir) for mul, ir in o3.Irreps(irreps)])
+    ii, io = reduce(irreps_in), reduce(irreps_out or irreps_in)
+    implementations = ["naive", "so2cuda", "eqv3"]
+    if importlib.util.find_spec("cuequivariance_torch") is not None:
+        implementations.append("cueq")
+    result = speed.equivalence_case(ii, io, min(ii.lmax, io.lmax), edges=9,
+                                   eqv3_root=os.environ.get("SO2CUDA_EQV3_ROOT"),
+                                   implementations=implementations)
+    assert result["passed"], result
+    assert result["implementations"]["so2cuda"]["metadata"]["api"].endswith("true_dense_pairs")
+    if os.environ.get("SO2CUDA_EQV3_ROOT"):
+        assert result["implementations"]["eqv3"]["status"] == "N/A"
+
+
+def test_default_so2cuda_measurement_uses_public_default_api(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test device")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(speed, "source_identity", lambda: {})
+    monkeypatch.setattr(speed, "equivalence_case", lambda *a, **k:
+                        {"passed": True, "implementations": {"so2cuda": {"status": "passed"}}})
+    calls = []
+    def setup(*args, **kwargs):
+        calls.append(kwargs.get("so2cuda_candidate", "true_dense_pairs"))
+        assert "SO2_CUDA_FORWARD_MODE" not in os.environ
+        assert "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE" not in os.environ
+        return SimpleNamespace(metadata={"api": "true_dense_pairs"}), None, None
+    monkeypatch.setattr(speed, "prepare_measurement", setup)
+    monkeypatch.setattr(speed, "measure", lambda *a, **k:
+                        {"forward": {"median_ms": 1.}, "forward_backward": {"median_ms": 2.}})
+    args = SimpleNamespace(impl="so2cuda", include_compile=False, lmax=1, channels=1,
+        irreps_in=None, irreps_out=None, mmax=None, edges=2, check_only=False,
+        eqv3_root=None, json=None, warmup=5, iterations=20)
+    result = speed.run(args)
+    assert calls == ["true_dense_pairs"]
+    assert result["implementations"]["so2cuda"]["status"] == "passed"
+    assert "so2cuda_alternatives" not in result
+
+
+def test_small_compiled_equiformerv3_executes_graphs_and_matches_gradients():
+    if not torch.cuda.is_available():
+        pytest.skip("Compiled operator timing requires CUDA")
+    root = os.environ.get("SO2CUDA_EQV3_ROOT")
+    if not root:
+        pytest.skip("Set SO2CUDA_EQV3_ROOT to the pinned original checkout")
+    args = SimpleNamespace(impl="eqv3,eqv3+compile", include_compile=False,
+        lmax=1, channels=2, irreps_in=None, irreps_out=None, mmax=None,
+        edges=16, check_only=False, eqv3_root=root, json=None, warmup=5, iterations=20,
+        allow_shared_gpu=True)
+    result = speed.run(args)
+    compiled = result["implementations"]["eqv3+compile"]
+    assert compiled["status"] == "passed"
+    assert compiled["metadata"]["compile_cache_reset"]
+    assert compiled["compile_execution"]["executed"]
+    assert compiled["compile_execution"]["counter_delta_before_timing"]["unique_graphs"] > 0
+    assert compiled["equivalence_vs_eager"]["passed"]
+
+
+def test_shared_gpu_smoke_is_bounded_before_cuda_execution():
+    with pytest.raises(ValueError, match="at most 512 edges"):
+        speed.run(SimpleNamespace(allow_shared_gpu=True, edges=513))
+    with pytest.raises(ValueError, match="at most 512 edges"):
+        speed.measure(SimpleNamespace(), torch.empty(513, 1), None, 5, 20, allow_shared=True)
+
+
+def test_shared_gpu_snapshot_preserves_strict_default_and_actual_processes(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="GPU-test"))
+    xml = ("<nvidia_smi_log><gpu><processes>"
+           f"<process_info><pid>{os.getpid()}</pid><type>C</type><used_memory>128 MiB</used_memory></process_info>"
+           "<process_info><pid>999999</pid><type>G</type><used_memory>4 MiB</used_memory></process_info>"
+           "</processes></gpu></nvidia_smi_log>")
+    monkeypatch.setattr(speed.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=xml))
+    with pytest.raises(speed.GPUExclusivityError):
+        speed.gpu_snapshot("before")
+    proof = speed.gpu_snapshot("before", allow_shared=True)
+    assert proof["exclusive"] is False and proof["allow_shared_gpu"] is True
+    assert [row["type"] for row in proof["processes"]] == ["C", "G"]
+    assert "functional smoke" in proof["reason"]

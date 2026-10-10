@@ -1,26 +1,34 @@
-# 更新记录
+# Changelog
 
-## 0.3.1（2026-10-11）
+## Unreleased
 
-- 旋入与收集增加按边分块的 kernel：每条边一个线程块，输入行、Wigner 块和输出行经共享内存暂存，读写连续。混合阶数的 warp（如 `24x1o+16x2e+...`）也合并读写。
-- top-k 路由的 `activation_forward` 中，各槽共用一次旋入和一次收集：旋入一次写出 K 份按槽排序的副本，收集按门控加权求和后只旋回一次，反向同样各一次。各行的专家组号直接取自路由结果，不再每层把 CPU 端的段指针展开到 GPU。
-- 前置径向权重在旋入 kernel 中施加，后置径向权重在收集 kernel 中施加。带径向权重的层前向只保存输入（后置径向层另存径向缩放前的求和），反向重算旋入。以 [unitb_slem.json](examples/configs/unitb_slem.json) 在 2 万条边上训练一步，峰值显存 16.15 → 12.70 GiB。
-- 新增 UniTB-SLEM 合成配置 [examples/configs/unitb_slem.json](examples/configs/unitb_slem.json)。
-- 接口与数值约定不变。README 中的性能表仍是 0.3.0 的测量结果。
+- Provide uniform and non-uniform SO(2) operator grids, with eager and compiled EquiformerV3, cuEquivariance, and our pure PyTorch reference implementation.
+- Compare UniTB-dense, UniTB, and UniTB-SLEM on the same real training-batch streams for both onsite and hopping heads, using the same HybridMuon optimizer path across backends.
+- Generate the English README performance tables and public numerical evidence from measurement JSON, including timing quartiles, peak memory, unsupported configurations, and out-of-memory results.
+- Provide a complete tensor-only SO(2) example with irreps, edge vectors, trainable weights, and input/weight autograd.
+- Document installation, DeePTB integration, supported inputs, reference fallback, and build settings in English.
 
-## 0.3.0（2026-10-10）
+## 0.3.1 (2026-10-11)
 
-- 新的块布局 sandwich 内核：每个 m 一块缓冲，(−m, +m) 成对存放，m>0 块的 2×2 复结构写成一个实数块权重，每块做一次 GEMM。旋入与收集各由一个按（边，通道）并行的 kernel 完成，反向复用同一套 kernel，不使用原子加。
-- `true_dense_pairs` 与 `dense_pairs` 增加仅关键字参数 `include_m0`：设为 `True` 时，m=0 项（含偏置）在同一次调用中完成；默认 `False`，行为与 0.2.0 相同。
-- 单专家与 top-k 路由的 `activation_forward`、按组的 `dense_pairs` 使用同一套块布局内核，径向权重与逐边门控在内核中处理。
-- FP32 下单组 GEMM 逐问题调用 cuBLAS；分组 GEMM 的反向只计算需要的梯度。
-- 增加单个 SO(2) 卷积的对照：EquiformerV3 原版（eager 与 `torch.compile`）、按 DeePTB 上游写法的纯 PyTorch 实现、cuEquivariance 0.12.0；逐项核对输出、输入梯度、参数梯度与旋转等变性。
-- 性能表由同一块 H200、同一次会话的 JSON 生成，分为单算子与 UniTB 模型两节，记录严格 FP32 下的时间与峰值显存。
+- Add edge-tiled rotation and gathering kernels. Each edge uses one thread block, staging input rows, Wigner blocks, and output rows in shared memory for contiguous access. Warps containing channels from different angular orders also combine memory accesses.
+- Share rotation and gathering across top-k slots in `activation_forward`: one rotation writes slot-ordered copies, and one gathering sums gated slot outputs before rotating back. Backward also shares these operations. Expert group IDs come directly from routing results.
+- Apply input-side radial weights during rotation and output-side radial weights during gathering. Radial layers save the input and recompute rotated blocks during backward; output-side radial layers also save the sum before radial scaling. This reduces saved activation memory.
+- Add the synthetic UniTB-SLEM configuration [unitb_slem.json](examples/configs/unitb_slem.json).
+- Preserve interface and numerical conventions.
 
-## 0.2.0（2026-10-07）
+## 0.3.0 (2026-10-10)
 
-- `so2_cuda_ops.deeptb` 提供张量与布局描述符接口，覆盖 dense SO2、激活空间专家路由和分组线性层。
-- `dense_pairs` 支持 UniTB-dense；`activation_forward` 支持 UniTB 的 PDQ-MoE；`true_dense_pairs` 支持扩展的非 MoE dense SO2 层。DeePTB `1006-stable` 通过可选后端统一调用这些接口。
-- SO2CUDA 统一维护 pack、分组 GEMM、scatter 和行置换的自动微分实现；分组 GEMM 支持 JVP。
-- CUDA 源仅保存在 `src/so2_cuda_ops/csrc/`。
-- 提供 UniTB 与 UniTB-dense 的合成周期结构加速示例，以同参数的纯 PyTorch 朴素实现（上游 SO2 张量积 + UMA 式专家层）为基线，报告严格 FP32 下的前向／反向时间、峰值显存与数值差。
+- Introduce block-layout sandwich kernels with one buffer per m. Positive and negative m components are paired; each complex linear map is represented as a real block matrix and evaluated with one GEMM. Rotation and gathering use kernels parallelized over edges and channels. Backward reuses these kernels without atomic additions.
+- Add the keyword-only `include_m0` argument to `true_dense_pairs` and `dense_pairs`. With `True`, the m=0 term, including its bias, is computed in the same call. The default remains `False`.
+- Use the same block-layout kernels for single-expert and top-k `activation_forward` and grouped `dense_pairs`, including radial weights and per-edge gates.
+- Execute single-group FP32 GEMM with cuBLAS and calculate only requested gradients in grouped GEMM backward.
+- Add operator comparisons against original EquiformerV3 (eager and `torch.compile`), our pure PyTorch implementation based on DeePTB upstream, and cuEquivariance. Check outputs, input gradients, parameter gradients, and rotation equivariance.
+- Generate H200 performance tables from measurement JSON, recording strict FP32 timing and peak memory for operators and UniTB models.
+
+## 0.2.0 (2026-10-07)
+
+- Add tensor and layout-descriptor interfaces in `so2_cuda_ops.deeptb` for dense SO(2), activation-space expert routing, and grouped linear layers.
+- Support UniTB-dense through `dense_pairs`, UniTB's PDQ-MoE through `activation_forward`, and non-MoE dense SO(2) through `true_dense_pairs`. DeePTB's `1006-stable` branch calls these through an optional backend.
+- Maintain automatic differentiation for packing, grouped GEMM, scatter, and row permutations in SO2CUDA. Grouped GEMM supports JVP.
+- Keep CUDA source in `src/so2_cuda_ops/csrc/`.
+- Add synthetic periodic-structure examples for UniTB and UniTB-dense, comparing against our pure PyTorch implementation of upstream SO(2) tensor products and UMA-style expert linear layers. Record strict FP32 forward/backward timing, peak memory, and numerical differences.

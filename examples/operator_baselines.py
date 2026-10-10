@@ -142,7 +142,7 @@ class NaiveOperator(CanonicalOperator):
 class SO2CUDAOperator(CanonicalOperator):
     """Public pair APIs, the m=0 term computed in the same call (``include_m0=True``)."""
 
-    def __init__(self, *args, candidate="dense_pairs"):
+    def __init__(self, *args, candidate="true_dense_pairs"):
         super().__init__(*args)
         if candidate not in SO2CUDA_CANDIDATES:
             raise ValueError(f"Unknown SO2CUDA candidate: {candidate}")
