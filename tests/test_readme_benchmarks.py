@@ -157,7 +157,7 @@ def test_mixed_commits_are_reported_per_table(reports):
     assert "SO2CUDA" not in op["source_commits"]
     sentence = gen.so2cuda_version_sentence(op, models)
     assert "for A1, A2, A3, UniTB-dense" in sentence
-    assert "for A4, UniTB, UniTB-SLEM" in sentence
+    assert "for A4, UniTB." in sentence and "SLEM" not in sentence
     assert sentence.count("The SO2CUDA source commits") == 1
 
 
@@ -188,8 +188,13 @@ def test_cli_keeps_scan_and_reproduces_all_artifacts(reports, tmp_path):
     subprocess.run(command + ["--write-readme"], check=True, capture_output=True)
     subprocess.run(command + ["--check"], check=True, capture_output=True)
     assert (tmp_path / "public/CUEQ_SELECTION_SCAN.json").is_file()
-    assert "All 16 descriptor/method/rotation combinations" in readme.read_text()
-    assert "--cueq-choice escn_tp_compact,naive,pytorch" in readme.read_text()
+    page = (tmp_path / "benchmarks.md").read_text(encoding="utf-8")
+    text = readme.read_text(encoding="utf-8")
+    assert "All 16 descriptor/method/rotation combinations" in page
+    assert "--cueq-choice escn_tp_compact,naive,pytorch" in page
+    assert gen.OPERATOR_FIGURE in text and gen.CRYSTAL_FIGURE in text and "docs/benchmarks.md" in text
+    public_model = (tmp_path / "public/MODEL_BS32_H200.json").read_text(encoding="utf-8")
+    assert "slem" not in (text + page + public_model).lower()
     (tmp_path / "public/CUEQ_SELECTION_SCAN.json").write_text("{}")
     result = subprocess.run(command + ["--check"], capture_output=True, text=True)
     assert result.returncode != 0 and "CUEQ_SELECTION_SCAN.json" in result.stderr
@@ -265,7 +270,7 @@ def test_optional_publication_keeps_success_validation_strict(reports, mutation)
 
 
 def test_partial_equivalence_is_scoped_to_validated_tables(reports):
-    raw, equiv = incomplete_models(reports[1], ("dense", "unitb"))
+    raw, equiv = incomplete_models(reports[1], ("unitb", "slem"))
     raw["cases"][0]["backends"]["cueq"] = {"status": "oom"}
     raw["cases"][1]["backends"]["cueq"] = {"status": "N/A", "reason": "Unsupported configuration"}
     public = gen.model_evidence(raw, allow_incomplete=True)
@@ -273,7 +278,7 @@ def test_partial_equivalence_is_scoped_to_validated_tables(reports):
     assert public["cases"][1]["implementations"]["cueq"]["status"] == "N/A"
     validation = gen.model_equivalence_evidence(equiv, public)
     assert validation["metric_count"] == 2 and not validation["all_passed"]
-    equiv["cases"].append({"model": "dense", "head": "onsite", "equivalence": EQUIVALENCE})
+    equiv["cases"].append({"model": "unitb", "head": "onsite", "equivalence": EQUIVALENCE})
     with pytest.raises(ValueError, match="exactly the validated"):
         gen.model_equivalence_evidence(equiv, public)
 
@@ -305,3 +310,89 @@ def test_incomplete_cli_generation_is_reproducible(reports, tmp_path):
     subprocess.run(command + ["--check"], check=True, capture_output=True)
     public = json.loads((tmp_path / "public/EQUIV_MODEL.json").read_text())
     assert public["status"] == "incomplete" and not public["all_passed"]
+
+
+def test_only_published_models_reach_readme_page_and_json(reports):
+    operator, model = gen.operator_evidence(reports[0]), gen.model_evidence(reports[1])
+    assert {row["model"] for row in model["cases"]} == set(gen.MODEL_LABELS)
+    public = gen.publish_models(model)
+    assert {row["model"] for row in public["cases"]} == set(gen.PUBLISHED_MODELS)
+    assert set(public["table_source_commits"]) == set(gen.PUBLISHED_MODELS)
+    assert public["source_commits"] == model["source_commits"]
+    section = gen.render(operator, model, EQUIVALENCE, EQUIVALENCE)
+    page = gen.render_page(operator, model, EQUIVALENCE, EQUIVALENCE)
+    for text in (section, page, json.dumps(public)):
+        assert "slem" not in text.lower() and "EquiformerV2" not in text
+
+
+def test_readme_section_is_a_summary_and_page_keeps_every_table(reports):
+    operator, model = gen.operator_evidence(reports[0]), gen.model_evidence(reports[1])
+    section = gen.render(operator, model, EQUIVALENCE, EQUIVALENCE)
+    page = gen.render_page(operator, model, EQUIVALENCE, EQUIVALENCE)
+    assert section.startswith(gen.BEGIN) and section.rstrip().endswith(gen.END)
+    assert "| Compared with SO2CUDA |" in section and "| Model (onsite head) |" in section
+    assert "median of 20 measured iterations after 5 warmup iterations" in section
+    assert "median of 12 measured complete training steps" in section and "after 4 warmup steps" in section
+    assert "strict FP32 with TF32 disabled" in section and "include input and weight gradients" in section
+    assert "at most 32 per batch (on average 32.0 structures and 50.0k directed edges)" in section
+    assert "exclude Wigner construction and the initial layout conversion" in section
+    assert "stored Wigner data count towards peak memory" in section
+    assert "(forward + backward + HybridMuon optimizer)" in section
+    assert "<details>" not in section and len(section.splitlines()) < 40
+    rows = [row for row in operator["cases"] if any(group in row["groups"] for group in gen.GROUP_LABELS)]
+    assert all(gen.config_label(row["config"]) in page for row in rows)
+    assert "## Models on real training batches" in page and "| Hopping |" in page
+
+
+def test_lower_memory_of_a_comparison_is_stated(reports):
+    operator, model = deepcopy(reports)
+    for row in operator["cases"]:
+        if gen.operator_configuration(row["config"]) == gen.S1_KEY:
+            row["implementations"]["eqv3+compile"]["forward_backward"]["peak_allocated_bytes"] = 512
+    for row in model["cases"]:
+        if row["model"] == "dense":
+            row["backends"]["cueq"]["step"]["peak_allocated_bytes"] = 512
+    section = gen.render(gen.operator_evidence(operator), gen.model_evidence(model), EQUIVALENCE, EQUIVALENCE)
+    assert "EquiformerV3 + compile uses less peak memory than SO2CUDA on S1 (0.50×)." in section
+    assert "On UniTB-dense, cuEquivariance uses less peak memory than SO2CUDA (0.0 vs 0.0 GiB)" in section
+
+
+def test_slightly_lower_memory_is_qualified_and_other_configurations_counted(reports):
+    operator, model = deepcopy(reports)
+    rows = [row for row in operator["cases"] if "A4" not in row["groups"]]
+    s1 = next(row for row in rows if gen.operator_configuration(row["config"]) == gen.S1_KEY)
+    other = next(row for row in rows if gen.operator_configuration(row["config"]) != gen.S1_KEY)
+    for row in (s1, other):
+        row["implementations"]["eqv3+compile"]["forward_backward"]["peak_allocated_bytes"] = 1000
+    section = gen.render(gen.operator_evidence(operator), gen.model_evidence(model), EQUIVALENCE, EQUIVALENCE)
+    assert ("EquiformerV3 + compile uses slightly less peak memory than SO2CUDA on S1 (0.98×) "
+            "and on 1 other configuration (0.98×).") in section
+
+
+def test_committed_readme_and_page_match_public_evidence():
+    """The committed README section and benchmark page render exactly from the committed public JSON."""
+    root = Path(gen.__file__).resolve().parents[1]
+    def public(name):
+        value = json.loads((root / "docs/benchmarks" / (name + ".json")).read_text(encoding="utf-8"))
+        value.pop("input_sha256", None)
+        return value
+    operator, model = public("OP_SPEED_H200"), public("MODEL_BS32_H200")
+    equiv_op, equiv_model = public("EQUIV_OP_L40S"), public("EQUIV_MODEL")
+    assert gen.publish_models(model) == model
+    section = gen.render(operator, model, equiv_op, equiv_model)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert gen.replace_section(readme, section) == readme
+    assert (root / "docs/benchmarks/README_SECTION.md").read_text(encoding="utf-8") == section
+    assert (root / "docs/benchmarks.md").read_text(encoding="utf-8") == gen.render_page(operator, model, equiv_op, equiv_model)
+
+
+def test_model_suite_needs_only_the_published_models(reports):
+    raw = deepcopy(reports[1])
+    raw["cases"] = [row for row in raw["cases"] if row["model"] in gen.PUBLISHED_MODELS]
+    public = gen.publish_models(gen.model_evidence(raw))
+    assert {(row["model"], row["head"]) for row in public["cases"]} == {
+        (model, head) for model in gen.PUBLISHED_MODELS for head in ("onsite", "hopping")}
+    missing = deepcopy(raw)
+    missing["cases"] = [row for row in raw["cases"] if (row["model"], row["head"]) != ("unitb", "hopping")]
+    with pytest.raises(ValueError, match="each published model exactly once"):
+        gen.model_evidence(missing)

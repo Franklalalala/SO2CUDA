@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Generate English README performance tables and public evidence from JSON.
+"""Generate the README performance summary, the benchmark page and public evidence from JSON.
 
 Operator input is a so2-operator-suite-v2 report (or an aggregate of suites).
 Model input contains the six real-batch model/head reports. An explicit option
 also accepts unavailable whole model tables with failure evidence. Private task records,
 paths and identities are excluded from the public evidence by an allowlist.
+Every model in the input is validated; only PUBLISHED_MODELS enter the README, the
+benchmark page (docs/benchmarks.md) and the public model JSON.
 Nothing is timed here; every displayed timing and ratio comes from input JSON.
 """
 from __future__ import annotations
@@ -26,12 +28,17 @@ DEEPTB_SHA = "8d5a0dcda30547f83869c292d48fab5df6eec722"
 RELEASE_SHA = "6bc05a7b5135efc153dbb75bf7a20b949979adcf"
 UNCHANGED_ROUTE_SHAS = {"179faaaabe269464fd7e0ad1a36926253bd08eb1",
                         "367642e703847d1c6ffc7f84ffdf7e84ad1de713"}
-LABELS = {"so2cuda": "SO2CUDA", "naive": "Our pure PyTorch", "cueq": "cuEquivariance",
+LABELS = {"so2cuda": "SO2CUDA", "naive": "Plain PyTorch", "cueq": "cuEquivariance",
           "eqv3": "EquiformerV3", "eqv3+compile": "EquiformerV3 + compile"}
 OPERATOR_COLUMNS = ("so2cuda", "naive", "cueq", "eqv3", "eqv3+compile")
 MODEL_COLUMNS = ("so2cuda", "naive", "cueq")
 MODEL_LABELS = {"dense": "UniTB-dense", "unitb": "UniTB", "slem": "UniTB-SLEM"}
 MODEL_ALIASES = {"unitb_slem": "slem", "UniTB-SLEM": "slem", "UniTB-dense": "dense", "UniTB": "unitb"}
+PUBLISHED_MODELS = ("dense", "unitb")          # models shown in the README, the benchmark page and the public JSON
+README_MODEL_ORDER = ("unitb", "dense")
+COMPARED = ("naive", "cueq", "eqv3", "eqv3+compile")
+OPERATOR_FIGURE = "docs/figures/operator_performance.png"
+CRYSTAL_FIGURE = "docs/figures/crystal_training.png"
 UNAVAILABLE_REASONS = {
     "runtime_error": "The measurement failed before a complete validated table was available.",
     "progress_timeout": "The measurement failed after exceeding its progress timeout.",
@@ -655,10 +662,10 @@ def model_evidence(raw, *, allow_incomplete=False):
                     or backend.get("optimizer_mode") != "fast"):
                 raise ValueError("Every successful backend must use the fast HybridMuon path")
         cases.append(row)
-    expected = {(model, head) for model in MODEL_LABELS for head in ("onsite", "hopping")}
+    required = {(model, head) for model in PUBLISHED_MODELS for head in ("onsite", "hopping")}
     actual = [(r["model"], r["head"]) for r in cases + unavailable]
-    if set(actual) != expected or len(actual) != len(expected):
-        raise ValueError("Real-batch table needs each of three models and two heads exactly once")
+    if not required <= set(actual) or len(set(actual)) != len(actual):
+        raise ValueError("Real-batch table needs both heads of each published model exactly once")
     for name in MODEL_LABELS:
         if sum(row["model"] == name for row in cases) not in (0, 2):
             raise ValueError("A model table must validate both heads in the same task or disclose both as unavailable")
@@ -673,22 +680,36 @@ def model_evidence(raw, *, allow_incomplete=False):
             **({"status": "incomplete", "unavailable_cases": unavailable} if incomplete else {})}
 
 
+def publish_models(model):
+    """Restrict validated model evidence to PUBLISHED_MODELS; the others stay in the private input only."""
+    result = dict(model)
+    result["cases"] = [row for row in model["cases"] if row["model"] in PUBLISHED_MODELS]
+    if "unavailable_cases" in model:
+        result["unavailable_cases"] = [row for row in model["unavailable_cases"] if row["model"] in PUBLISHED_MODELS]
+    result["table_source_commits"] = {name: commits for name, commits in model["table_source_commits"].items()
+                                      if name in PUBLISHED_MODELS}
+    result["source_commits"] = common_source_commits(result["table_source_commits"])
+    return result
+
+
 def model_equivalence_evidence(raw, model):
     if model.get("status") != "incomplete":
         return equivalence_evidence(raw)
     if raw.get("status") != "incomplete":
         raise ValueError("Incomplete model timings need equivalence scoped to the available tables")
-    expected = {(row["model"], row["head"]) for row in model["cases"]}
+    expected = {(row["model"], row["head"]) for row in model["cases"] if row["model"] in PUBLISHED_MODELS}
     cases = []
     for source in raw.get("cases", []):
         name, head = model_identity(source)
-        cases.append({"model": name, "head": head, **equivalence_evidence(source["equivalence"])})
+        if name in PUBLISHED_MODELS:
+            cases.append({"model": name, "head": head, **equivalence_evidence(source["equivalence"])})
     actual = [(row["model"], row["head"]) for row in cases]
     if set(actual) != expected or len(actual) != len(expected):
         raise ValueError("Model equivalence must cover exactly the validated model/head timings")
-    expected_unavailable = {(row["model"], row["head"], row["status"]) for row in model["unavailable_cases"]}
+    expected_unavailable = {(row["model"], row["head"], row["status"]) for row in model["unavailable_cases"]
+                            if row["model"] in PUBLISHED_MODELS}
     unavailable = [{"model": model_identity(row)[0], "head": row["head"], "status": row["status"]}
-                   for row in raw.get("unavailable_cases", [])]
+                   for row in raw.get("unavailable_cases", []) if model_identity(row)[0] in PUBLISHED_MODELS]
     actual_unavailable = [(row["model"], row["head"], row["status"]) for row in unavailable]
     if set(actual_unavailable) != expected_unavailable or len(actual_unavailable) != len(expected_unavailable):
         raise ValueError("Unavailable model equivalence must match the unavailable timing tables")
@@ -777,6 +798,7 @@ def memory_cell(data):
 
 
 def operator_tables(report, groups):
+    """Full per-configuration tables for the benchmark page; links are relative to docs/."""
     lines = []
     for group in groups:
         rows = sorted((r for r in report["cases"] if group in r["groups"]),
@@ -814,16 +836,17 @@ def operator_tables(report, groups):
                     if impl["status"] != "passed"})
     if notes:
         lines.extend(["", *["- " + text for text in notes]])
-    evidence_note = "Measured candidate timings and unsupported combinations are recorded in [operator JSON](docs/benchmarks/OP_SPEED_H200.json)."
+    evidence_note = "Measured candidate timings and unsupported combinations are recorded in [operator JSON](benchmarks/OP_SPEED_H200.json)."
     if any("cueq_selection_basis" in row for row in report["cases"]):
-        evidence_note += " The original 12-configuration full scan is recorded in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json)."
+        evidence_note += " The original 12-configuration full scan is recorded in [selection evidence](benchmarks/CUEQ_SELECTION_SCAN.json)."
     lines.extend(["", evidence_note, "", "</details>", ""])
     return "\n".join(lines)
 
 
 def model_tables(report):
     lines = []
-    for model, label in MODEL_LABELS.items():
+    for model in PUBLISHED_MODELS:
+        label = MODEL_LABELS[model]
         rows = [row for row in report["cases"] if row["model"] == model]
         unavailable = [row for row in report.get("unavailable_cases", []) if row["model"] == model]
         if unavailable:
@@ -833,6 +856,8 @@ def model_tables(report):
                 marker = "Failed" if row["status"] == "failed" else "Not measured"
                 lines.append(f'| {row["head"].capitalize()} | {marker} | {row["reason"]} |')
             lines.append("")
+            continue
+        if not rows:
             continue
         lines.extend(["**" + label + "**", "",
                       "| Head | Mean structures | Mean directed edges | " + " | ".join(LABELS[n] + " step ms" + (" (ratio)" if n != "so2cuda" else "") + " | " + LABELS[n] + " peak GiB" for n in MODEL_COLUMNS) + " |",
@@ -846,11 +871,12 @@ def model_tables(report):
                           memory_cell(impl["step"]) if impl["status"] == "passed" else ("OOM" if impl["status"] == "oom" else "N/A")]
             lines.append(f'| {row["head"].capitalize()} | {stream["mean_structures"]:.2f} | {stream["mean_edges"]:,.1f} | ' + " | ".join(cells) + " |")
         lines.append("")
-    if not report["cases"]:
+    published = [row for row in report["cases"] if row["model"] in PUBLISHED_MODELS]
+    if not published:
         return "\n".join(lines)
     lines.extend(["<details>", "<summary>Step quartiles and forward + backward timing without the optimizer</summary>", "",
                   "| Model | Head | Backend | Step ms (Q1–Q3) | Forward + backward ms (Q1–Q3) | Peak allocated GiB |", "|---|---|---|---:|---:|---:|"])
-    for row in report["cases"]:
+    for row in published:
         for name in MODEL_COLUMNS:
             impl = row["implementations"][name]
             prefix = f'| {MODEL_LABELS[row["model"]]} | {row["head"].capitalize()} | {LABELS[name]} | '
@@ -876,11 +902,11 @@ def so2cuda_version_sentence(operator, model):
         sha = operator["table_source_commits"][group]["SO2CUDA"]
         versions.setdefault(sha, []).append(group)
     measured_models = {row["model"] for row in model["cases"]}
-    for name, label in MODEL_LABELS.items():
+    for name in PUBLISHED_MODELS:
         if name not in measured_models:
             continue
         sha = model["table_source_commits"][name]["SO2CUDA"]
-        versions.setdefault(sha, []).append(label)
+        versions.setdefault(sha, []).append(MODEL_LABELS[name])
     def commit_link(sha):
         return f"[`{sha[:8]}`](https://github.com/Franklalalala/SO2CUDA/tree/{sha})"
     uniform_shas = {operator["table_source_commits"][group]["SO2CUDA"] for group in ("A1", "A2", "A3")}
@@ -890,7 +916,9 @@ def so2cuda_version_sentence(operator, model):
         if not other:
             return prefix + ", as do all other measured tables."
         labels = {"A4": "the non-uniform operator table"}
-        parts = [commit_link(sha) + " for " + ", ".join(labels.get(name, name) for name in names)
+        def listing(items):
+            return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+        parts = [commit_link(sha) + " for " + listing([labels.get(name, name) for name in names])
                  for sha, names in other]
         return prefix + "; the other measured tables use " + "; ".join(parts) + ", which execute the same kernels as 0.3.2 on these routes."
     if len(versions) == 1:
@@ -899,7 +927,198 @@ def so2cuda_version_sentence(operator, model):
     return "The SO2CUDA source commits are " + "; ".join(parts) + "."
 
 
+def flat_irreps(lmax, channels):
+    return "+".join(f"{channels}x{level}{'e' if level % 2 == 0 else 'o'}" for level in range(lmax + 1))
+
+
+S1_KEY = (flat_irreps(6, 128), flat_irreps(6, 128), 6, 50000)
+S2_KEY = (V_SHAPE, V_SHAPE, 6, 50000)
+
+
+def scenario(report, key):
+    return next((row for row in report["cases"] if operator_configuration(row["config"]) == key), None)
+
+
+def peak_bytes(impl, scope):
+    return impl[scope].get("peak_allocated_bytes") if impl["status"] == "passed" else None
+
+
+def operator_ratio(row, name, kind):
+    """One comparison over SO2CUDA: forward + backward median time, or forward + backward peak allocated memory."""
+    if row is None:
+        return None
+    impl, ref = row["implementations"][name], row["implementations"]["so2cuda"]
+    if impl["status"] != "passed" or ref["status"] != "passed":
+        return None
+    if kind == "time":
+        return impl["forward_backward"]["median_ms"] / ref["forward_backward"]["median_ms"]
+    value, reference = peak_bytes(impl, "forward_backward"), peak_bytes(ref, "forward_backward")
+    return value / reference if value is not None and reference else None
+
+
+def ratio_text(value):
+    return "N/A" if value is None else f"{value:.2f}×"
+
+
+def range_text(values):
+    values = [value for value in values if value is not None]
+    if not values:
+        return "N/A"
+    low, high = min(values), max(values)
+    return ratio_text(low) if math.isclose(low, high) else f"{low:.2f}–{high:.2f}×"
+
+
+def operator_summary(report):
+    """README table: time ranges over the uniform and non-uniform tables, and the two named scenarios."""
+    uniform = [row for row in report["cases"] if "A4" not in row["groups"]]
+    nonuniform = [row for row in report["cases"] if "A4" in row["groups"]]
+    s1, s2 = scenario(report, S1_KEY), scenario(report, S2_KEY)
+    lines = ["| Compared with SO2CUDA | Uniform irreps: time | S1: time | S1: peak memory | Non-uniform irreps: time | S2: time | S2: peak memory |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
+    for name in COMPARED:
+        cells = [range_text(operator_ratio(row, name, "time") for row in uniform),
+                 ratio_text(operator_ratio(s1, name, "time")), ratio_text(operator_ratio(s1, name, "memory")),
+                 range_text(operator_ratio(row, name, "time") for row in nonuniform),
+                 ratio_text(operator_ratio(s2, name, "time")), ratio_text(operator_ratio(s2, name, "memory"))]
+        lines.append(f"| {LABELS[name]} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def degree(values, word):
+    return ("slightly " if min(values) >= 0.9 else "") + word
+
+
+def operator_memory_notes(report):
+    """Name every comparison that needs less peak memory than SO2CUDA anywhere: S1/S2 by name, the rest counted."""
+    notes = []
+    for name in COMPARED:
+        first = {}                                  # configuration -> ratio of its first row, as in scenario()
+        for row in report["cases"]:
+            first.setdefault(operator_configuration(row["config"]), operator_ratio(row, name, "memory"))
+        below = {config: value for config, value in first.items() if value is not None and value < 1}
+        if not below:
+            continue
+        parts = [f"on {tag} ({below[key]:.2f}×)" for tag, key in (("S1", S1_KEY), ("S2", S2_KEY)) if key in below]
+        others = [value for config, value in below.items() if config not in (S1_KEY, S2_KEY)]
+        if others:
+            parts.append(f"on {len(others)} other configuration{'s' if len(others) > 1 else ''} ({range_text(others)})")
+        notes.append(f"{LABELS[name]} uses {degree(list(below.values()), 'less')} peak memory than SO2CUDA "
+                     + " and ".join(parts))
+    return notes
+
+
+def model_summary(report):
+    """README table: onsite head of each published model; step time, ratios and peak memory per backend."""
+    rows = {row["model"]: row for row in report["cases"] if row["head"] == "onsite"}
+    lines = ["| Model (onsite head) | SO2CUDA step | " + " | ".join(LABELS[n] + " / SO2CUDA" for n in MODEL_COLUMNS[1:])
+             + " | Peak GiB: " + " / ".join(LABELS[n] for n in MODEL_COLUMNS) + " |",
+             "|---|---:|" + "---:|" * (len(MODEL_COLUMNS) - 1) + "---:|"]
+    notes = []
+    for name in README_MODEL_ORDER:
+        row = rows.get(name)
+        if row is None:
+            continue
+        impls = row["implementations"]
+        reference = impls["so2cuda"]
+        passed = reference["status"] == "passed"
+        step = f'{reference["step"]["median_ms"] / 1000:.2f} s' if passed else "N/A"
+        ratios = []
+        for backend in MODEL_COLUMNS[1:]:
+            impl = impls[backend]
+            if impl["status"] == "passed" and passed:
+                ratios.append(f'{impl["step"]["median_ms"] / reference["step"]["median_ms"]:.2f}×')
+            else:
+                ratios.append("OOM" if impl["status"] == "oom" else "N/A")
+        peaks = [peak_bytes(impls[backend], "step") for backend in MODEL_COLUMNS]
+        lines.append(f"| {MODEL_LABELS[name]} | {step} | " + " | ".join(ratios) + " | "
+                     + " / ".join("N/A" if value is None else f"{value / 2 ** 30:.1f}" for value in peaks) + " |")
+        for backend, value in zip(MODEL_COLUMNS[1:], peaks[1:]):
+            if value is not None and peaks[0] and value < peaks[0]:
+                notes.append(f"on {MODEL_LABELS[name]}, {LABELS[backend]} uses {degree([value / peaks[0]], 'less')} "
+                             f"peak memory than SO2CUDA ({value / 2 ** 30:.1f} vs {peaks[0] / 2 ** 30:.1f} GiB)")
+    return "\n".join(lines), notes
+
+
+def model_status(report):
+    rows = [row for row in report.get("unavailable_cases", []) if row["model"] in PUBLISHED_MODELS]
+    if not rows:
+        return ""
+    lines = ["| Model | Head | Measurement status | Reason |", "|---|---|---|---|"]
+    for row in sorted(rows, key=lambda r: (README_MODEL_ORDER.index(r["model"]), r["head"] == "hopping")):
+        marker = "Failed" if row["status"] == "failed" else "Not measured"
+        lines.append(f'| {MODEL_LABELS[row["model"]]} | {row["head"].capitalize()} | {marker} | {row["reason"]} |')
+    return "\n".join(lines)
+
+
+def batch_means(cases):
+    structures = sorted({round(row["batch_stream"]["mean_structures"], 1) for row in cases})
+    edges = sorted({round(row["batch_stream"]["mean_edges"] / 1000, 1) for row in cases})
+    span = lambda values, fmt: fmt(values[0]) if len(values) == 1 else fmt(values[0]) + "–" + fmt(values[-1])
+    return span(structures, lambda v: f"{v:.1f}"), span(edges, lambda v: f"{v:.1f}k")
+
+
+def cap(text):
+    return text[:1].upper() + text[1:]
+
+
 def render(operator, model, equiv_op, equiv_model):
+    """README section: one figure, one compact table and the measurement scope for operators and for models."""
+    model = publish_models(model)
+    op_warmup, op_iterations = protocol(operator["cases"])
+    uniform_count = len({operator_configuration(r["config"]) for r in operator["cases"] if "A4" not in r["groups"]})
+    nonuniform_count = len({operator_configuration(r["config"]) for r in operator["cases"] if "A4" in r["groups"]})
+    op_notes = operator_memory_notes(operator)
+    op_scope = (f"Each entry divides an implementation's forward + backward time (median of {op_iterations} measured iterations "
+                f"after {op_warmup} warmup iterations) or peak allocated memory by SO2CUDA's, on one NVIDIA H200 in strict FP32 "
+                "with TF32 disabled; times include input and weight gradients. Geometry is precomputed and each implementation "
+                "starts from its native feature layout, so the timings exclude Wigner construction and the initial layout "
+                "conversion, while stored Wigner data count towards peak memory. "
+                f"S1 is `{S1_KEY[0]}` and S2 is UniTB's V-shaped hidden irreps `{S2_KEY[0]}`, both with 50,000 directed edges; "
+                f"the ranges cover {uniform_count} uniform and {nonuniform_count} non-uniform configurations. "
+                + ("".join(cap(note) + ". " for note in op_notes))
+                + "Every configuration, timing quartiles and source commits are on the [benchmark page](docs/benchmarks.md).")
+    lines = [BEGIN, "## Operator performance", "",
+             f"![Operator performance]({OPERATOR_FIGURE})", "",
+             "*One SO(2) tensor product layer. **a–b**, forward + backward time relative to SO2CUDA for uniform and "
+             "non-uniform irreps; **c**, peak memory relative to SO2CUDA. Large markers are the scenarios S1, its "
+             "$m_{\\max}=2$ variant and S2; light points are the other measured configurations. Above 1, SO2CUDA is faster or uses less memory.*", "",
+             operator_summary(operator), "", op_scope, "",
+             "## Crystal training performance", "",
+             f"![Crystal training]({CRYSTAL_FIGURE})", "",
+             "*One complete training step of UniTB and UniTB-dense on real crystal batches (onsite head). **a**, step "
+             "time: SO2CUDA in seconds, the other backends relative to it; **b**, peak memory.*", ""]
+    if model["cases"]:
+        model_warmup, model_iterations = protocol(model["cases"])
+        structures, edges = batch_means(model["cases"])
+        table, notes = model_summary(model)
+        lines.extend([table, ""])
+        status = model_status(model)
+        if status:
+            lines.extend([status, ""])
+        lines.append(
+            f"Batches hold real crystal structures from our training set, at most 32 per batch (on average {structures} structures "
+            f"and {edges} directed edges), and every backend trains on the same batches in the same order; the table gives the "
+            f"median of {model_iterations} measured complete training steps (forward + backward + HybridMuon optimizer) after "
+            f"{model_warmup} warmup steps on one NVIDIA H200 in strict FP32 with TF32 disabled. Only the backend of the SO(2) and expert-linear "
+            "layers changes, and first-step losses and parameter gradients agree within FP32 tolerance. "
+            + "".join(cap(note) + ". " for note in notes)
+            + "EquiformerV3 is not applicable because both models contain non-uniform SO(2) layers. The hopping head, timing "
+            "quartiles and forward + backward times without the optimizer are on the "
+            "[benchmark page](docs/benchmarks.md#models-on-real-training-batches).")
+    else:
+        lines.extend(["No complete validated real-batch model table is available; no model timing or speedup is reported.", ""])
+        status = model_status(model)
+        if status:
+            lines.extend([status, ""])
+        lines.append("Formal real-batch model equivalence is unavailable for these tables. Failed or unmeasured tables keep their "
+                     "raw evidence digests in the [public JSON](docs/benchmarks/MODEL_BS32_H200.json).")
+    lines.extend(["", END])
+    return "\n".join(lines) + "\n"
+
+
+def render_page(operator, model, equiv_op, equiv_model):
+    """docs/benchmarks.md: every table, the implementation notes, source commits and the reproduction commands."""
+    model = publish_models(model)
     op_warmup, op_iterations = protocol(operator["cases"])
     model_warmup, model_iterations = protocol(model["cases"]) if model["cases"] else (None, None)
     cueq_versions = {row["implementations"]["cueq"]["version"] for row in operator["cases"]
@@ -914,7 +1133,7 @@ def render(operator, model, equiv_op, equiv_model):
         "`SegmentedPolynomial` with `escn_tp_compact`, method `naive`, and precomputed PyTorch Wigner `bmm` rotation. "
         "All 16 descriptor/method/rotation combinations were compared on 12 uniform configurations; this combination "
         "was the fastest numerically correct choice in every configuration. The complete scan is retained in "
-        "[selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json), and the tables use this fixed choice."
+        "[selection evidence](benchmarks/CUEQ_SELECTION_SCAN.json), and the tables use this fixed choice."
         if fixed_choice else
         "`SO3` irreps with `escn_tp` or `escn_tp_compact`, executed by `SegmentedPolynomial`. "
         "The selected method and rotation are listed below; alternatives and unsupported combinations are retained in the JSON. "
@@ -926,69 +1145,68 @@ def render(operator, model, equiv_op, equiv_model):
         if label not in {x[0] for x in configurations}:
             configurations.append((label, config["irreps_in"], config["irreps_out"]))
     model_protocol = (
-        f"For each published model and head, all backends use the same structures in the same order, with {model_warmup} warmup steps and {model_iterations} measured steps on NVIDIA H200. "
+        f"For each published model and head, all backends use the same structures in the same order, with {model_warmup} warmup steps and {model_iterations} measured steps on NVIDIA H200 in strict FP32. "
         if model["cases"] else "No complete validated real-batch model table is available; no model timing or speedup is reported. ")
     model_protocol += (
         "We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, "
-        "[our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). "
+        "[our plain PyTorch implementation](../examples/naive_baseline.py), or [cuEquivariance](../examples/cueq_baseline.py). "
         "Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. "
-        "Published timing tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. "
+        "The tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. "
         "Forward + backward timing excluding the optimizer appears in the details.")
     if model.get("status") == "incomplete":
         model_protocol += " Failed or unmeasured tables are disclosed below; their raw evidence digests are retained in the public JSON."
     validation_sentence = (
         "For each published timing table, the first-step loss and parameter gradients are compared on the same batch within FP32 rounding tolerance, "
-        "and dispatch checks verify that the pure PyTorch and cuEquivariance routes do not call SO2CUDA. "
+        "and dispatch checks verify that the plain PyTorch and cuEquivariance routes do not call SO2CUDA. "
         if model["cases"] else "Formal real-batch model equivalence is unavailable for these tables. ")
     if model.get("status") == "incomplete" and model["cases"]:
         validation_sentence += "No equivalence pass is claimed for the unavailable tables. "
-    lines = [BEGIN, "## Performance", "", "### 1. SO(2) tensor product operator", "",
+    lines = ["# Benchmark details", "",
+             "This page is generated by [update_readme_benchmarks.py](../examples/update_readme_benchmarks.py) from the public JSON in "
+             "[benchmarks/](benchmarks/); the [README](../README.md#operator-performance) shows the summary and "
+             "[operator-benchmark.md](operator-benchmark.md) describes the measurement contract.", "",
+             "## SO(2) tensor product operator", "",
              "The edge operator rotates features into the edge frame, applies a shared linear map for each |m|, and rotates back:", "",
              r"$$y_e = D(R_e)^{\top}\,\mathcal{L}_W\!\left(D(R_e)\,x_e\right).$$", "",
              "The m=0 block is real; each positive m uses a complex linear map represented by real weights. Weights are shared across edges; the operator benchmark excludes radial modulation.", "",
-             "**Uniform irreps** have the same number of channels at every l, as in the usual eSCN, EquiformerV2, and EquiformerV3 layouts. **Non-uniform irreps** have different channel counts across l. SO2CUDA and our pure PyTorch implementation support both, including unequal input and output irreps. The original EquiformerV3 layer requires uniform channels on each side; non-uniform cases are N/A without padding. cuEquivariance support depends on the descriptor and method; unsupported combinations retain their reason in the JSON.", "",
+             "**Uniform irreps** have the same number of channels at every l, as in the usual eSCN and EquiformerV3 layouts. **Non-uniform irreps** have different channel counts across l. SO2CUDA and the plain PyTorch implementation support both, including unequal input and output irreps. The original EquiformerV3 layer requires uniform channels on each side; non-uniform cases are N/A without padding. cuEquivariance support depends on the descriptor and method; unsupported combinations retain their reason in the JSON.", "",
              "- **SO2CUDA:** the public `true_dense_pairs(..., include_m0=True)` interface, with default settings, computes the complete layer.",
-             "- **Our pure PyTorch:** our implementation of [DeePTB upstream `SO2_Linear`](https://github.com/deepmodeling/DeePTB/blob/1dcc7f61480c373870cd5bad1d4000ac80757ff5/dptb/nn/tensor_product.py), in [operator_baselines.py](examples/operator_baselines.py). It is authored here from that computation pattern.",
+             "- **Plain PyTorch:** our implementation of [DeePTB upstream `SO2_Linear`](https://github.com/deepmodeling/DeePTB/blob/1dcc7f61480c373870cd5bad1d4000ac80757ff5/dptb/nn/tensor_product.py), in [operator_baselines.py](../examples/operator_baselines.py). It is authored here from that computation pattern.",
              f"- **EquiformerV3:** the original `SO3Rotation` and `SO2Linear` at [commit `{EQV3_SHA[:8]}`](https://github.com/atomicarchitects/equiformer_v3/tree/{EQV3_SHA}), with m=0 bias set to zero. Eager and `torch.compile(dynamic=True)` are measured separately; compilation is outside steady-state timing.",
              f"- **cuEquivariance {cueq_version}:** " + cueq_description, "",
-             f"Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. {so2cuda_version_sentence(operator, model)} Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has {op_warmup} warmup iterations and {op_iterations} measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.", "",
-             "#### 1.1 Uniform irreps", "", operator_tables(operator, ("A1", "A2", "A3")),
-             "#### 1.2 Non-uniform irreps", "", "The configurations below use decreasing channels, UniTB's V-shaped hidden channels, and unequal input/output irreps:", "",
+             f"Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. {so2cuda_version_sentence(operator, model)} "
+             "Geometry is precomputed and each implementation runs in its native feature layout: the timings exclude Wigner construction and the initial layout conversion. "
+             f"Each implementation has {op_warmup} warmup iterations and {op_iterations} measured iterations. Each complete table comes from one card task. "
+             "The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. "
+             "Peak allocated memory includes that implementation's inputs, weights, geometry (the stored Wigner data), saved activations, gradients, and workspace.", "",
+             f"The README's scenario S1 is `{S1_KEY[0]}` (lmax=6, C=128, mmax=6) and S2 is `{S2_KEY[0]}` (V-shaped channels), both with 50,000 directed edges.", "",
+             "### Uniform irreps", "", operator_tables(operator, ("A1", "A2", "A3")),
+             "### Non-uniform irreps", "", "The configurations below use decreasing channels, UniTB's V-shaped hidden channels, and unequal input/output irreps:", "",
              "| Configuration | Input irreps | Output irreps |", "|---|---|---|"]
     for label, ir_in, ir_out in configurations:
         lines.append(f"| {label} | `{ir_in}` | `{ir_out}` |")
     lines.extend(["", operator_tables(operator, ("A4",)),
-                  "Outputs, input gradients, and weight gradients mapped to common canonical parameters are compared pairwise and against an FP64 reference on small inputs. The new non-uniform irreps also undergo a rotation-equivariance check. [Numerical evidence](docs/benchmarks/EQUIV_OP_L40S.json) records the errors and FP32 tolerances.", "",
-                  "**Minimal use for interatomic potentials**", "",
-                  "The example accepts e3nn irreps such as `32x0e+32x1o+32x2e` or `128x0e+64x1o+32x2e`, and permits different input/output channel counts. Features use e3nn `mul_ir` layout `[edges, irreps.dim]`. Edge vectors determine a constant rotation; geometry gradients are unsupported. Prepare the layout and Wigner data once for an unchanged edge geometry:", "", "```python",
-                  "import torch", "from e3nn import o3", "from examples.minimal_so2_tp import prepare_so2_tp, make_weights",
-                  "from so2_cuda_ops.deeptb import true_dense_pairs", "", 'irreps = o3.Irreps("128x0e+64x1o+32x2e")',
-                  'edge_vectors = torch.randn(512, 3, device="cuda", dtype=torch.float32)',
-                  'x = torch.randn(512, irreps.dim, device="cuda", dtype=torch.float32, requires_grad=True)',
-                  "layout, wigner = prepare_so2_tp(irreps, irreps, edge_vectors, m_max=2)",
-                  "weights = make_weights(irreps, irreps, 2, device=x.device)",
-                  "parts = None if wigner is None else true_dense_pairs(x, layout, wigner, weights, include_m0=True)",
-                  'if parts is None:', '    raise RuntimeError("Use your PyTorch reference implementation for this input")',
-                  "y = parts[0]", "y.square().mean().backward()", "```", "",
-                  "`make_weights` creates trainable W0 and `[A_m; B_m]` matrices, shared across edges; a model can supply its own `LinearWeights` instead. These preparation helpers live in [minimal_so2_tp.py](examples/minimal_so2_tp.py), rather than the package API. The CUDA interface uses FP32 tensors on one CUDA device. CPU, other dtypes, autocast, `torch.func`, geometry requiring gradients, and unsupported layouts return `None`, so the caller can use its reference path. Native CUDA execution errors propagate.", "",
-                  "Reproduce an operator comparison from the repository root. The environment must already contain CUDA-enabled PyTorch, compatible cuBLAS, and the standard Python dependencies (NumPy, SciPy, SymPy, NetworkX, opt-einsum, tqdm, nvidia-ml-py, and platformdirs). `--no-deps` preserves that environment; measured software versions are recorded in the JSON:", "", "```bash",
-                  f"pip install --no-deps cuequivariance=={cueq_version} cuequivariance-torch=={cueq_version} cuequivariance-ops-cu12=={cueq_version} cuequivariance-ops-torch-cu12=={cueq_version}",
-                  f"git clone https://github.com/atomicarchitects/equiformer_v3.git && git -C equiformer_v3 checkout {EQV3_SHA}",
-                  "python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup 5 --iterations 20" +
-                  (" --cueq-choice escn_tp_compact,naive,pytorch" if fixed_choice else "") + " --json operator.json",
-                  "```", "", "### 2. UniTB models on real training batches", "",
-                  "UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. The comparison uses both onsite and hopping production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; published timing tables report the measured mean structure and directed-edge counts for each fixed batch stream.", "",
+                  "Outputs, input gradients, and weight gradients mapped to common canonical parameters are compared pairwise and against an FP64 reference on small inputs. The non-uniform irreps also undergo a rotation-equivariance check. [Numerical evidence](benchmarks/EQUIV_OP_L40S.json) records the errors and FP32 tolerances.", "",
+                  "## Models on real training batches", "",
+                  "UniTB uses PDQ-MoE expert layers; UniTB-dense uses a single expert. The comparison uses both onsite and hopping production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; the tables report the measured mean structure and directed-edge counts for each fixed batch stream.", "",
                   model_protocol, "",
                   f"The DeePTB source is pinned to [commit `{DEEPTB_SHA[:7]}`](https://github.com/Franklalalala/DeePTB/tree/{DEEPTB_SHA}); full source commits and software versions are recorded in the public JSON.", "",
                   model_tables(model),
-                  "EquiformerV3 is N/A for all three complete models because each contains non-uniform SO(2) layers, including UniTB-dense's final output layers.", "",
-                  "The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). " + validation_sentence + "See [model measurement records](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).", "",
+                  "EquiformerV3 is N/A for both models because each contains non-uniform SO(2) layers, including UniTB-dense's final output layers.", "",
+                  "The plain PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). " + validation_sentence + "See [model measurement records](benchmarks/MODEL_BS32_H200.json) and [model equivalence](benchmarks/EQUIV_MODEL.json).", "",
+                  "## Reproducing the measurements", "",
+                  "Run the operator comparison from the repository root. The environment must already contain CUDA-enabled PyTorch, compatible cuBLAS, and the standard Python dependencies (NumPy, SciPy, SymPy, NetworkX, opt-einsum, tqdm, nvidia-ml-py, and platformdirs). `--no-deps` preserves that environment; measured software versions are recorded in the JSON:", "", "```bash",
+                  f"pip install --no-deps cuequivariance=={cueq_version} cuequivariance-torch=={cueq_version} cuequivariance-ops-cu12=={cueq_version} cuequivariance-ops-torch-cu12=={cueq_version}",
+                  f"git clone https://github.com/atomicarchitects/equiformer_v3.git && git -C equiformer_v3 checkout {EQV3_SHA}",
+                  f"python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup {op_warmup} --iterations {op_iterations}" +
+                  (" --cueq-choice escn_tp_compact,naive,pytorch" if fixed_choice else "") + " --json operator.json",
+                  "```", "",
                   "The training dataset is not public. Synthetic periodic structures provide a runnable comparison of relative timing; they are used only for timing and do not reproduce the real-batch measurements, physical priors, or prediction accuracy:", "", "```bash",
                   "pip install 'git+https://github.com/Franklalalala/DeePTB.git@1006-stable'", "pip install -e .",
-                  "python examples/deeptb_speed_test.py --model all --backend both --edges 20000 --json synthetic_so2cuda.json",
-                  "python examples/deeptb_speed_test.py --model all --backend cueq --edges 20000 --json synthetic_cueq.json", "```", "",
-                  "The synthetic example compares the same randomly initialized model and inputs, disables SO2CUDA for reference routes, and records timing, peak memory, dispatch, and numerical differences. Reduce `--edges` on smaller GPUs; `--max-memory-gib` sets its allocator limit. Its forward + backward timings exclude optimizer updates.", "", END])
-    return "\n".join(lines) + "\n"
+                  "python examples/deeptb_speed_test.py --model both --backend both --edges 20000 --json synthetic_so2cuda.json",
+                  "python examples/deeptb_speed_test.py --model both --backend cueq --edges 20000 --json synthetic_cueq.json", "```", "",
+                  "The synthetic example compares the same randomly initialized model and inputs, disables SO2CUDA for reference routes, and records timing, peak memory, dispatch, and numerical differences. Reduce `--edges` on smaller GPUs; `--max-memory-gib` sets its allocator limit. Its forward + backward timings exclude optimizer updates.", ""])
+    return "\n".join(lines)
 
 
 def replace_section(readme, section):
@@ -1040,7 +1258,7 @@ def main():
     raw_operator = load(args.operator_json)
     operator = operator_evidence(raw_operator)
     selection_scan = selection_scan_artifact(raw_operator, args.cueq_selection_json)
-    model = model_evidence(load(args.model_json), allow_incomplete=args.allow_incomplete_models)
+    model = publish_models(model_evidence(load(args.model_json), allow_incomplete=args.allow_incomplete_models))
     verify_sources(operator, model)
     equiv_op = equivalence_evidence(load(args.equiv_operator_json))
     equiv_model = model_equivalence_evidence(load(args.equiv_model_json), model)
@@ -1049,6 +1267,7 @@ def main():
     if selection_scan is not None:
         inputs["cueq_selection_scan"] = selection_scan["selection_basis"]["source_sha256"]
     section = render(operator, model, equiv_op, equiv_model)
+    page = render_page(operator, model, equiv_op, equiv_model)
     artifacts = {"OP_SPEED_H200": operator, "MODEL_BS32_H200": model,
                  "EQUIV_OP_L40S": equiv_op, "EQUIV_MODEL": equiv_model}
     if selection_scan is not None:
@@ -1056,6 +1275,7 @@ def main():
     expected = {args.docs_dir / (name + ".json"): json.dumps({**value, "input_sha256": inputs}, indent=2,
                 ensure_ascii=False, allow_nan=False) + "\n" for name, value in artifacts.items()}
     expected[args.docs_dir / "README_SECTION.md"] = section
+    expected[args.docs_dir.parent / "benchmarks.md"] = page
     readme = args.readme.read_text(encoding="utf-8")
     generated_readme = replace_section(readme, section)
     if args.check:
@@ -1068,6 +1288,7 @@ def main():
         print(json.dumps({"status": "passed", "readme_matches_json": True}))
         return
     args.docs_dir.mkdir(parents=True, exist_ok=True)
+    args.docs_dir.parent.mkdir(parents=True, exist_ok=True)
     for path, value in expected.items():
         path.write_text(value, encoding="utf-8")
     if args.write_readme:

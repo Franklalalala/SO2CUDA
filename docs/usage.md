@@ -34,6 +34,21 @@ Radial blocks are `[N,Cin_m]` for input-side (`front=True`) modulation or `[N,Co
 
 `ActivationRouting.indices` and `values` have shape `[N,K]`. Each slot describes a stable expert ordering as `(order, inverse, ptr_cpu, sorted_expert_ids)`. Routed `LinearWeights.weight` has shape `[experts,Dout,Din]`; non-routed interpolation blocks use `[Dout,Din]`. Set `coefficients_sum_to_one=True` only when the caller has already folded shared experts according to the model definition; otherwise provide the separate shared weights.
 
+## Grouped linear layers
+
+Grouped linear layers can also be called directly:
+
+```python
+import torch
+from so2_cuda_ops.deeptb import grouped_gemm
+
+x = torch.randn(1024, 32, device="cuda", dtype=torch.float32)
+weight = torch.randn(2, 64, 32, device="cuda", dtype=torch.float32)
+# Each contiguous group of rows uses its own [out, in] weight.
+ptr = torch.tensor([0, 512, 1024], dtype=torch.long)
+y = grouped_gemm(x, ptr, weight)  # [1024, 64], supports autograd
+```
+
 ## Fallback and errors
 
 SO(2) interfaces return `None` before unsupported native execution for CPU, non-FP32, autocast, `torch.func`, geometry requiring gradients, or unsupported layouts. The caller then uses its reference implementation. DeePTB handles that fallback through its optional backend. Native execution exceptions propagate; they do not silently select another path.
