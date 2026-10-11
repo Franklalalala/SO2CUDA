@@ -16,7 +16,7 @@ The m=0 block is real; each positive m uses a complex linear map represented by 
 - **EquiformerV3:** the original `SO3Rotation` and `SO2Linear` at [commit `a7300c58`](https://github.com/atomicarchitects/equiformer_v3/tree/a7300c58df683dc99cb48027d5bfd4c887486c48), with m=0 bias set to zero. Eager and `torch.compile(dynamic=True)` are measured separately; compilation is outside steady-state timing.
 - **cuEquivariance 0.12.0:** `SegmentedPolynomial` with `escn_tp_compact`, method `naive`, and precomputed PyTorch Wigner `bmm` rotation. All 16 descriptor/method/rotation combinations were compared on 12 uniform configurations; this combination was the fastest numerically correct choice in every configuration. The complete scan is retained in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json), and the tables use this fixed choice.
 
-Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. The uniform operator tables use SO2CUDA 0.3.2 source at [`6bc05a7b`](https://github.com/Franklalalala/SO2CUDA/tree/6bc05a7b5135efc153dbb75bf7a20b949979adcf); the other measured tables use [`179faaaa`](https://github.com/Franklalalala/SO2CUDA/tree/179faaaabe269464fd7e0ad1a36926253bd08eb1) for the non-uniform operator table, which execute the same kernels as 0.3.2 on these routes. Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has 5 warmup iterations and 20 measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.
+Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. The uniform operator tables use SO2CUDA 0.3.2 source at [`6bc05a7b`](https://github.com/Franklalalala/SO2CUDA/tree/6bc05a7b5135efc153dbb75bf7a20b949979adcf); the other measured tables use [`179faaaa`](https://github.com/Franklalalala/SO2CUDA/tree/179faaaabe269464fd7e0ad1a36926253bd08eb1) for the non-uniform operator table; [`367642e7`](https://github.com/Franklalalala/SO2CUDA/tree/367642e703847d1c6ffc7f84ffdf7e84ad1de713) for UniTB, UniTB-SLEM, which execute the same kernels as 0.3.2 on these routes. Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has 5 warmup iterations and 20 measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.
 
 #### 1.1 Uniform irreps
 
@@ -304,7 +304,7 @@ python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --incl
 
 UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. The comparison uses both onsite and hopping production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; published timing tables report the measured mean structure and directed-edge counts for each fixed batch stream.
 
-No complete validated real-batch model table is available; no model timing or speedup is reported. We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, [our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. Published timing tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. Forward + backward timing excluding the optimizer appears in the details. Failed or unmeasured tables are disclosed below; their raw evidence digests are retained in the public JSON.
+For each published model and head, all backends use the same structures in the same order, with 4 warmup steps and 12 measured steps on NVIDIA H200. We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, [our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. Published timing tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. Forward + backward timing excluding the optimizer appears in the details. Failed or unmeasured tables are disclosed below; their raw evidence digests are retained in the public JSON.
 
 The DeePTB source is pinned to [commit `8d5a0dc`](https://github.com/Franklalalala/DeePTB/tree/8d5a0dcda30547f83869c292d48fab5df6eec722); full source commits and software versions are recorded in the public JSON.
 
@@ -317,21 +317,41 @@ The DeePTB source is pinned to [commit `8d5a0dc`](https://github.com/Franklalala
 
 **UniTB**
 
-| Head | Measurement status | Reason |
-|---|---|---|
-| Onsite | Not measured | No complete validated measurement is available. |
-| Hopping | Not measured | No complete validated measurement is available. |
+| Head | Mean structures | Mean directed edges | SO2CUDA step ms | SO2CUDA peak GiB | Our pure PyTorch step ms (ratio) | Our pure PyTorch peak GiB | cuEquivariance step ms (ratio) | cuEquivariance peak GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Onsite | 31.67 | 55,893.0 | 792.27 | 32.60 | 1636.29 (2.07×) | 61.44 | 1660.71 (2.10×) | 52.51 |
+| Hopping | 31.67 | 55,893.0 | 792.81 | 32.60 | 1628.35 (2.05×) | 61.44 | 1670.60 (2.11×) | 52.51 |
 
 **UniTB-SLEM**
 
-| Head | Measurement status | Reason |
-|---|---|---|
-| Onsite | Not measured | No complete validated measurement is available. |
-| Hopping | Not measured | No complete validated measurement is available. |
+| Head | Mean structures | Mean directed edges | SO2CUDA step ms | SO2CUDA peak GiB | Our pure PyTorch step ms (ratio) | Our pure PyTorch peak GiB | cuEquivariance step ms (ratio) | cuEquivariance peak GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Onsite | 31.67 | 55,893.0 | 978.87 | 46.25 | 2234.06 (2.28×) | 90.83 | 2308.46 (2.36×) | 75.85 |
+| Hopping | 31.67 | 55,893.0 | 993.42 | 46.25 | 2242.09 (2.26×) | 90.83 | 2300.22 (2.32×) | 75.85 |
+
+<details>
+<summary>Step quartiles and forward + backward timing without the optimizer</summary>
+
+| Model | Head | Backend | Step ms (Q1–Q3) | Forward + backward ms (Q1–Q3) | Peak allocated GiB |
+|---|---|---|---:|---:|---:|
+| UniTB | Onsite | SO2CUDA | 792.27 (765.31–868.40) | 676.27 (631.02–707.64) | 32.60 |
+| UniTB | Onsite | Our pure PyTorch | 1636.29 (1553.19–1854.00) | 1511.17 (1375.19–1625.85) | 61.44 |
+| UniTB | Onsite | cuEquivariance | 1660.71 (1573.78–1873.63) | 1516.10 (1418.92–1651.25) | 52.51 |
+| UniTB | Hopping | SO2CUDA | 792.81 (758.48–857.18) | 673.50 (641.98–717.05) | 32.60 |
+| UniTB | Hopping | Our pure PyTorch | 1628.35 (1565.97–1859.38) | 1495.24 (1389.44–1626.72) | 61.44 |
+| UniTB | Hopping | cuEquivariance | 1670.60 (1571.91–1873.13) | 1525.19 (1425.87–1636.45) | 52.51 |
+| UniTB-SLEM | Onsite | SO2CUDA | 978.87 (936.01–1082.99) | 850.24 (794.41–907.70) | 46.25 |
+| UniTB-SLEM | Onsite | Our pure PyTorch | 2234.06 (2096.81–2559.62) | 2081.77 (1899.51–2280.35) | 90.83 |
+| UniTB-SLEM | Onsite | cuEquivariance | 2308.46 (2147.07–2626.06) | 2132.64 (1988.37–2328.31) | 75.85 |
+| UniTB-SLEM | Hopping | SO2CUDA | 993.42 (921.11–1068.99) | 862.02 (803.25–892.49) | 46.25 |
+| UniTB-SLEM | Hopping | Our pure PyTorch | 2242.09 (2096.77–2569.35) | 2077.80 (1898.92–2278.60) | 90.83 |
+| UniTB-SLEM | Hopping | cuEquivariance | 2300.22 (2157.93–2648.18) | 2141.75 (1965.90–2332.42) | 75.85 |
+
+</details>
 
 EquiformerV3 is N/A for all three complete models because each contains non-uniform SO(2) layers, including UniTB-dense's final output layers.
 
-The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). Formal real-batch model equivalence is unavailable for these tables. See [model measurement records](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).
+The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). For each published timing table, the first-step loss and parameter gradients are compared on the same batch within FP32 rounding tolerance, and dispatch checks verify that the pure PyTorch and cuEquivariance routes do not call SO2CUDA. No equivalence pass is claimed for the unavailable tables. See [model measurement records](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).
 
 The training dataset is not public. Synthetic periodic structures provide a runnable comparison of relative timing; they are used only for timing and do not reproduce the real-batch measurements, physical priors, or prediction accuracy:
 
