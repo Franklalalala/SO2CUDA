@@ -1,14 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 (2026-10-11)
 
-- Accelerate supported uniform-channel SO(2) rotations with channel-tiled kernels, retaining the general training path for small layouts.
-- Preserve autograd tensor-version checks and respect device shared-memory limits in sandwich operations.
-- Provide uniform and non-uniform SO(2) operator grids, with eager and compiled EquiformerV3, cuEquivariance, and our pure PyTorch reference implementation.
-- Compare UniTB-dense, UniTB, and UniTB-SLEM on the same real training-batch streams for both onsite and hopping heads, using the same HybridMuon optimizer path across backends.
-- Generate the English README performance tables and public numerical evidence from measurement JSON, including timing quartiles, peak memory, unsupported configurations, out-of-memory results, and explicit disclosure of unavailable whole model tables.
-- Provide a complete tensor-only SO(2) example with irreps, edge vectors, trainable weights, and input/weight autograd.
-- Document installation, DeePTB integration, supported inputs, reference fallback, and build settings in English.
+- Uniform irreps: when every degree has the same multiplicity (a multiple of 32, $\ell_{\max} \le 8$, complete positive-m blocks) and the layer has a single weight set without radial weights or gates, rotate-and-pack and gather-and-rotate run in a kernel in which each warp handles 32 channels of one degree of one edge. Layouts with 32 channels and $\ell_{\max} \le 2$ keep the edge-tiled kernels. The choice is made once when the layout is prepared; numerical results are unchanged.
+- Radial-fused layers keep the Wigner values and the sorted group ids among the tensors saved for backward, so modifying either in place between forward and backward raises the standard autograd error.
+- The shared-memory check for the edge-tiled gather kernel includes its static scratch, so layouts at the limit fall back to the general kernels.
+- The extension build takes CUDA headers from the selected toolkit only.
+- The README performance section is in English: uniform and non-uniform SO(2) operator tables against EquiformerV3 (eager and `torch.compile`), cuEquivariance, and our pure PyTorch reference, and real training-batch steps for UniTB-dense, UniTB, and UniTB-SLEM with each SO(2) backend. Tables and the published JSON evidence are generated from the measurement records, including timing quartiles, peak memory, and unsupported configurations.
+- [examples/minimal_so2_tp.py](examples/minimal_so2_tp.py) is a complete tensor-only SO(2) example with irreps, edge vectors, trainable weights, and input and weight gradients.
+- Installation, DeePTB integration, supported inputs, reference fallback, and build settings are documented in English.
 
 ## 0.3.1 (2026-10-11)
 
