@@ -2,7 +2,8 @@
 """Generate English README performance tables and public evidence from JSON.
 
 Operator input is a so2-operator-suite-v2 report (or an aggregate of suites).
-Model input contains the six real-batch model/head reports. Private task records,
+Model input contains the six real-batch model/head reports. An explicit option
+also accepts unavailable whole model tables with failure evidence. Private task records,
 paths and identities are excluded from the public evidence by an allowlist.
 Nothing is timed here; every displayed timing and ratio comes from input JSON.
 """
@@ -22,11 +23,22 @@ BEGIN = "<!-- SO2CUDA_BENCHMARKS_BEGIN -->"
 END = "<!-- SO2CUDA_BENCHMARKS_END -->"
 EQV3_SHA = "a7300c58df683dc99cb48027d5bfd4c887486c48"
 DEEPTB_SHA = "8d5a0dcda30547f83869c292d48fab5df6eec722"
+RELEASE_SHA = "6bc05a7b5135efc153dbb75bf7a20b949979adcf"
+UNCHANGED_ROUTE_SHAS = {"179faaaabe269464fd7e0ad1a36926253bd08eb1",
+                        "367642e703847d1c6ffc7f84ffdf7e84ad1de713"}
 LABELS = {"so2cuda": "SO2CUDA", "naive": "Our pure PyTorch", "cueq": "cuEquivariance",
           "eqv3": "EquiformerV3", "eqv3+compile": "EquiformerV3 + compile"}
 OPERATOR_COLUMNS = ("so2cuda", "naive", "cueq", "eqv3", "eqv3+compile")
 MODEL_COLUMNS = ("so2cuda", "naive", "cueq")
 MODEL_LABELS = {"dense": "UniTB-dense", "unitb": "UniTB", "slem": "UniTB-SLEM"}
+MODEL_ALIASES = {"unitb_slem": "slem", "UniTB-SLEM": "slem", "UniTB-dense": "dense", "UniTB": "unitb"}
+UNAVAILABLE_REASONS = {
+    "runtime_error": "The measurement failed before a complete validated table was available.",
+    "progress_timeout": "The measurement failed after exceeding its progress timeout.",
+    "task_timeout": "The measurement failed after exceeding its execution time limit.",
+    "failed_equivalence": "The measurement failed numerical or backend validation.",
+    "not_measured": "No complete validated measurement is available.",
+}
 GROUP_LABELS = {"A1": "Shape", "A2": "Edge count", "A3": "Truncated m", "A4": "Non-uniform irreps"}
 METHODS = {"naive", "uniform_1d", "fused_tp", "indexed_linear"}
 DESCRIPTORS = {"escn_tp", "escn_tp_compact"}
@@ -560,19 +572,52 @@ def model_rows(raw):
             yield from model_rows(row.get("result", row))
 
 
-def model_evidence(raw):
-    if raw.get("status") not in ("completed", "complete", "passed"):
+def model_identity(source):
+    model = MODEL_ALIASES.get(source["model"], source["model"])
+    head = source["head"]
+    if model not in MODEL_LABELS or head not in ("onsite", "hopping"):
+        raise ValueError("Unknown model or head")
+    return model, head
+
+
+def unavailable_model_case(source, raw):
+    model, head = model_identity(source)
+    state = source.get("status")
+    if state not in ("failed", "unmeasured"):
+        raise ValueError("Unavailable model cases must distinguish failed from unmeasured")
+    reason_code = source.get("reason_code", "runtime_error" if state == "failed" else "not_measured")
+    if reason_code not in UNAVAILABLE_REASONS or ((state == "unmeasured") != (reason_code == "not_measured")):
+        raise ValueError("Unavailable model status disagrees with its reason code")
+    evidence = source.get("raw_evidence_sha256", {})
+    if not isinstance(evidence, dict) or any(
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", key)
+            or not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for key, value in evidence.items()):
+        raise ValueError("Unavailable model evidence needs safe labels and SHA256 digests")
+    recorded = row_provenance(source, raw)
+    if state == "failed" and (not evidence or task_key(source, raw) is None
+                              or not {"SO2CUDA", "DeePTB"} <= set(recorded["source_commits"])):
+        raise ValueError("A failed model table needs its task identity, source commits and raw evidence digests")
+    return {"model": model, "head": head, "status": state, "reason_code": reason_code,
+            "reason": UNAVAILABLE_REASONS[reason_code], "raw_evidence_sha256": evidence, **recorded}
+
+
+def model_evidence(raw, *, allow_incomplete=False):
+    incomplete = raw.get("status") == "incomplete"
+    if raw.get("status") not in ("completed", "complete", "passed") and not (allow_incomplete and incomplete):
         raise ValueError("Model measurement suite has not completed")
+    if raw.get("unavailable_cases") and not (allow_incomplete and incomplete):
+        raise ValueError("Unavailable model tables require explicit incomplete publication")
     source_rows = list(model_rows(raw))
-    check_table_sessions(source_rows, raw, operator=False)
+    unavailable_sources = raw.get("unavailable_cases", []) if incomplete else []
+    unavailable = [unavailable_model_case(source, raw) for source in unavailable_sources]
+    attempted = source_rows + [source for source in unavailable_sources if task_key(source, raw) is not None]
+    check_table_sessions(attempted, raw, operator=False)
     cases = []
     for source in source_rows:
         if source.get("status", "completed") not in ("completed", "complete", "passed"):
             raise ValueError("A model/head measurement has not completed")
-        model = {"unitb_slem": "slem", "UniTB-SLEM": "slem", "UniTB-dense": "dense", "UniTB": "unitb"}.get(source["model"], source["model"])
-        head = source["head"]
-        if model not in MODEL_LABELS or head not in ("onsite", "hopping"):
-            raise ValueError("Unknown model or head")
+        model, head = model_identity(source)
         hardware(source if source.get("gpu") or source.get("provenance", {}).get("gpu") else raw)
         require_precision(source if "precision" in source else raw)
         warmup = number(source.get("warmup_steps", source.get("warmup", raw.get("warmup_steps"))))
@@ -611,14 +656,45 @@ def model_evidence(raw):
                 raise ValueError("Every successful backend must use the fast HybridMuon path")
         cases.append(row)
     expected = {(model, head) for model in MODEL_LABELS for head in ("onsite", "hopping")}
-    actual = [(r["model"], r["head"]) for r in cases]
+    actual = [(r["model"], r["head"]) for r in cases + unavailable]
     if set(actual) != expected or len(actual) != len(expected):
         raise ValueError("Real-batch table needs each of three models and two heads exactly once")
-    tables = table_source_commits(cases, raw, operator=False)
+    for name in MODEL_LABELS:
+        if sum(row["model"] == name for row in cases) not in (0, 2):
+            raise ValueError("A model table must validate both heads in the same task or disclose both as unavailable")
+    if incomplete and not unavailable:
+        raise ValueError("An incomplete model suite must identify unavailable tables")
+    pinned = cases + [row for row in unavailable if "SO2CUDA" in row["source_commits"]]
+    tables = table_source_commits(pinned, raw, operator=False)
     return {"schema": "so2cuda-public-real-batch-benchmarks-v2", "hardware": "NVIDIA H200", "precision": "FP32",
             "tf32": False, "optimizer": "HybridMuon", "optimizer_mode": "fast", "batch_size_limit": 32,
             **provenance(raw), "source_commits": common_source_commits(tables), "table_source_commits": tables,
-            "cases": sorted(cases, key=lambda r: (list(MODEL_LABELS).index(r["model"]), r["head"] == "hopping"))}
+            "cases": sorted(cases, key=lambda r: (list(MODEL_LABELS).index(r["model"]), r["head"] == "hopping")),
+            **({"status": "incomplete", "unavailable_cases": unavailable} if incomplete else {})}
+
+
+def model_equivalence_evidence(raw, model):
+    if model.get("status") != "incomplete":
+        return equivalence_evidence(raw)
+    if raw.get("status") != "incomplete":
+        raise ValueError("Incomplete model timings need equivalence scoped to the available tables")
+    expected = {(row["model"], row["head"]) for row in model["cases"]}
+    cases = []
+    for source in raw.get("cases", []):
+        name, head = model_identity(source)
+        cases.append({"model": name, "head": head, **equivalence_evidence(source["equivalence"])})
+    actual = [(row["model"], row["head"]) for row in cases]
+    if set(actual) != expected or len(actual) != len(expected):
+        raise ValueError("Model equivalence must cover exactly the validated model/head timings")
+    expected_unavailable = {(row["model"], row["head"], row["status"]) for row in model["unavailable_cases"]}
+    unavailable = [{"model": model_identity(row)[0], "head": row["head"], "status": row["status"]}
+                   for row in raw.get("unavailable_cases", [])]
+    actual_unavailable = [(row["model"], row["head"], row["status"]) for row in unavailable]
+    if set(actual_unavailable) != expected_unavailable or len(actual_unavailable) != len(expected_unavailable):
+        raise ValueError("Unavailable model equivalence must match the unavailable timing tables")
+    return {"schema": "so2cuda-public-model-equivalence-v1", "status": "incomplete", "all_passed": False,
+            "metric_count": sum(row["metric_count"] for row in cases), "cases": cases,
+            "unavailable_cases": unavailable}
 
 
 def equivalence_evidence(raw, *, require_pass=True):
@@ -749,6 +825,15 @@ def model_tables(report):
     lines = []
     for model, label in MODEL_LABELS.items():
         rows = [row for row in report["cases"] if row["model"] == model]
+        unavailable = [row for row in report.get("unavailable_cases", []) if row["model"] == model]
+        if unavailable:
+            lines.extend(["**" + label + "**", "", "| Head | Measurement status | Reason |",
+                          "|---|---|---|"])
+            for row in unavailable:
+                marker = "Failed" if row["status"] == "failed" else "Not measured"
+                lines.append(f'| {row["head"].capitalize()} | {marker} | {row["reason"]} |')
+            lines.append("")
+            continue
         lines.extend(["**" + label + "**", "",
                       "| Head | Mean structures | Mean directed edges | " + " | ".join(LABELS[n] + " step ms" + (" (ratio)" if n != "so2cuda" else "") + " | " + LABELS[n] + " peak GiB" for n in MODEL_COLUMNS) + " |",
                       "|---|---:|---:|" + "---:|" * (2 * len(MODEL_COLUMNS))])
@@ -761,6 +846,8 @@ def model_tables(report):
                           memory_cell(impl["step"]) if impl["status"] == "passed" else ("OOM" if impl["status"] == "oom" else "N/A")]
             lines.append(f'| {row["head"].capitalize()} | {stream["mean_structures"]:.2f} | {stream["mean_edges"]:,.1f} | ' + " | ".join(cells) + " |")
         lines.append("")
+    if not report["cases"]:
+        return "\n".join(lines)
     lines.extend(["<details>", "<summary>Step quartiles and forward + backward timing without the optimizer</summary>", "",
                   "| Model | Head | Backend | Step ms (Q1–Q3) | Forward + backward ms (Q1–Q3) | Peak allocated GiB |", "|---|---|---|---:|---:|---:|"])
     for row in report["cases"]:
@@ -788,11 +875,24 @@ def so2cuda_version_sentence(operator, model):
     for group in GROUP_LABELS:
         sha = operator["table_source_commits"][group]["SO2CUDA"]
         versions.setdefault(sha, []).append(group)
+    measured_models = {row["model"] for row in model["cases"]}
     for name, label in MODEL_LABELS.items():
+        if name not in measured_models:
+            continue
         sha = model["table_source_commits"][name]["SO2CUDA"]
         versions.setdefault(sha, []).append(label)
     def commit_link(sha):
         return f"[`{sha[:8]}`](https://github.com/Franklalalala/SO2CUDA/tree/{sha})"
+    uniform_shas = {operator["table_source_commits"][group]["SO2CUDA"] for group in ("A1", "A2", "A3")}
+    if uniform_shas == {RELEASE_SHA} and set(versions) <= UNCHANGED_ROUTE_SHAS | {RELEASE_SHA}:
+        other = [(sha, labels) for sha, labels in versions.items() if sha != RELEASE_SHA]
+        prefix = "The uniform operator tables use SO2CUDA 0.3.2 source at " + commit_link(RELEASE_SHA)
+        if not other:
+            return prefix + ", as do all other measured tables."
+        labels = {"A4": "the non-uniform operator table"}
+        parts = [commit_link(sha) + " for " + ", ".join(labels.get(name, name) for name in names)
+                 for sha, names in other]
+        return prefix + "; the other measured tables use " + "; ".join(parts) + ", which execute the same kernels as 0.3.2 on these routes."
     if len(versions) == 1:
         return "All operator and model tables use SO2CUDA commit " + commit_link(next(iter(versions))) + "."
     parts = [commit_link(sha) + " for " + ", ".join(labels) for sha, labels in versions.items()]
@@ -801,7 +901,7 @@ def so2cuda_version_sentence(operator, model):
 
 def render(operator, model, equiv_op, equiv_model):
     op_warmup, op_iterations = protocol(operator["cases"])
-    model_warmup, model_iterations = protocol(model["cases"])
+    model_warmup, model_iterations = protocol(model["cases"]) if model["cases"] else (None, None)
     cueq_versions = {row["implementations"]["cueq"]["version"] for row in operator["cases"]
                      if "version" in row["implementations"]["cueq"]}
     if operator["versions"].get("cuequivariance"):
@@ -825,6 +925,23 @@ def render(operator, model, equiv_op, equiv_model):
         label = config_label(config)
         if label not in {x[0] for x in configurations}:
             configurations.append((label, config["irreps_in"], config["irreps_out"]))
+    model_protocol = (
+        f"For each published model and head, all backends use the same structures in the same order, with {model_warmup} warmup steps and {model_iterations} measured steps on NVIDIA H200. "
+        if model["cases"] else "No complete validated real-batch model table is available; no model timing or speedup is reported. ")
+    model_protocol += (
+        "We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, "
+        "[our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). "
+        "Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. "
+        "Published timing tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. "
+        "Forward + backward timing excluding the optimizer appears in the details.")
+    if model.get("status") == "incomplete":
+        model_protocol += " Failed or unmeasured tables are disclosed below; their raw evidence digests are retained in the public JSON."
+    validation_sentence = (
+        "For each published timing table, the first-step loss and parameter gradients are compared on the same batch within FP32 rounding tolerance, "
+        "and dispatch checks verify that the pure PyTorch and cuEquivariance routes do not call SO2CUDA. "
+        if model["cases"] else "Formal real-batch model equivalence is unavailable for these tables. ")
+    if model.get("status") == "incomplete" and model["cases"]:
+        validation_sentence += "No equivalence pass is claimed for the unavailable tables. "
     lines = [BEGIN, "## Performance", "", "### 1. SO(2) tensor product operator", "",
              "The edge operator rotates features into the edge frame, applies a shared linear map for each |m|, and rotates back:", "",
              r"$$y_e = D(R_e)^{\top}\,\mathcal{L}_W\!\left(D(R_e)\,x_e\right).$$", "",
@@ -860,12 +977,12 @@ def render(operator, model, equiv_op, equiv_model):
                   "python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup 5 --iterations 20" +
                   (" --cueq-choice escn_tp_compact,naive,pytorch" if fixed_choice else "") + " --json operator.json",
                   "```", "", "### 2. UniTB models on real training batches", "",
-                  "UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. Both onsite and hopping heads use the production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; the tables report the measured mean structure and directed-edge counts for each fixed batch stream.", "",
-                  f"For each model and head, all backends use the same structures in the same order, with {model_warmup} warmup steps and {model_iterations} measured steps on NVIDIA H200. We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, [our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. The main tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. Forward + backward timing excluding the optimizer appears in the details.", "",
-                  f"The measured DeePTB source is pinned to [commit `{DEEPTB_SHA[:7]}`](https://github.com/Franklalalala/DeePTB/tree/{DEEPTB_SHA}); full source commits and software versions are recorded in the public JSON.", "",
+                  "UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. The comparison uses both onsite and hopping production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; published timing tables report the measured mean structure and directed-edge counts for each fixed batch stream.", "",
+                  model_protocol, "",
+                  f"The DeePTB source is pinned to [commit `{DEEPTB_SHA[:7]}`](https://github.com/Franklalalala/DeePTB/tree/{DEEPTB_SHA}); full source commits and software versions are recorded in the public JSON.", "",
                   model_tables(model),
                   "EquiformerV3 is N/A for all three complete models because each contains non-uniform SO(2) layers, including UniTB-dense's final output layers.", "",
-                  "The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). The first-step loss and parameter gradients are compared on the same batch within FP32 rounding tolerance, and dispatch checks verify that the pure PyTorch and cuEquivariance routes do not call SO2CUDA. See [model timings](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).", "",
+                  "The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). " + validation_sentence + "See [model measurement records](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).", "",
                   "The training dataset is not public. Synthetic periodic structures provide a runnable comparison of relative timing; they are used only for timing and do not reproduce the real-batch measurements, physical priors, or prediction accuracy:", "", "```bash",
                   "pip install 'git+https://github.com/Franklalalala/DeePTB.git@1006-stable'", "pip install -e .",
                   "python examples/deeptb_speed_test.py --model all --backend both --edges 20000 --json synthetic_so2cuda.json",
@@ -884,7 +1001,9 @@ def replace_section(readme, section):
 
 def verify_sources(operator, model):
     op_tables = table_source_commits(operator["cases"], operator, operator=True)
-    model_tables = table_source_commits(model["cases"], model, operator=False)
+    pinned_models = model["cases"] + [row for row in model.get("unavailable_cases", [])
+                                      if "SO2CUDA" in row["source_commits"]]
+    model_tables = table_source_commits(pinned_models, model, operator=False)
     for commits in op_tables.values():
         if set(commits) != {"SO2CUDA", "DeePTB", "EquiformerV3"}:
             raise ValueError("Every operator table must pin SO2CUDA, DeePTB, and EquiformerV3")
@@ -906,6 +1025,8 @@ def main():
     parser.add_argument("--model-json", type=Path, required=True)
     parser.add_argument("--equiv-operator-json", type=Path, required=True)
     parser.add_argument("--equiv-model-json", type=Path, required=True)
+    parser.add_argument("--allow-incomplete-models", action="store_true",
+                        help="Publish only validated whole model tables and explicitly disclose failed or unmeasured tables")
     parser.add_argument("--cueq-selection-json", type=Path,
                         help="Original full 12-configuration cuEquivariance scan (otherwise use the aggregate's embedded scan)")
     root = Path(__file__).resolve().parents[1]
@@ -919,10 +1040,10 @@ def main():
     raw_operator = load(args.operator_json)
     operator = operator_evidence(raw_operator)
     selection_scan = selection_scan_artifact(raw_operator, args.cueq_selection_json)
-    model = model_evidence(load(args.model_json))
+    model = model_evidence(load(args.model_json), allow_incomplete=args.allow_incomplete_models)
     verify_sources(operator, model)
     equiv_op = equivalence_evidence(load(args.equiv_operator_json))
-    equiv_model = equivalence_evidence(load(args.equiv_model_json))
+    equiv_model = model_equivalence_evidence(load(args.equiv_model_json), model)
     inputs = {"operator": digest(args.operator_json), "model": digest(args.model_json),
               "equiv_operator": digest(args.equiv_operator_json), "equiv_model": digest(args.equiv_model_json)}
     if selection_scan is not None:

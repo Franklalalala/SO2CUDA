@@ -6,7 +6,7 @@
 - Preserve autograd tensor-version checks and respect device shared-memory limits in sandwich operations.
 - Provide uniform and non-uniform SO(2) operator grids, with eager and compiled EquiformerV3, cuEquivariance, and our pure PyTorch reference implementation.
 - Compare UniTB-dense, UniTB, and UniTB-SLEM on the same real training-batch streams for both onsite and hopping heads, using the same HybridMuon optimizer path across backends.
-- Generate the English README performance tables and public numerical evidence from measurement JSON, including timing quartiles, peak memory, unsupported configurations, and out-of-memory results.
+- Generate the English README performance tables and public numerical evidence from measurement JSON, including timing quartiles, peak memory, unsupported configurations, out-of-memory results, and explicit disclosure of unavailable whole model tables.
 - Provide a complete tensor-only SO(2) example with irreps, edge vectors, trainable weights, and input/weight autograd.
 - Document installation, DeePTB integration, supported inputs, reference fallback, and build settings in English.
 

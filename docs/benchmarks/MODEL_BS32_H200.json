@@ -1,0 +1,115 @@
+{
+  "schema": "so2cuda-public-real-batch-benchmarks-v2",
+  "hardware": "NVIDIA H200",
+  "precision": "FP32",
+  "tf32": false,
+  "optimizer": "HybridMuon",
+  "optimizer_mode": "fast",
+  "batch_size_limit": 32,
+  "source_commits": {},
+  "versions": {
+    "cuequivariance": "0.12.0"
+  },
+  "table_source_commits": {},
+  "cases": [],
+  "status": "incomplete",
+  "unavailable_cases": [
+    {
+      "model": "dense",
+      "head": "onsite",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    },
+    {
+      "model": "dense",
+      "head": "hopping",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    },
+    {
+      "model": "unitb",
+      "head": "onsite",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    },
+    {
+      "model": "unitb",
+      "head": "hopping",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    },
+    {
+      "model": "slem",
+      "head": "onsite",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    },
+    {
+      "model": "slem",
+      "head": "hopping",
+      "status": "unmeasured",
+      "reason_code": "not_measured",
+      "reason": "No complete validated measurement is available.",
+      "raw_evidence_sha256": {},
+      "source_commits": {
+        "DeePTB": "8d5a0dcda30547f83869c292d48fab5df6eec722",
+        "EquiformerV3": "a7300c58df683dc99cb48027d5bfd4c887486c48"
+      },
+      "versions": {
+        "cuequivariance": "0.12.0"
+      }
+    }
+  ],
+  "input_sha256": {
+    "operator": "ed32b8117a08ba84252ef25b96af22dc77d342e2d5a80e125a95e029ad3b40d6",
+    "model": "2d1d02ec9fea1aa20badfca4b5c760a7874425ec571294548ecbf739cb3415ce",
+    "equiv_operator": "6955bed143adceec46add3e9db6ddea2bf1041a3214bd8006cc76bd9bd089a40",
+    "equiv_model": "5a3d2fa012d0f8822b7b9a31150813616ba79bf307848e257607ef3d17b5ed07",
+    "cueq_selection_scan": "b5686af9bed300292d466ee070b26c5d967aa9efb3f88ee3523fffb40213390e"
+  }
+}

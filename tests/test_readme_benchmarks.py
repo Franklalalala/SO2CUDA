@@ -193,3 +193,115 @@ def test_cli_keeps_scan_and_reproduces_all_artifacts(reports, tmp_path):
     (tmp_path / "public/CUEQ_SELECTION_SCAN.json").write_text("{}")
     result = subprocess.run(command + ["--check"], capture_output=True, text=True)
     assert result.returncode != 0 and "CUEQ_SELECTION_SCAN.json" in result.stderr
+
+
+def incomplete_models(raw, missing=("dense", "unitb", "slem")):
+    raw = deepcopy(raw)
+    unavailable = []
+    for row in raw["cases"]:
+        if row["model"] in missing:
+            unavailable.append({key: row[key] for key in ("model", "head", "task_id", "source_commits")})
+            unavailable[-1].update(status="failed", reason_code="progress_timeout",
+                                   reason="Failure in /private/account/runtime with host=private-machine",
+                                   raw_evidence_sha256={"RESULT.json": "d" * 64})
+    raw.update(status="incomplete", unavailable_cases=unavailable,
+               cases=[row for row in raw["cases"] if row["model"] not in missing])
+    equivalence = {"status": "incomplete", "cases": [
+        {"model": row["model"], "head": row["head"], "equivalence": deepcopy(EQUIVALENCE)} for row in raw["cases"]],
+        "unavailable_cases": [{key: row[key] for key in ("model", "head", "status")} for row in unavailable]}
+    return raw, equivalence
+
+
+def test_incomplete_publication_requires_explicit_option_and_keeps_failure(reports):
+    raw, equiv = incomplete_models(reports[1])
+    with pytest.raises(ValueError, match="has not completed"):
+        gen.model_evidence(raw)
+    public = gen.model_evidence(raw, allow_incomplete=True)
+    assert not public["cases"] and len(public["unavailable_cases"]) == 6
+    assert all(row["status"] == "failed" for row in public["unavailable_cases"])
+    assert public["unavailable_cases"][0]["raw_evidence_sha256"] == {"RESULT.json": "d" * 64}
+    assert "private" not in json.dumps(public) and "dense-task" not in json.dumps(public)
+    validation = gen.model_equivalence_evidence(equiv, public)
+    assert validation["all_passed"] is False and validation["metric_count"] == 0
+    section = gen.render(gen.operator_evidence(reports[0]), public, EQUIVALENCE, validation)
+    assert "No complete validated real-batch model table is available" in section
+    assert "Formal real-batch model equivalence is unavailable" in section
+    assert "| Onsite | Failed |" in section
+    assert "None warmup" not in section
+
+
+def test_optional_publication_rejects_half_model_table(reports):
+    raw, _ = incomplete_models(reports[1], ("dense",))
+    raw["unavailable_cases"] = [row for row in raw["unavailable_cases"] if row["head"] == "hopping"]
+    raw["cases"].append(deepcopy(reports[1]["cases"][0]))
+    with pytest.raises(ValueError, match="both heads"):
+        gen.model_evidence(raw, allow_incomplete=True)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda raw: raw["unavailable_cases"][0].update(raw_evidence_sha256={}),
+    lambda raw: raw["unavailable_cases"][0].update(raw_evidence_sha256={"/private/RESULT.json": "d" * 64}),
+    lambda raw: raw["unavailable_cases"][0].update(status="N/A"),
+    lambda raw: raw["unavailable_cases"][0].pop("task_id"),
+])
+def test_unavailable_failure_requires_evidence_not_na(reports, mutation):
+    raw, _ = incomplete_models(reports[1])
+    mutation(raw)
+    with pytest.raises(ValueError):
+        gen.model_evidence(raw, allow_incomplete=True)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda row: row["backends"]["so2cuda"].update(status="failed"),
+    lambda row: row["backends"]["cueq"].update(batch_stream_sha256="e" * 64),
+    lambda row: row["backends"]["naive"].update(optimizer="other"),
+    lambda row: row["backends"]["so2cuda"]["step"].update(median_ms=2.),
+])
+def test_optional_publication_keeps_success_validation_strict(reports, mutation):
+    raw, _ = incomplete_models(reports[1], ("dense", "unitb"))
+    mutation(raw["cases"][0])
+    with pytest.raises(ValueError):
+        gen.model_evidence(raw, allow_incomplete=True)
+
+
+def test_partial_equivalence_is_scoped_to_validated_tables(reports):
+    raw, equiv = incomplete_models(reports[1], ("dense", "unitb"))
+    raw["cases"][0]["backends"]["cueq"] = {"status": "oom"}
+    raw["cases"][1]["backends"]["cueq"] = {"status": "N/A", "reason": "Unsupported configuration"}
+    public = gen.model_evidence(raw, allow_incomplete=True)
+    assert public["cases"][0]["implementations"]["cueq"]["status"] == "oom"
+    assert public["cases"][1]["implementations"]["cueq"]["status"] == "N/A"
+    validation = gen.model_equivalence_evidence(equiv, public)
+    assert validation["metric_count"] == 2 and not validation["all_passed"]
+    equiv["cases"].append({"model": "dense", "head": "onsite", "equivalence": EQUIVALENCE})
+    with pytest.raises(ValueError, match="exactly the validated"):
+        gen.model_equivalence_evidence(equiv, public)
+
+
+def test_release_sentence_pins_actual_measurements_and_shared_kernels(reports):
+    operator, models = deepcopy(reports)
+    for row in operator["cases"]:
+        sha = next(iter(gen.UNCHANGED_ROUTE_SHAS)) if row["groups"] == ["A4"] else gen.RELEASE_SHA
+        row["source_commits"] = {**COMMITS, "SO2CUDA": sha}
+    models, _ = incomplete_models(models)
+    sentence = gen.so2cuda_version_sentence(gen.operator_evidence(operator),
+                                          gen.model_evidence(models, allow_incomplete=True))
+    assert "SO2CUDA 0.3.2 source" in sentence and "same kernels as 0.3.2" in sentence
+    assert "UniTB" not in sentence
+
+
+def test_incomplete_cli_generation_is_reproducible(reports, tmp_path):
+    model, equivalent = incomplete_models(reports[1])
+    for name, value in (("operator", reports[0]), ("model", model),
+                        ("equivalence", EQUIVALENCE), ("model_equivalence", equivalent)):
+        (tmp_path / (name + ".json")).write_text(json.dumps(value))
+    readme = tmp_path / "README.md"
+    readme.write_text(gen.BEGIN + "\n" + gen.END + "\n")
+    command = [sys.executable, str(Path(gen.__file__)), "--operator-json", str(tmp_path / "operator.json"),
+               "--model-json", str(tmp_path / "model.json"), "--equiv-operator-json", str(tmp_path / "equivalence.json"),
+               "--equiv-model-json", str(tmp_path / "model_equivalence.json"), "--readme", str(readme),
+               "--docs-dir", str(tmp_path / "public"), "--allow-incomplete-models"]
+    subprocess.run(command + ["--write-readme"], check=True, capture_output=True)
+    subprocess.run(command + ["--check"], check=True, capture_output=True)
+    public = json.loads((tmp_path / "public/EQUIV_MODEL.json").read_text())
+    assert public["status"] == "incomplete" and not public["all_passed"]

@@ -1,253 +1,347 @@
 <!-- SO2CUDA_BENCHMARKS_BEGIN -->
-## 性能测试
+## Performance
 
-### 1. SO(2) 张量积算子
+### 1. SO(2) tensor product operator
 
-边上的 SO(2) 卷积先将输入旋转到边的主轴，做按 |m| 分组的共享线性变换，再旋转回原坐标：
+The edge operator rotates features into the edge frame, applies a shared linear map for each |m|, and rotates back:
 
-$$y_e=D(R_e)^\top\,\mathcal{L}_W\!\left(D(R_e)x_e\right).$$
+$$y_e = D(R_e)^{\top}\,\mathcal{L}_W\!\left(D(R_e)\,x_e\right).$$
 
-`m=0` 使用实线性变换，`m>0` 使用 2×2 复结构；边之间共享权重，算子测试不含径向调制。
+The m=0 block is real; each positive m uses a complex linear map represented by real weights. Weights are shared across edges; the operator benchmark excludes radial modulation.
 
-EquiformerV3 原版本身就是显式旋转：把系数排列并入稠密 Wigner 矩阵后用 `bmm` 旋转，再做逐 m 线性和逆旋转。SO2CUDA 与它数学相同，差别在 indexed sandwich 的实现：CUDA kernel 以（边，通道）为单位，把输入的各 ℓ 分量旋入每个 m 一块的缓冲；每块做一次 GEMM，m>0 块的 2×2 复结构写成一个实数块权重；再从各块旋回并写出特征。反向由同样的 kernel 与 GEMM 完成。我们的纯 PyTorch 实现按 DeePTB 上游写法逐 l 旋转、按 m 选取特征后做线性层。
+**Uniform irreps** have the same number of channels at every l, as in the usual eSCN, EquiformerV2, and EquiformerV3 layouts. **Non-uniform irreps** have different channel counts across l. SO2CUDA and our pure PyTorch implementation support both, including unequal input and output irreps. The original EquiformerV3 layer requires uniform channels on each side; non-uniform cases are N/A without padding. cuEquivariance support depends on the descriptor and method; unsupported combinations retain their reason in the JSON.
 
-- SO2CUDA：通用入口 `true_dense_pairs(..., include_m0=True)`，一次调用算完整层（含 m=0）。其他公开入口（`dense_pairs`、单专家的 `activation_forward`）执行同一套 kernel，各入口逐配置的计时见 [docs/operator-benchmark.md](docs/operator-benchmark.md#各入口计时)。
-- 我们自己的纯 PyTorch 实现：按 DeePTB 上游 `SO2_Linear` 写法实现的算子，见 [operator_baselines.py](examples/operator_baselines.py)。
-- EquiformerV3 原版：[固定提交](https://github.com/atomicarchitects/equiformer_v3/tree/a7300c58df683dc99cb48027d5bfd4c887486c48) 的 `SO3Rotation` ＋ `SO2Linear`（eager，源码不改），`fc_m0` 的 bias 置零；另列同一实现经 `torch.compile` 后的时间（各 ℓ 通道数一致的 14 个配置）。
-- cuEquivariance 0.12.0：`SO3` irreps 的 `escn_tp_compact` 描述符由 `SegmentedPolynomial` 执行，method 为 `naive`，旋转方式为 `pytorch`；这一组合在全部描述符／method／旋转组合中前向＋反向最快且数值正确。
+- **SO2CUDA:** the public `true_dense_pairs(..., include_m0=True)` interface, with default settings, computes the complete layer.
+- **Our pure PyTorch:** our implementation of [DeePTB upstream `SO2_Linear`](https://github.com/deepmodeling/DeePTB/blob/1dcc7f61480c373870cd5bad1d4000ac80757ff5/dptb/nn/tensor_product.py), in [operator_baselines.py](examples/operator_baselines.py). It is authored here from that computation pattern.
+- **EquiformerV3:** the original `SO3Rotation` and `SO2Linear` at [commit `a7300c58`](https://github.com/atomicarchitects/equiformer_v3/tree/a7300c58df683dc99cb48027d5bfd4c887486c48), with m=0 bias set to zero. Eager and `torch.compile(dynamic=True)` are measured separately; compilation is outside steady-state timing.
+- **cuEquivariance 0.12.0:** `SegmentedPolynomial` with `escn_tp_compact`, method `naive`, and precomputed PyTorch Wigner `bmm` rotation. All 16 descriptor/method/rotation combinations were compared on 12 uniform configurations; this combination was the fastest numerically correct choice in every configuration. The complete scan is retained in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json), and the tables use this fixed choice.
 
-全部配置与实现在同一块 NVIDIA H200 上的同一次会话中测量，计时前后核验独占，严格 FP32、关闭 TF32；几何量按各实现的格式预先计算。各实现使用各自原生特征布局，布局转换在计时区外；峰值显存只保留当前实现的输入、参数和几何量。每路预热 5 次、计时 20 次。下表为前向＋输入和全部权重反向的 ms 中位数；括号内为该实现时间 ÷ SO2CUDA 时间：大于 1 表示 SO2CUDA 更快，小于 1 表示该实现更快。SO2CUDA 列均为 `true_dense_pairs(include_m0=True)`。
+Measurements use NVIDIA H200 in strict FP32 with TF32 disabled. The uniform operator tables use SO2CUDA 0.3.2 source at [`6bc05a7b`](https://github.com/Franklalalala/SO2CUDA/tree/6bc05a7b5135efc153dbb75bf7a20b949979adcf); the other measured tables use [`179faaaa`](https://github.com/Franklalalala/SO2CUDA/tree/179faaaabe269464fd7e0ad1a36926253bd08eb1) for the non-uniform operator table, which execute the same kernels as 0.3.2 on these routes. Geometry and feature-layout conversions are prepared before timing in each implementation's native format. Each implementation has 5 warmup iterations and 20 measured iterations. Each complete table comes from one card task. The main tables show forward + backward medians in ms, including input and weight gradients. Ratios are the comparison time divided by SO2CUDA time: above 1 means SO2CUDA is faster; below 1 means the comparison is faster. Peak allocated memory includes that implementation's inputs, weights, geometry, saved activations, gradients, and workspace.
 
-- 与 EquiformerV3 原版相比：14 个配置中 SO2CUDA 都更快，对方用时为 SO2CUDA 的 1.21–2.03 倍。
-- 与 EquiformerV3 + compile 相比：14 个配置中 SO2CUDA 都更快，对方用时为 SO2CUDA 的 1.05–1.39 倍。
-- 与我们的纯 PyTorch 实现相比：20 个配置中 SO2CUDA 都更快，对方用时为 SO2CUDA 的 5.38–14.71 倍。
-- 与 cuEquivariance 相比：20 个配置中 SO2CUDA 都更快，对方用时为 SO2CUDA 的 1.45–5.49 倍。
+#### 1.1 Uniform irreps
 
-**形状**
+**Shape**
 
-| 配置 | 有向边 | EquiformerV3 原版 ms（时间比） | EquiformerV3 + compile ms（时间比） | 我们的纯 PyTorch ms（时间比） | cuEquivariance ms（时间比） | SO2CUDA ms |
+| Configuration | Directed edges | SO2CUDA ms | Our pure PyTorch ms (ratio) | cuEquivariance ms (ratio) | EquiformerV3 ms (ratio) | EquiformerV3 + compile ms (ratio) |
 |---|---:|---:|---:|---:|---:|---:|
-| ℓ=2, C=32, m≤2 | 50,000 | 1.71（1.84×） | 1.28（1.38×） | 10.82（11.62×） | 3.93（4.22×） | 0.93 |
-| ℓ=2, C=64, m≤2 | 50,000 | 3.16（1.93×） | 2.28（1.39×） | 19.73（12.07×） | 4.33（2.65×） | 1.64 |
-| ℓ=2, C=128, m≤2 | 50,000 | 6.93（1.66×） | 5.20（1.24×） | 38.78（9.27×） | 7.87（1.88×） | 4.18 |
-| ℓ=4, C=32, m≤4 | 50,000 | 4.47（2.03×） | 2.74（1.24×） | 32.47（14.71×） | 7.62（3.45×） | 2.21 |
-| ℓ=4, C=64, m≤4 | 50,000 | 9.88（1.76×） | 6.54（1.17×） | 63.32（11.31×） | 12.88（2.30×） | 5.60 |
-| ℓ=4, C=128, m≤4 | 50,000 | 25.65（1.48×） | 19.06（1.10×） | 130.07（7.48×） | 30.65（1.76×） | 17.39 |
-| ℓ=6, C=32, m≤6 | 50,000 | 10.51（1.76×） | 6.53（1.09×） | 70.19（11.75×） | 16.13（2.70×） | 5.97 |
-| ℓ=6, C=64, m≤6 | 50,000 | 24.43（1.59×） | 16.69（1.09×） | 139.81（9.13×） | 33.32（2.18×） | 15.32 |
-| ℓ=6, C=128, m≤6 | 50,000 | 67.62（1.42×） | 52.28（1.10×） | 293.35（6.16×） | 83.90（1.76×） | 47.64 |
+| lmax=2, C=32, mmax=2 | 50,000 | 1.01 | 10.88 (10.80×) | 3.98 (3.94×) | 1.71 (1.70×) | 1.30 (1.29×) |
+| lmax=2, C=64, mmax=2 | 50,000 | 1.44 | 19.74 (13.75×) | 4.36 (3.04×) | 3.16 (2.20×) | 2.30 (1.60×) |
+| lmax=2, C=128, mmax=2 | 50,000 | 3.86 | 38.99 (10.11×) | 7.89 (2.04×) | 6.92 (1.79×) | 5.20 (1.35×) |
+| lmax=4, C=32, mmax=4 | 50,000 | 1.89 | 32.53 (17.23×) | 7.71 (4.08×) | 4.48 (2.37×) | 2.75 (1.46×) |
+| lmax=4, C=64, mmax=4 | 50,000 | 5.06 | 63.31 (12.50×) | 12.85 (2.54×) | 9.89 (1.95×) | 6.55 (1.29×) |
+| lmax=4, C=128, mmax=4 | 50,000 | 16.73 | 130.33 (7.79×) | 30.71 (1.84×) | 25.77 (1.54×) | 19.17 (1.15×) |
+| lmax=6, C=32, mmax=6 | 50,000 | 4.29 | 70.54 (16.45×) | 16.20 (3.78×) | 10.53 (2.45×) | 6.50 (1.52×) |
+| lmax=6, C=64, mmax=6 | 50,000 | 13.18 | 139.82 (10.61×) | 33.29 (2.52×) | 24.43 (1.85×) | 16.77 (1.27×) |
+| lmax=6, C=128, mmax=6 | 50,000 | 45.93 | 293.72 (6.40×) | 83.99 (1.83×) | 68.41 (1.49×) | 52.49 (1.14×) |
 
-**规模**
+**Edge count**
 
-| 配置 | 有向边 | EquiformerV3 原版 ms（时间比） | EquiformerV3 + compile ms（时间比） | 我们的纯 PyTorch ms（时间比） | cuEquivariance ms（时间比） | SO2CUDA ms |
+| Configuration | Directed edges | SO2CUDA ms | Our pure PyTorch ms (ratio) | cuEquivariance ms (ratio) | EquiformerV3 ms (ratio) | EquiformerV3 + compile ms (ratio) |
 |---|---:|---:|---:|---:|---:|---:|
-| ℓ=6, C=32, m≤6 | 20,000 | 4.66（1.74×） | 2.92（1.09×） | 30.86（11.54×） | 10.05（3.76×） | 2.67 |
-| ℓ=6, C=32, m≤6 | 50,000 | 10.51（1.76×） | 6.53（1.09×） | 70.19（11.75×） | 16.13（2.70×） | 5.97 |
-| ℓ=6, C=32, m≤6 | 130,000 | 26.20（1.76×） | 16.41（1.10×） | 167.47（11.27×） | 37.47（2.52×） | 14.86 |
-| ℓ=6, C=128, m≤6 | 20,000 | 27.40（1.39×） | 21.16（1.07×） | 120.59（6.10×） | 35.14（1.78×） | 19.76 |
-| ℓ=6, C=128, m≤6 | 50,000 | 67.62（1.42×） | 52.28（1.10×） | 293.35（6.16×） | 83.90（1.76×） | 47.64 |
-| ℓ=6, C=128, m≤6 | 130,000 | 177.86（1.40×） | 137.86（1.09×） | 727.30（5.72×） | 217.99（1.72×） | 127.06 |
+| lmax=6, C=32, mmax=6 | 20,000 | 2.06 | 31.05 (15.06×) | 10.28 (4.99×) | 4.72 (2.29×) | 2.93 (1.42×) |
+| lmax=6, C=32, mmax=6 | 50,000 | 4.29 | 70.54 (16.45×) | 16.20 (3.78×) | 10.53 (2.45×) | 6.50 (1.52×) |
+| lmax=6, C=32, mmax=6 | 130,000 | 10.86 | 167.75 (15.45×) | 37.54 (3.46×) | 26.23 (2.42×) | 16.50 (1.52×) |
+| lmax=6, C=128, mmax=6 | 20,000 | 18.92 | 120.93 (6.39×) | 35.17 (1.86×) | 27.47 (1.45×) | 21.23 (1.12×) |
+| lmax=6, C=128, mmax=6 | 50,000 | 45.93 | 293.72 (6.40×) | 83.99 (1.83×) | 68.41 (1.49×) | 52.49 (1.14×) |
+| lmax=6, C=128, mmax=6 | 130,000 | 122.57 | 727.66 (5.94×) | 218.58 (1.78×) | 176.86 (1.44×) | 138.65 (1.13×) |
 
-**一般 irreps**
+**Truncated m**
 
-| 配置 | 有向边 | EquiformerV3 原版 ms（时间比） | EquiformerV3 + compile ms（时间比） | 我们的纯 PyTorch ms（时间比） | cuEquivariance ms（时间比） | SO2CUDA ms |
+| Configuration | Directed edges | SO2CUDA ms | Our pure PyTorch ms (ratio) | cuEquivariance ms (ratio) | EquiformerV3 ms (ratio) | EquiformerV3 + compile ms (ratio) |
 |---|---:|---:|---:|---:|---:|---:|
-| V 形通道 | 20,000 | N/A | N/A | 30.78（8.32×） | 11.40（3.08×） | 3.70 |
-| V 形通道 | 50,000 | N/A | N/A | 69.77（7.99×） | 19.55（2.24×） | 8.73 |
-| V 形通道 | 130,000 | N/A | N/A | 167.12（7.55×） | 47.89（2.16×） | 22.14 |
-| 输入／输出 irreps 不同 | 20,000 | N/A | N/A | 8.64（7.83×） | 6.06（5.49×） | 1.10 |
-| 输入／输出 irreps 不同 | 50,000 | N/A | N/A | 17.23（12.53×） | 6.24（4.54×） | 1.38 |
-| 输入／输出 irreps 不同 | 130,000 | N/A | N/A | 38.87（12.43×） | 9.94（3.18×） | 3.13 |
-
-**截断 m**
-
-| 配置 | 有向边 | EquiformerV3 原版 ms（时间比） | EquiformerV3 + compile ms（时间比） | 我们的纯 PyTorch ms（时间比） | cuEquivariance ms（时间比） | SO2CUDA ms |
-|---|---:|---:|---:|---:|---:|---:|
-| ℓ=6, C=128, m≤2 | 50,000 | 41.52（1.21×） | 36.19（1.05×） | 184.72（5.38×） | 49.92（1.45×） | 34.35 |
+| lmax=6, C=128, mmax=2 | 50,000 | 33.10 | 184.94 (5.59×) | 49.92 (1.51×) | 41.97 (1.27×) | 36.50 (1.10×) |
 
 <details>
-<summary>前向计时、四分位与峰值显存</summary>
+<summary>Forward timing, quartiles, peak memory, and cuEquivariance choices</summary>
 
-| 配置 | 有向边 | 实现 | 前向 ms（Q1–Q3） | 前向＋反向 ms（Q1–Q3） | 前向＋反向峰值 GiB |
-|---|---:|---|---:|---:|---:|
-| ℓ=2, C=32, m≤2 | 50,000 | EquiformerV3 原版 | 0.58（0.57–0.58） | 1.71（1.71–1.73） | 0.56 |
-| ℓ=2, C=32, m≤2 | 50,000 | EquiformerV3 + compile | 0.58（0.57–0.58） | 1.28（1.28–1.29） | 0.47 |
-| ℓ=2, C=32, m≤2 | 50,000 | 我们的纯 PyTorch | 1.71（1.70–1.71） | 10.82（10.81–10.87） | 0.56 |
-| ℓ=2, C=32, m≤2 | 50,000 | cuEquivariance | 1.36（1.34–1.37） | 3.93（3.93–3.95） | 0.48 |
-| ℓ=2, C=32, m≤2 | 50,000 | SO2CUDA | 0.42（0.41–0.42） | 0.93（0.93–0.94） | 0.44 |
-| ℓ=2, C=64, m≤2 | 50,000 | EquiformerV3 原版 | 1.06（1.06–1.06） | 3.16（3.15–3.16） | 1.02 |
-| ℓ=2, C=64, m≤2 | 50,000 | EquiformerV3 + compile | 1.04（1.04–1.05） | 2.28（2.27–2.28） | 0.84 |
-| ℓ=2, C=64, m≤2 | 50,000 | 我们的纯 PyTorch | 2.68（2.67–2.69） | 19.73（19.71–19.74） | 1.06 |
-| ℓ=2, C=64, m≤2 | 50,000 | cuEquivariance | 1.46（1.45–1.47） | 4.33（4.31–4.35） | 0.89 |
-| ℓ=2, C=64, m≤2 | 50,000 | SO2CUDA | 0.71（0.71–0.71） | 1.64（1.63–1.64） | 0.82 |
-| ℓ=2, C=128, m≤2 | 50,000 | EquiformerV3 原版 | 2.30（2.30–2.31） | 6.93（6.92–6.93） | 1.95 |
-| ℓ=2, C=128, m≤2 | 50,000 | EquiformerV3 + compile | 2.22（2.22–2.22） | 5.20（5.20–5.21） | 1.60 |
-| ℓ=2, C=128, m≤2 | 50,000 | 我们的纯 PyTorch | 5.01（5.01–5.02） | 38.78（38.77–38.82） | 2.05 |
-| ℓ=2, C=128, m≤2 | 50,000 | cuEquivariance | 2.49（2.49–2.49） | 7.87（7.87–7.88） | 1.70 |
-| ℓ=2, C=128, m≤2 | 50,000 | SO2CUDA | 1.66（1.66–1.66） | 4.18（4.18–4.19） | 1.58 |
-| ℓ=4, C=32, m≤4 | 50,000 | EquiformerV3 原版 | 1.24（1.24–1.25） | 4.47（4.47–4.47） | 1.48 |
-| ℓ=4, C=32, m≤4 | 50,000 | EquiformerV3 + compile | 1.20（1.20–1.21） | 2.74（2.74–2.74） | 1.22 |
-| ℓ=4, C=32, m≤4 | 50,000 | 我们的纯 PyTorch | 3.89（3.88–3.91） | 32.47（32.44–32.48） | 1.45 |
-| ℓ=4, C=32, m≤4 | 50,000 | cuEquivariance | 2.35（2.33–2.36） | 7.62（7.60–7.64） | 1.34 |
-| ℓ=4, C=32, m≤4 | 50,000 | SO2CUDA | 0.93（0.93–0.94） | 2.21（2.20–2.21） | 1.14 |
-| ℓ=4, C=64, m≤4 | 50,000 | EquiformerV3 原版 | 2.74（2.74–2.74） | 9.88（9.88–9.88） | 2.66 |
-| ℓ=4, C=64, m≤4 | 50,000 | EquiformerV3 + compile | 2.60（2.60–2.61） | 6.54（6.53–6.55） | 2.15 |
-| ℓ=4, C=64, m≤4 | 50,000 | 我们的纯 PyTorch | 7.10（7.09–7.11） | 63.32（63.31–63.38） | 2.80 |
-| ℓ=4, C=64, m≤4 | 50,000 | cuEquivariance | 3.14（3.13–3.14） | 12.88（12.88–12.90） | 2.50 |
-| ℓ=4, C=64, m≤4 | 50,000 | SO2CUDA | 2.22（2.21–2.22） | 5.60（5.59–5.61） | 2.19 |
-| ℓ=4, C=128, m≤4 | 50,000 | EquiformerV3 原版 | 7.44（7.42–7.57） | 25.65（25.62–25.71） | 5.02 |
-| ℓ=4, C=128, m≤4 | 50,000 | EquiformerV3 + compile | 7.10（7.09–7.14） | 19.06（19.05–19.09） | 4.00 |
-| ℓ=4, C=128, m≤4 | 50,000 | 我们的纯 PyTorch | 15.34（15.33–15.37） | 130.07（130.04–130.14） | 5.51 |
-| ℓ=4, C=128, m≤4 | 50,000 | cuEquivariance | 8.04（7.99–8.05） | 30.65（30.63–30.68） | 4.83 |
-| ℓ=4, C=128, m≤4 | 50,000 | SO2CUDA | 6.39（6.26–6.41） | 17.39（17.37–17.40） | 4.29 |
-| ℓ=6, C=32, m≤6 | 50,000 | EquiformerV3 原版 | 2.78（2.78–2.78） | 10.51（10.50–10.52） | 3.24 |
-| ℓ=6, C=32, m≤6 | 50,000 | EquiformerV3 + compile | 2.63（2.63–2.64） | 6.53（6.49–6.54） | 2.75 |
-| ℓ=6, C=32, m≤6 | 50,000 | 我们的纯 PyTorch | 7.31（7.29–7.32） | 70.19（70.16–70.22） | 2.79 |
-| ℓ=6, C=32, m≤6 | 50,000 | cuEquivariance | 3.59（3.58–3.61） | 16.13（16.11–16.14） | 2.80 |
-| ℓ=6, C=32, m≤6 | 50,000 | SO2CUDA | 2.54（2.54–2.54） | 5.97（5.97–5.99） | 2.20 |
-| ℓ=6, C=64, m≤6 | 50,000 | EquiformerV3 原版 | 6.69（6.66–6.74） | 24.43（24.43–24.46） | 5.53 |
-| ℓ=6, C=64, m≤6 | 50,000 | EquiformerV3 + compile | 6.32（6.27–6.34） | 16.69（16.61–16.82） | 4.55 |
-| ℓ=6, C=64, m≤6 | 50,000 | 我们的纯 PyTorch | 14.51（14.50–14.53） | 139.81（139.80–139.85） | 5.43 |
-| ℓ=6, C=64, m≤6 | 50,000 | cuEquivariance | 7.47（7.45–7.51） | 33.32（33.27–33.40） | 5.11 |
-| ℓ=6, C=64, m≤6 | 50,000 | SO2CUDA | 5.89（5.89–5.90） | 15.32（15.30–15.34） | 4.25 |
-| ℓ=6, C=128, m≤6 | 50,000 | EquiformerV3 原版 | 19.90（19.89–19.99） | 67.62（66.83–71.44） | 10.10 |
-| ℓ=6, C=128, m≤6 | 50,000 | EquiformerV3 + compile | 19.04（19.01–19.08） | 52.28（51.77–54.90） | 8.16 |
-| ℓ=6, C=128, m≤6 | 50,000 | 我们的纯 PyTorch | 34.13（34.11–34.18） | 293.35（293.29–293.55） | 10.72 |
-| ℓ=6, C=128, m≤6 | 50,000 | cuEquivariance | 20.91（20.90–20.93） | 83.90（83.61–84.58） | 9.74 |
-| ℓ=6, C=128, m≤6 | 50,000 | SO2CUDA | 17.14（17.02–17.24） | 47.64（47.21–48.46） | 8.40 |
-| ℓ=6, C=128, m≤2 | 50,000 | EquiformerV3 原版 | 13.57（13.50–13.58） | 41.52（41.26–43.94） | 7.90 |
-| ℓ=6, C=128, m≤2 | 50,000 | EquiformerV3 + compile | 13.10（13.08–13.13） | 36.19（35.65–39.22） | 6.59 |
-| ℓ=6, C=128, m≤2 | 50,000 | 我们的纯 PyTorch | 24.67（24.66–24.76） | 184.72（184.71–184.78） | 10.25 |
-| ℓ=6, C=128, m≤2 | 50,000 | cuEquivariance | 15.43（15.37–15.48） | 49.92（49.78–51.29） | 8.67 |
-| ℓ=6, C=128, m≤2 | 50,000 | SO2CUDA | 12.43（12.38–12.48） | 34.35（33.91–37.84） | 6.95 |
-| ℓ=6, C=32, m≤6 | 20,000 | EquiformerV3 原版 | 1.27（1.27–1.27） | 4.66（4.65–4.68） | 1.33 |
-| ℓ=6, C=32, m≤6 | 20,000 | EquiformerV3 + compile | 1.24（1.23–1.24） | 2.92（2.91–2.92） | 1.14 |
-| ℓ=6, C=32, m≤6 | 20,000 | 我们的纯 PyTorch | 4.05（4.05–4.08） | 30.86（30.85–30.88） | 1.15 |
-| ℓ=6, C=32, m≤6 | 20,000 | cuEquivariance | 3.11（3.10–3.13） | 10.05（10.03–10.06） | 1.16 |
-| ℓ=6, C=32, m≤6 | 20,000 | SO2CUDA | 1.14（1.13–1.14） | 2.67（2.67–2.68） | 0.92 |
-| ℓ=6, C=32, m≤6 | 130,000 | EquiformerV3 原版 | 6.95（6.94–6.99） | 26.20（26.19–26.22） | 8.32 |
-| ℓ=6, C=32, m≤6 | 130,000 | EquiformerV3 + compile | 6.51（6.44–6.54） | 16.41（16.34–16.46） | 7.05 |
-| ℓ=6, C=32, m≤6 | 130,000 | 我们的纯 PyTorch | 16.91（16.90–16.93） | 167.47（167.44–167.51） | 7.15 |
-| ℓ=6, C=32, m≤6 | 130,000 | cuEquivariance | 7.89（7.84–7.96） | 37.47（37.44–37.49） | 7.18 |
-| ℓ=6, C=32, m≤6 | 130,000 | SO2CUDA | 6.22（6.22–6.23） | 14.86（14.85–14.86） | 5.60 |
-| ℓ=6, C=128, m≤6 | 20,000 | EquiformerV3 原版 | 8.13（8.01–8.20） | 27.40（27.38–27.42） | 4.09 |
-| ℓ=6, C=128, m≤6 | 20,000 | EquiformerV3 + compile | 7.84（7.75–7.94） | 21.16（21.05–21.19） | 3.32 |
-| ℓ=6, C=128, m≤6 | 20,000 | 我们的纯 PyTorch | 14.67（14.65–14.69） | 120.59（120.56–120.62） | 4.34 |
-| ℓ=6, C=128, m≤6 | 20,000 | cuEquivariance | 8.95（8.94–8.95） | 35.14（35.13–35.38） | 3.97 |
-| ℓ=6, C=128, m≤6 | 20,000 | SO2CUDA | 7.15（7.14–7.26） | 19.76（19.67–19.80） | 3.44 |
-| ℓ=6, C=128, m≤6 | 130,000 | EquiformerV3 原版 | 51.81（51.57–54.03） | 177.86（175.77–179.02） | 26.14 |
-| ℓ=6, C=128, m≤6 | 130,000 | EquiformerV3 + compile | 49.51（49.38–52.40） | 137.86（135.52–141.15） | 21.07 |
-| ℓ=6, C=128, m≤6 | 130,000 | 我们的纯 PyTorch | 88.81（87.55–93.31） | 727.30（727.08–727.46） | 27.76 |
-| ℓ=6, C=128, m≤6 | 130,000 | cuEquivariance | 55.01（54.60–56.19） | 217.99（217.53–218.52） | 25.10 |
-| ℓ=6, C=128, m≤6 | 130,000 | SO2CUDA | 44.96（44.60–48.38） | 127.06（124.95–130.84） | 21.62 |
-| V 形通道 | 20,000 | 我们的纯 PyTorch | 4.16（4.15–4.25） | 30.78（30.77–30.80） | 1.15 |
-| V 形通道 | 20,000 | cuEquivariance | 3.72（3.71–3.74） | 11.40（11.38–11.41） | 1.02 |
-| V 形通道 | 20,000 | SO2CUDA | 1.62（1.61–1.62） | 3.70（3.69–3.70） | 0.92 |
-| V 形通道 | 50,000 | 我们的纯 PyTorch | 7.50（7.50–7.51） | 69.77（69.73–69.85） | 2.79 |
-| V 形通道 | 50,000 | cuEquivariance | 4.75（4.75–4.75） | 19.55（19.53–19.57） | 2.46 |
-| V 形通道 | 50,000 | SO2CUDA | 3.80（3.79–3.80） | 8.73（8.72–8.74） | 2.20 |
-| V 形通道 | 130,000 | 我们的纯 PyTorch | 17.60（17.58–17.61） | 167.12（167.09–167.21） | 7.14 |
-| V 形通道 | 130,000 | cuEquivariance | 11.93（11.93–11.94） | 47.89（47.88–47.90） | 6.29 |
-| V 形通道 | 130,000 | SO2CUDA | 9.59（9.59–9.60） | 22.14（22.13–22.16） | 5.60 |
-| 输入／输出 irreps 不同 | 20,000 | 我们的纯 PyTorch | 1.90（1.88–1.91） | 8.64（8.64–8.66） | 0.38 |
-| 输入／输出 irreps 不同 | 20,000 | cuEquivariance | 2.08（2.06–2.08） | 6.06（6.04–6.07） | 0.35 |
-| 输入／输出 irreps 不同 | 20,000 | SO2CUDA | 0.48（0.47–0.48） | 1.10（1.09–1.11） | 0.29 |
-| 输入／输出 irreps 不同 | 50,000 | 我们的纯 PyTorch | 2.62（2.61–2.63） | 17.23（17.21–17.24） | 0.85 |
-| 输入／输出 irreps 不同 | 50,000 | cuEquivariance | 2.29（2.27–2.30） | 6.24（6.23–6.25） | 0.78 |
-| 输入／输出 irreps 不同 | 50,000 | SO2CUDA | 0.65（0.65–0.66） | 1.38（1.36–1.66） | 0.62 |
-| 输入／输出 irreps 不同 | 130,000 | 我们的纯 PyTorch | 5.33（5.32–5.34） | 38.87（38.86–38.89） | 2.12 |
-| 输入／输出 irreps 不同 | 130,000 | cuEquivariance | 3.37（3.36–3.37） | 9.94（9.92–9.96） | 1.93 |
-| 输入／输出 irreps 不同 | 130,000 | SO2CUDA | 1.48（1.48–1.49） | 3.13（3.12–3.13） | 1.51 |
+| Configuration | Directed edges | Implementation | Forward ms (Q1–Q3) | Forward + backward ms (Q1–Q3) | Forward peak GiB | Forward + backward peak GiB |
+|---|---:|---|---:|---:|---:|---:|
+| lmax=2, C=32, mmax=2 | 50,000 | SO2CUDA | 0.46 (0.46–0.47) | 1.01 (1.00–1.01) | 0.34 | 0.44 |
+| lmax=2, C=32, mmax=2 | 50,000 | Our pure PyTorch | 1.71 (1.70–1.72) | 10.88 (10.85–10.91) | 0.46 | 0.56 |
+| lmax=2, C=32, mmax=2 | 50,000 | cuEquivariance | 1.36 (1.36–1.38) | 3.98 (3.96–3.99) | 0.35 | 0.48 |
+| lmax=2, C=32, mmax=2 | 50,000 | EquiformerV3 | 0.58 (0.57–0.58) | 1.71 (1.71–1.72) | 0.36 | 0.56 |
+| lmax=2, C=32, mmax=2 | 50,000 | EquiformerV3 + compile | 0.58 (0.57–0.58) | 1.30 (1.29–1.31) | 0.36 | 0.47 |
+| lmax=2, C=64, mmax=2 | 50,000 | SO2CUDA | 0.60 (0.60–0.61) | 1.44 (1.43–1.44) | 0.61 | 0.82 |
+| lmax=2, C=64, mmax=2 | 50,000 | Our pure PyTorch | 2.69 (2.68–2.70) | 19.74 (19.73–19.78) | 0.84 | 1.06 |
+| lmax=2, C=64, mmax=2 | 50,000 | cuEquivariance | 1.49 (1.46–2.21) | 4.36 (4.34–4.37) | 0.62 | 0.89 |
+| lmax=2, C=64, mmax=2 | 50,000 | EquiformerV3 | 1.06 (1.06–1.06) | 3.16 (3.16–3.17) | 0.63 | 1.02 |
+| lmax=2, C=64, mmax=2 | 50,000 | EquiformerV3 + compile | 1.05 (1.04–1.06) | 2.30 (2.29–2.31) | 0.62 | 0.84 |
+| lmax=2, C=128, mmax=2 | 50,000 | SO2CUDA | 1.49 (1.49–1.49) | 3.86 (3.85–3.87) | 1.14 | 1.58 |
+| lmax=2, C=128, mmax=2 | 50,000 | Our pure PyTorch | 5.02 (5.01–5.03) | 38.99 (38.96–39.07) | 1.62 | 2.05 |
+| lmax=2, C=128, mmax=2 | 50,000 | cuEquivariance | 2.49 (2.49–2.50) | 7.89 (7.88–7.89) | 1.16 | 1.70 |
+| lmax=2, C=128, mmax=2 | 50,000 | EquiformerV3 | 2.31 (2.30–2.31) | 6.92 (6.92–6.93) | 1.17 | 1.95 |
+| lmax=2, C=128, mmax=2 | 50,000 | EquiformerV3 + compile | 2.22 (2.22–2.23) | 5.20 (5.19–5.20) | 1.14 | 1.60 |
+| lmax=4, C=32, mmax=4 | 50,000 | SO2CUDA | 0.78 (0.77–0.78) | 1.89 (1.88–1.89) | 0.84 | 1.14 |
+| lmax=4, C=32, mmax=4 | 50,000 | Our pure PyTorch | 3.91 (3.90–3.93) | 32.53 (32.52–32.55) | 1.04 | 1.45 |
+| lmax=4, C=32, mmax=4 | 50,000 | cuEquivariance | 2.38 (2.36–2.39) | 7.71 (7.69–7.76) | 0.93 | 1.34 |
+| lmax=4, C=32, mmax=4 | 50,000 | EquiformerV3 | 1.25 (1.24–1.25) | 4.48 (4.47–4.48) | 1.04 | 1.48 |
+| lmax=4, C=32, mmax=4 | 50,000 | EquiformerV3 + compile | 1.20 (1.20–1.21) | 2.75 (2.75–2.80) | 1.05 | 1.22 |
+| lmax=4, C=64, mmax=4 | 50,000 | SO2CUDA | 1.94 (1.94–1.94) | 5.06 (5.06–5.07) | 1.59 | 2.19 |
+| lmax=4, C=64, mmax=4 | 50,000 | Our pure PyTorch | 7.11 (7.10–7.12) | 63.31 (63.25–63.49) | 1.99 | 2.80 |
+| lmax=4, C=64, mmax=4 | 50,000 | cuEquivariance | 3.12 (3.12–3.12) | 12.85 (12.84–12.87) | 1.67 | 2.50 |
+| lmax=4, C=64, mmax=4 | 50,000 | EquiformerV3 | 2.74 (2.73–2.74) | 9.89 (9.88–9.90) | 1.79 | 2.66 |
+| lmax=4, C=64, mmax=4 | 50,000 | EquiformerV3 + compile | 2.59 (2.59–2.60) | 6.55 (6.55–6.56) | 1.80 | 2.15 |
+| lmax=4, C=128, mmax=4 | 50,000 | SO2CUDA | 6.04 (5.86–6.13) | 16.73 (16.65–16.83) | 3.09 | 4.29 |
+| lmax=4, C=128, mmax=4 | 50,000 | Our pure PyTorch | 15.37 (15.36–15.37) | 130.33 (130.26–130.37) | 3.89 | 5.51 |
+| lmax=4, C=128, mmax=4 | 50,000 | cuEquivariance | 7.91 (7.91–7.92) | 30.71 (30.67–30.95) | 3.18 | 4.83 |
+| lmax=4, C=128, mmax=4 | 50,000 | EquiformerV3 | 7.54 (7.49–7.54) | 25.77 (25.67–25.87) | 3.28 | 5.02 |
+| lmax=4, C=128, mmax=4 | 50,000 | EquiformerV3 + compile | 7.11 (7.06–7.23) | 19.17 (19.15–19.31) | 3.30 | 4.00 |
+| lmax=6, C=32, mmax=6 | 50,000 | SO2CUDA | 1.70 (1.70–1.71) | 4.29 (4.28–4.30) | 1.61 | 2.20 |
+| lmax=6, C=32, mmax=6 | 50,000 | Our pure PyTorch | 7.32 (7.30–7.33) | 70.54 (70.51–70.59) | 1.86 | 2.79 |
+| lmax=6, C=32, mmax=6 | 50,000 | cuEquivariance | 3.62 (3.61–3.65) | 16.20 (16.18–16.22) | 1.97 | 2.80 |
+| lmax=6, C=32, mmax=6 | 50,000 | EquiformerV3 | 2.78 (2.77–2.78) | 10.53 (10.52–10.54) | 2.42 | 3.24 |
+| lmax=6, C=32, mmax=6 | 50,000 | EquiformerV3 + compile | 2.64 (2.64–2.65) | 6.50 (6.47–6.53) | 2.41 | 2.75 |
+| lmax=6, C=64, mmax=6 | 50,000 | SO2CUDA | 4.91 (4.82–4.91) | 13.18 (13.16–13.26) | 3.08 | 4.25 |
+| lmax=6, C=64, mmax=6 | 50,000 | Our pure PyTorch | 14.53 (14.52–14.54) | 139.82 (139.78–139.91) | 3.57 | 5.43 |
+| lmax=6, C=64, mmax=6 | 50,000 | cuEquivariance | 7.51 (7.43–7.54) | 33.29 (33.25–33.40) | 3.44 | 5.11 |
+| lmax=6, C=64, mmax=6 | 50,000 | EquiformerV3 | 6.66 (6.57–6.78) | 24.43 (24.41–24.44) | 3.88 | 5.53 |
+| lmax=6, C=64, mmax=6 | 50,000 | EquiformerV3 + compile | 6.29 (6.25–6.39) | 16.77 (16.72–16.94) | 3.87 | 4.55 |
+| lmax=6, C=128, mmax=6 | 50,000 | SO2CUDA | 16.29 (16.28–16.39) | 45.93 (45.68–48.15) | 6.02 | 8.40 |
+| lmax=6, C=128, mmax=6 | 50,000 | Our pure PyTorch | 34.35 (34.20–34.39) | 293.72 (293.58–294.24) | 7.00 | 10.72 |
+| lmax=6, C=128, mmax=6 | 50,000 | cuEquivariance | 20.86 (20.74–20.89) | 83.99 (83.63–85.28) | 6.41 | 9.74 |
+| lmax=6, C=128, mmax=6 | 50,000 | EquiformerV3 | 19.94 (19.86–20.03) | 68.41 (66.91–72.91) | 6.81 | 10.10 |
+| lmax=6, C=128, mmax=6 | 50,000 | EquiformerV3 + compile | 19.16 (19.10–19.26) | 52.49 (51.99–55.00) | 6.79 | 8.16 |
+| lmax=6, C=32, mmax=6 | 20,000 | SO2CUDA | 0.85 (0.84–0.85) | 2.06 (2.06–2.07) | 0.68 | 0.92 |
+| lmax=6, C=32, mmax=6 | 20,000 | Our pure PyTorch | 4.12 (4.10–4.40) | 31.05 (31.02–31.09) | 0.78 | 1.15 |
+| lmax=6, C=32, mmax=6 | 20,000 | cuEquivariance | 3.18 (3.16–3.19) | 10.28 (10.26–10.29) | 0.83 | 1.16 |
+| lmax=6, C=32, mmax=6 | 20,000 | EquiformerV3 | 1.27 (1.27–1.27) | 4.72 (4.71–4.73) | 1.01 | 1.33 |
+| lmax=6, C=32, mmax=6 | 20,000 | EquiformerV3 + compile | 1.24 (1.24–1.25) | 2.93 (2.92–2.94) | 1.00 | 1.14 |
+| lmax=6, C=32, mmax=6 | 130,000 | SO2CUDA | 4.03 (4.03–4.06) | 10.86 (10.81–11.07) | 4.08 | 5.60 |
+| lmax=6, C=32, mmax=6 | 130,000 | Our pure PyTorch | 16.92 (16.91–16.93) | 167.75 (167.62–167.87) | 4.73 | 7.15 |
+| lmax=6, C=32, mmax=6 | 130,000 | cuEquivariance | 7.84 (7.82–7.90) | 37.54 (37.44–37.89) | 5.03 | 7.18 |
+| lmax=6, C=32, mmax=6 | 130,000 | EquiformerV3 | 6.94 (6.92–7.04) | 26.23 (26.22–26.26) | 6.19 | 8.32 |
+| lmax=6, C=32, mmax=6 | 130,000 | EquiformerV3 + compile | 6.49 (6.47–6.54) | 16.50 (16.45–16.54) | 6.17 | 7.05 |
+| lmax=6, C=128, mmax=6 | 20,000 | SO2CUDA | 6.80 (6.79–6.86) | 18.92 (18.89–18.94) | 2.47 | 3.44 |
+| lmax=6, C=128, mmax=6 | 20,000 | Our pure PyTorch | 14.69 (14.68–14.70) | 120.93 (120.86–121.01) | 2.85 | 4.34 |
+| lmax=6, C=128, mmax=6 | 20,000 | cuEquivariance | 8.94 (8.94–8.94) | 35.17 (35.14–35.60) | 2.63 | 3.97 |
+| lmax=6, C=128, mmax=6 | 20,000 | EquiformerV3 | 8.21 (8.00–8.26) | 27.47 (27.41–27.50) | 2.77 | 4.09 |
+| lmax=6, C=128, mmax=6 | 20,000 | EquiformerV3 + compile | 7.85 (7.81–7.88) | 21.23 (21.18–21.38) | 2.76 | 3.32 |
+| lmax=6, C=128, mmax=6 | 130,000 | SO2CUDA | 42.67 (42.37–47.83) | 122.57 (120.13–126.67) | 15.51 | 21.62 |
+| lmax=6, C=128, mmax=6 | 130,000 | Our pure PyTorch | 89.41 (88.05–93.40) | 727.66 (727.46–727.86) | 18.09 | 27.76 |
+| lmax=6, C=128, mmax=6 | 130,000 | cuEquivariance | 55.46 (55.04–56.77) | 218.58 (217.11–220.34) | 16.47 | 25.10 |
+| lmax=6, C=128, mmax=6 | 130,000 | EquiformerV3 | 52.01 (51.66–53.67) | 176.86 (174.62–180.66) | 17.59 | 26.14 |
+| lmax=6, C=128, mmax=6 | 130,000 | EquiformerV3 + compile | 50.18 (49.46–51.62) | 138.65 (136.21–141.97) | 17.53 | 21.07 |
+| lmax=6, C=128, mmax=2 | 50,000 | SO2CUDA | 11.74 (11.68–11.76) | 33.10 (32.74–35.75) | 5.06 | 6.95 |
+| lmax=6, C=128, mmax=2 | 50,000 | Our pure PyTorch | 24.73 (24.70–24.82) | 184.94 (184.89–184.97) | 7.00 | 10.25 |
+| lmax=6, C=128, mmax=2 | 50,000 | cuEquivariance | 15.47 (15.41–15.49) | 49.92 (49.82–51.43) | 6.39 | 8.67 |
+| lmax=6, C=128, mmax=2 | 50,000 | EquiformerV3 | 13.60 (13.57–13.65) | 41.97 (41.27–45.16) | 5.01 | 7.90 |
+| lmax=6, C=128, mmax=2 | 50,000 | EquiformerV3 + compile | 13.20 (13.18–13.23) | 36.50 (35.80–40.44) | 5.08 | 6.59 |
 
-全部实现与 SO2CUDA 各公开入口的计时、数值核对与报错见 [算子 JSON](docs/benchmarks/OP_SPEED_H200.json)。
+The cuEquivariance column uses the recorded descriptor, method, and rotation for each configuration:
+
+| Configuration | Directed edges | Descriptor | Method | Rotation |
+|---|---:|---|---|---|
+| lmax=2, C=32, mmax=2 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=2, C=64, mmax=2 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=2, C=128, mmax=2 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=4, C=32, mmax=4 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=4, C=64, mmax=4 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=4, C=128, mmax=4 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=32, mmax=6 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=64, mmax=6 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=128, mmax=6 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=32, mmax=6 | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=32, mmax=6 | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=128, mmax=6 | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=128, mmax=6 | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| lmax=6, C=128, mmax=2 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+
+Measured candidate timings and unsupported combinations are recorded in [operator JSON](docs/benchmarks/OP_SPEED_H200.json). The original 12-configuration full scan is recorded in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json).
 
 </details>
 
-每个配置计时前，各实现（含 SO2CUDA 的各公开入口）先在 128 条边上与 FP64 参考比较输出、输入梯度和映射回共同参数的权重梯度，并做整体旋转等变检查，均通过 FP32 的绝对误差／相对 L2 联合判据；近零参考量使用绝对误差判据。逐项误差和判据见 [算子数值证据](docs/benchmarks/EQUIV_OP_H200.json)。
+#### 1.2 Non-uniform irreps
 
-各实现的参数映射与计时约定见 [docs/operator-benchmark.md](docs/operator-benchmark.md)。
+The configurations below use decreasing channels, UniTB's V-shaped hidden channels, and unequal input/output irreps:
 
-一般 irreps 表中 EquiformerV3 的两列为 N/A：原实现要求各 ℓ 的通道数一致；这些行的时间比相对我们的纯 PyTorch 和 cuEquivariance 报告。
+| Configuration | Input irreps | Output irreps |
+|---|---|---|
+| Decreasing channels, lmax=2 | `128x0e+64x1o+32x2e` | `128x0e+64x1o+32x2e` |
+| Decreasing channels, lmax=4 | `128x0e+64x1o+32x2e+16x3o+16x4e` | `128x0e+64x1o+32x2e+16x3o+16x4e` |
+| V-shaped channels | `128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e` | `128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e` |
+| V-shaped input → different output | `128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e` | `151x0e+37x1o+41x2e+29x3o+13x4e+5x5o+1x6e` |
 
-复现算子测试（在本仓库根目录）：
+| Configuration | Directed edges | SO2CUDA ms | Our pure PyTorch ms (ratio) | cuEquivariance ms (ratio) | EquiformerV3 ms (ratio) | EquiformerV3 + compile ms (ratio) |
+|---|---:|---:|---:|---:|---:|---:|
+| V-shaped channels | 20,000 | 3.35 | 30.86 (9.22×) | 11.49 (3.43×) | N/A | N/A |
+| V-shaped channels | 50,000 | 7.78 | 69.78 (8.96×) | 19.65 (2.52×) | N/A | N/A |
+| V-shaped channels | 130,000 | 19.66 | 167.38 (8.51×) | 47.91 (2.44×) | N/A | N/A |
+| V-shaped input → different output | 20,000 | 3.04 | 24.37 (8.02×) | 11.62 (3.82×) | N/A | N/A |
+| V-shaped input → different output | 50,000 | 6.82 | 52.43 (7.69×) | 18.57 (2.72×) | N/A | N/A |
+| V-shaped input → different output | 130,000 | 17.04 | 124.03 (7.28×) | 43.07 (2.53×) | N/A | N/A |
+| Decreasing channels, lmax=2 | 20,000 | 1.00 | 7.46 (7.45×) | 4.62 (4.61×) | N/A | N/A |
+| Decreasing channels, lmax=2 | 50,000 | 2.11 | 15.80 (7.50×) | 5.42 (2.58×) | N/A | N/A |
+| Decreasing channels, lmax=2 | 130,000 | 5.09 | 36.00 (7.07×) | 12.16 (2.39×) | N/A | N/A |
+| Decreasing channels, lmax=4 | 20,000 | 1.64 | 13.72 (8.36×) | 7.84 (4.78×) | N/A | N/A |
+| Decreasing channels, lmax=4 | 50,000 | 3.51 | 28.75 (8.19×) | 9.39 (2.67×) | N/A | N/A |
+| Decreasing channels, lmax=4 | 130,000 | 8.69 | 66.57 (7.67×) | 20.39 (2.35×) | N/A | N/A |
 
-```bash
-pip install cuequivariance-torch==0.12.0
-git clone https://github.com/atomicarchitects/equiformer_v3.git && git -C equiformer_v3 checkout a7300c58df683dc99cb48027d5bfd4c887486c48
-python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --cueq-choice escn_tp_compact,naive,pytorch --lmax 6 --channels 128 --edges 50000 --warmup 5 --iterations 20 --eqv3-root equiformer_v3 --json operator.json
+<details>
+<summary>Forward timing, quartiles, peak memory, and cuEquivariance choices</summary>
+
+| Configuration | Directed edges | Implementation | Forward ms (Q1–Q3) | Forward + backward ms (Q1–Q3) | Forward peak GiB | Forward + backward peak GiB |
+|---|---:|---|---:|---:|---:|---:|
+| Decreasing channels, lmax=2 | 20,000 | SO2CUDA | 0.46 (0.46–0.46) | 1.00 (1.00–1.01) | 0.24 | 0.32 |
+| Decreasing channels, lmax=2 | 20,000 | Our pure PyTorch | 1.43 (1.42–1.43) | 7.46 (7.44–7.49) | 0.31 | 0.40 |
+| Decreasing channels, lmax=2 | 20,000 | cuEquivariance | 1.64 (1.62–1.65) | 4.62 (4.59–4.88) | 0.28 | 0.34 |
+| Decreasing channels, lmax=2 | 20,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=2 | 20,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=2 | 50,000 | SO2CUDA | 0.95 (0.95–0.96) | 2.11 (2.11–2.11) | 0.52 | 0.70 |
+| Decreasing channels, lmax=2 | 50,000 | Our pure PyTorch | 2.25 (2.24–2.27) | 15.80 (15.78–15.89) | 0.67 | 0.90 |
+| Decreasing channels, lmax=2 | 50,000 | cuEquivariance | 1.97 (1.96–1.99) | 5.42 (5.40–5.43) | 0.61 | 0.74 |
+| Decreasing channels, lmax=2 | 50,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=2 | 50,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=2 | 130,000 | SO2CUDA | 2.27 (2.27–2.27) | 5.09 (5.09–5.10) | 1.24 | 1.71 |
+| Decreasing channels, lmax=2 | 130,000 | Our pure PyTorch | 4.71 (4.70–4.71) | 36.00 (35.99–36.01) | 1.64 | 2.23 |
+| Decreasing channels, lmax=2 | 130,000 | cuEquivariance | 4.39 (4.39–4.39) | 12.16 (12.15–12.16) | 1.48 | 1.83 |
+| Decreasing channels, lmax=2 | 130,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=2 | 130,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 20,000 | SO2CUDA | 0.76 (0.76–0.76) | 1.64 (1.64–1.64) | 0.35 | 0.46 |
+| Decreasing channels, lmax=4 | 20,000 | Our pure PyTorch | 2.42 (2.41–2.44) | 13.72 (13.69–13.73) | 0.42 | 0.57 |
+| Decreasing channels, lmax=4 | 20,000 | cuEquivariance | 2.64 (2.62–2.65) | 7.84 (7.82–7.87) | 0.41 | 0.51 |
+| Decreasing channels, lmax=4 | 20,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 20,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 50,000 | SO2CUDA | 1.60 (1.60–1.61) | 3.51 (3.50–3.52) | 0.78 | 1.05 |
+| Decreasing channels, lmax=4 | 50,000 | Our pure PyTorch | 3.76 (3.75–3.77) | 28.75 (28.72–28.78) | 0.95 | 1.33 |
+| Decreasing channels, lmax=4 | 50,000 | cuEquivariance | 3.16 (3.15–3.18) | 9.39 (9.37–9.41) | 0.94 | 1.17 |
+| Decreasing channels, lmax=4 | 50,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 50,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 130,000 | SO2CUDA | 3.95 (3.94–3.95) | 8.69 (8.68–8.70) | 1.93 | 2.64 |
+| Decreasing channels, lmax=4 | 130,000 | Our pure PyTorch | 8.02 (8.01–8.03) | 66.57 (66.56–66.59) | 2.38 | 3.37 |
+| Decreasing channels, lmax=4 | 130,000 | cuEquivariance | 6.24 (6.24–6.24) | 20.39 (20.38–20.40) | 2.34 | 2.93 |
+| Decreasing channels, lmax=4 | 130,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| Decreasing channels, lmax=4 | 130,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped channels | 20,000 | SO2CUDA | 1.44 (1.44–1.45) | 3.35 (3.34–3.35) | 0.68 | 0.92 |
+| V-shaped channels | 20,000 | Our pure PyTorch | 4.16 (4.15–4.17) | 30.86 (30.80–30.96) | 0.77 | 1.15 |
+| V-shaped channels | 20,000 | cuEquivariance | 3.77 (3.75–3.78) | 11.49 (11.48–11.52) | 0.81 | 1.02 |
+| V-shaped channels | 20,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped channels | 20,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped channels | 50,000 | SO2CUDA | 3.33 (3.33–3.33) | 7.78 (7.78–7.80) | 1.61 | 2.20 |
+| V-shaped channels | 50,000 | Our pure PyTorch | 7.51 (7.49–7.52) | 69.78 (69.74–69.85) | 1.82 | 2.79 |
+| V-shaped channels | 50,000 | cuEquivariance | 4.75 (4.74–4.75) | 19.65 (19.62–19.70) | 1.93 | 2.46 |
+| V-shaped channels | 50,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped channels | 50,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped channels | 130,000 | SO2CUDA | 8.34 (8.33–8.35) | 19.66 (19.65–19.67) | 4.08 | 5.60 |
+| V-shaped channels | 130,000 | Our pure PyTorch | 17.60 (17.59–17.64) | 167.38 (167.27–167.40) | 4.64 | 7.14 |
+| V-shaped channels | 130,000 | cuEquivariance | 11.94 (11.93–11.95) | 47.91 (47.90–47.98) | 4.91 | 6.29 |
+| V-shaped channels | 130,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped channels | 130,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 20,000 | SO2CUDA | 1.30 (1.29–1.30) | 3.04 (3.04–3.05) | 0.52 | 0.76 |
+| V-shaped input → different output | 20,000 | Our pure PyTorch | 3.51 (3.49–3.53) | 24.37 (24.33–24.41) | 0.63 | 0.85 |
+| V-shaped input → different output | 20,000 | cuEquivariance | 3.80 (3.78–3.82) | 11.62 (11.61–11.64) | 0.67 | 0.81 |
+| V-shaped input → different output | 20,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 20,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 50,000 | SO2CUDA | 2.94 (2.94–2.95) | 6.82 (6.81–6.83) | 1.21 | 1.80 |
+| V-shaped input → different output | 50,000 | Our pure PyTorch | 5.96 (5.96–5.98) | 52.43 (52.40–52.45) | 1.47 | 2.04 |
+| V-shaped input → different output | 50,000 | cuEquivariance | 4.69 (4.67–4.69) | 18.57 (18.55–18.60) | 1.59 | 1.94 |
+| V-shaped input → different output | 50,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 50,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 130,000 | SO2CUDA | 7.32 (7.31–7.33) | 17.04 (17.03–17.05) | 3.05 | 4.56 |
+| V-shaped input → different output | 130,000 | Our pure PyTorch | 13.55 (13.54–13.56) | 124.03 (123.99–124.09) | 3.72 | 5.21 |
+| V-shaped input → different output | 130,000 | cuEquivariance | 10.30 (10.29–10.30) | 43.07 (43.06–43.08) | 4.02 | 4.93 |
+| V-shaped input → different output | 130,000 | EquiformerV3 | N/A | N/A | N/A | N/A |
+| V-shaped input → different output | 130,000 | EquiformerV3 + compile | N/A | N/A | N/A | N/A |
+
+The cuEquivariance column uses the recorded descriptor, method, and rotation for each configuration:
+
+| Configuration | Directed edges | Descriptor | Method | Rotation |
+|---|---:|---|---|---|
+| Decreasing channels, lmax=2 | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| Decreasing channels, lmax=2 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| Decreasing channels, lmax=2 | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| Decreasing channels, lmax=4 | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| Decreasing channels, lmax=4 | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| Decreasing channels, lmax=4 | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped channels | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped channels | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped channels | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped input → different output | 20,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped input → different output | 50,000 | `escn_tp_compact` | `naive` | `pytorch` |
+| V-shaped input → different output | 130,000 | `escn_tp_compact` | `naive` | `pytorch` |
+
+- EquiformerV3 + compile: The original implementation requires equal channels across l on each side; no padding is used.
+- EquiformerV3: The original implementation requires equal channels across l on each side; no padding is used.
+
+Measured candidate timings and unsupported combinations are recorded in [operator JSON](docs/benchmarks/OP_SPEED_H200.json). The original 12-configuration full scan is recorded in [selection evidence](docs/benchmarks/CUEQ_SELECTION_SCAN.json).
+
+</details>
+
+Outputs, input gradients, and weight gradients mapped to common canonical parameters are compared pairwise and against an FP64 reference on small inputs. The new non-uniform irreps also undergo a rotation-equivariance check. [Numerical evidence](docs/benchmarks/EQUIV_OP_L40S.json) records the errors and FP32 tolerances.
+
+**Minimal use for interatomic potentials**
+
+The example accepts e3nn irreps such as `32x0e+32x1o+32x2e` or `128x0e+64x1o+32x2e`, and permits different input/output channel counts. Features use e3nn `mul_ir` layout `[edges, irreps.dim]`. Edge vectors determine a constant rotation; geometry gradients are unsupported. Prepare the layout and Wigner data once for an unchanged edge geometry:
+
+```python
+import torch
+from e3nn import o3
+from examples.minimal_so2_tp import prepare_so2_tp, make_weights
+from so2_cuda_ops.deeptb import true_dense_pairs
+
+irreps = o3.Irreps("128x0e+64x1o+32x2e")
+edge_vectors = torch.randn(512, 3, device="cuda", dtype=torch.float32)
+x = torch.randn(512, irreps.dim, device="cuda", dtype=torch.float32, requires_grad=True)
+layout, wigner = prepare_so2_tp(irreps, irreps, edge_vectors, m_max=2)
+weights = make_weights(irreps, irreps, 2, device=x.device)
+parts = None if wigner is None else true_dense_pairs(x, layout, wigner, weights, include_m0=True)
+if parts is None:
+    raise RuntimeError("Use your PyTorch reference implementation for this input")
+y = parts[0]
+y.square().mean().backward()
 ```
 
-### 2. UniTB 模型
+`make_weights` creates trainable W0 and `[A_m; B_m]` matrices, shared across edges; a model can supply its own `LinearWeights` instead. These preparation helpers live in [minimal_so2_tp.py](examples/minimal_so2_tp.py), rather than the package API. The CUDA interface uses FP32 tensors on one CUDA device. CPU, other dtypes, autocast, `torch.func`, geometry requiring gradients, and unsupported layouts return `None`, so the caller can use its reference path. Native CUDA execution errors propagate.
 
-<!-- SO2CUDA_MODEL_CONTEXT_BEGIN -->
-[examples/deeptb_speed_test.py](examples/deeptb_speed_test.py) 使用标准 `dptb.nn.build.build_model` 入口随机初始化模型，生成合成周期结构、成对的周期边和正确形状的随机 H0。无需数据集或检查点。
+Reproduce an operator comparison from the repository root. The environment must already contain CUDA-enabled PyTorch, compatible cuBLAS, and the standard Python dependencies (NumPy, SciPy, SymPy, NetworkX, opt-einsum, tqdm, nvidia-ml-py, and platformdirs). `--no-deps` preserves that environment; measured software versions are recorded in the JSON:
 
-两个配置均使用 `model_options.embedding.method="unitb"`：[unitb.json](examples/configs/unitb.json) 采用 UniTB 默认架构；[unitb_dense.json](examples/configs/unitb_dense.json) 设置 `num_experts=1`，由构造器选择无共享专家、top-k=1 与均匀 32 通道。两者均为三层、`lmax=6`，示例截断半径为 `r_max=7.4`。
+```bash
+pip install --no-deps cuequivariance==0.12.0 cuequivariance-torch==0.12.0 cuequivariance-ops-cu12==0.12.0 cuequivariance-ops-torch-cu12==0.12.0
+git clone https://github.com/atomicarchitects/equiformer_v3.git && git -C equiformer_v3 checkout a7300c58df683dc99cb48027d5bfd4c887486c48
+python examples/so2_operator_speed_test.py --impl naive,so2cuda,eqv3,cueq --include-compile --suite all --eqv3-root equiformer_v3 --warmup 5 --iterations 20 --cueq-choice escn_tp_compact,naive,pytorch --json operator.json
+```
 
-UniTB 的 PDQ-MoE 使用四个路由专家、一个共享专家、top-k=2、共享基底参数化、V 形通道与 H0 先验 CG 路由，并启用局域 QEq 电荷响应头。示例包含两种元素和 f 轨道，flow time 固定为 0。随机 H0 和合成 overlap 只用于性能测试，不代表物理先验或模型预测精度。
+### 2. UniTB models on real training batches
 
-三行命令测加速（在本仓库根目录，已有 CUDA PyTorch 与 Toolkit）：
+UniTB uses PDQ-MoE; UniTB-dense uses a single expert; UniTB-SLEM applies three SO(2) operators per layer. The comparison uses both onsite and hopping production configurations without model changes. Batches contain real crystal structures from our training set, with a limit of 32 structures per batch. Dynamic cost limits can produce smaller batches; published timing tables report the measured mean structure and directed-edge counts for each fixed batch stream.
+
+No complete validated real-batch model table is available; no model timing or speedup is reported. We switch the SO(2) and associated expert-linear execution backend: default SO2CUDA, [our pure PyTorch implementation](examples/naive_baseline.py), or [cuEquivariance](examples/cueq_baseline.py). Parameters, routing, the remaining model, and the loss stay fixed. HybridMuon uses the same fast optimizer path in every case. Published timing tables show the median complete step (forward + backward + optimizer), its ratio to SO2CUDA, and peak allocated memory. Forward + backward timing excluding the optimizer appears in the details. Failed or unmeasured tables are disclosed below; their raw evidence digests are retained in the public JSON.
+
+The DeePTB source is pinned to [commit `8d5a0dc`](https://github.com/Franklalalala/DeePTB/tree/8d5a0dcda30547f83869c292d48fab5df6eec722); full source commits and software versions are recorded in the public JSON.
+
+**UniTB-dense**
+
+| Head | Measurement status | Reason |
+|---|---|---|
+| Onsite | Not measured | No complete validated measurement is available. |
+| Hopping | Not measured | No complete validated measurement is available. |
+
+**UniTB**
+
+| Head | Measurement status | Reason |
+|---|---|---|
+| Onsite | Not measured | No complete validated measurement is available. |
+| Hopping | Not measured | No complete validated measurement is available. |
+
+**UniTB-SLEM**
+
+| Head | Measurement status | Reason |
+|---|---|---|
+| Onsite | Not measured | No complete validated measurement is available. |
+| Hopping | Not measured | No complete validated measurement is available. |
+
+EquiformerV3 is N/A for all three complete models because each contains non-uniform SO(2) layers, including UniTB-dense's final output layers.
+
+The pure PyTorch model baseline is our implementation of the DeePTB upstream SO(2) computation and [UMA MoLE linear formula](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py). Formal real-batch model equivalence is unavailable for these tables. See [model measurement records](docs/benchmarks/MODEL_BS32_H200.json) and [model equivalence](docs/benchmarks/EQUIV_MODEL.json).
+
+The training dataset is not public. Synthetic periodic structures provide a runnable comparison of relative timing; they are used only for timing and do not reproduce the real-batch measurements, physical priors, or prediction accuracy:
 
 ```bash
 pip install 'git+https://github.com/Franklalalala/DeePTB.git@1006-stable'
 pip install -e .
-python examples/deeptb_speed_test.py --model both --json speed.json
+python examples/deeptb_speed_test.py --model all --backend both --edges 20000 --json synthetic_so2cuda.json
+python examples/deeptb_speed_test.py --model all --backend cueq --edges 20000 --json synthetic_cueq.json
 ```
 
-默认每批 20,000 条有向边：每个周期胞 125 个原子，每原子 80 个邻居。`--model unitb` / `--model dense` 可只测一种模型。`--edges` 指定目标边数，脚本向上取整到完整周期胞并记录实际边数；默认结构下 20,000 / 50,000 / 130,000 均为精确边数。`--side`、`--neighbors` 和 `--spacing` 可调节结构。默认 CUDA 分配器上限为 20 GiB；显存不足时可减小 `--edges`，或按设备容量增加 `--max-memory-gib`。
+The synthetic example compares the same randomly initialized model and inputs, disables SO2CUDA for reference routes, and records timing, peak memory, dispatch, and numerical differences. Reduce `--edges` on smaller GPUs; `--max-memory-gib` sets its allocator limit. Its forward + backward timings exclude optimizer updates.
 
-**我们的纯 PyTorch 实现**在同一块 GPU 上使用同一模型、参数和输入，关闭 SO2CUDA（`SO2_CUDA_BACKEND=off`），由 [naive_baseline.py](examples/naive_baseline.py) 换成直接的 PyTorch 写法：SO2 张量积照 [DeePTB 上游主分支的 `SO2_Linear`](https://github.com/deepmodeling/DeePTB/blob/1dcc7f61480c373870cd5bad1d4000ac80757ff5/dptb/nn/tensor_product.py)，专家层照 [UMA 的 MoLE](https://github.com/facebookresearch/fairchem/blob/3801dac0cc0458a2f8121259a2ce8b23d4dcc5a1/src/fairchem/core/models/uma/nn/mole.py) 线性公式。UniTB 的每个路由专家只对分给它的边做一次普通 `F.linear`，再按路由系数加权，共享专家单独计算；UniTB-dense 按路由组混合权重，每组做一次普通 `F.linear`。路由器、电荷头和其余层两条路线相同。
-
-**加速路线**使用安装后的默认设置，脚本自动恢复原模块并选择 `SO2_CUDA_BACKEND=auto`。每轮恢复路由缓冲区，不做优化器更新。计时包含模型前向与 loss 反向，排除输入生成、复制、缓冲区恢复和首次 JIT 编译；默认预热 3 次、计时 10 次，报告中位数与 Q1 / Q3。计算固定为严格 FP32，禁用 TF32。
-
-JSON 同时记录峰值显存、实际成功调用的加速入口、推理与训练输出和全部参数梯度的最大绝对差及逐张量相对 L2。若我们的纯 PyTorch 实现调用了 SO2CUDA，或加速路线没有进入对应入口，脚本会报错。共用 GPU 的结果可用 `--shared-gpu` 标记。
-
-“我们的纯 PyTorch”是我们按 DeePTB 上游 `SO2_Linear` 与 UMA MoLE 写法自己实现的（[examples/naive_baseline.py](examples/naive_baseline.py)）。朴素 PyTorch SO(2) 基线采用 EquiformerV3 原版 `SO3Rotation` ＋ `SO2Linear`（eager）；模型层的通道布局不适用时标 N/A。
-<!-- SO2CUDA_MODEL_CONTEXT_END -->
-
-与上节算子测试在同一块 NVIDIA H200 上的同一次会话中测量，严格 FP32，每次计时迭代前后核验独占；每路先做一次不计时的前向＋反向，再预热 3 次、计时 10 次。下表为前向＋反向 ms 中位数，括号内为该实现时间 ÷ SO2CUDA 时间。cuEquivariance 列在全部六个 SO(2) 层统一使用 `escn_tp_compact` 描述符与 `naive` method，每次前向共享一次 Wigner 构建。
-
-| 模型 | 有向边 | EquiformerV3 原版 ms | 我们的纯 PyTorch ms（时间比） | cuEquivariance ms（时间比） | SO2CUDA ms |
-|---|---:|---:|---:|---:|---:|
-| UniTB-dense | 20,000 | N/A | 552.84（2.21×） | 557.79（2.23×） | 250.54 |
-| UniTB-dense | 50,000 | N/A | 1015.85（2.82×） | 773.33（2.14×） | 360.75 |
-| UniTB-dense | 130,000 | N/A | 2230.04（3.22×） | 1524.84（2.20×） | 693.52 |
-| UniTB | 20,000 | N/A | 659.03（2.07×） | 768.89（2.41×） | 318.50 |
-| UniTB | 50,000 | N/A | 1190.57（2.28×） | 1234.09（2.36×） | 523.09 |
-| UniTB | 130,000 | N/A | 2608.06（2.38×） | 2660.13（2.43×） | 1094.53 |
-
-<details>
-<summary>前向计时、四分位与峰值显存</summary>
-
-| 模型 | 有向边 | 实现 | 前向 ms（Q1–Q3） | 前向＋反向 ms（Q1–Q3） | 峰值 GiB |
-|---|---:|---|---:|---:|---:|
-| UniTB-dense | 20,000 | 我们的纯 PyTorch | 146.75（146.16–148.07） | 552.84（550.60–557.87） | 10.72 |
-| UniTB-dense | 20,000 | cuEquivariance | 177.00（176.55–178.21） | 557.79（555.11–563.16） | 9.34 |
-| UniTB-dense | 20,000 | SO2CUDA | 96.28（96.07–96.64） | 250.54（249.76–253.34） | 8.95 |
-| UniTB-dense | 50,000 | 我们的纯 PyTorch | 202.15（201.51–205.56） | 1015.85（1014.23–1018.50） | 26.57 |
-| UniTB-dense | 50,000 | cuEquivariance | 205.28（205.02–207.78） | 773.33（772.08–778.31） | 23.06 |
-| UniTB-dense | 50,000 | SO2CUDA | 131.10（130.80–131.97） | 360.75（360.54–361.59） | 22.04 |
-| UniTB-dense | 130,000 | 我们的纯 PyTorch | 388.67（388.22–390.03） | 2230.04（2228.79–2231.29） | 68.83 |
-| UniTB-dense | 130,000 | cuEquivariance | 322.07（321.58–324.54） | 1524.84（1522.62–1528.25） | 59.65 |
-| UniTB-dense | 130,000 | SO2CUDA | 252.61（252.38–252.67） | 693.52（693.47–699.83） | 56.97 |
-| UniTB | 20,000 | 我们的纯 PyTorch | 194.64（193.92–200.89） | 659.03（658.43–667.28） | 17.04 |
-| UniTB | 20,000 | cuEquivariance | 236.69（235.79–245.77） | 768.89（763.35–786.20） | 14.54 |
-| UniTB | 20,000 | SO2CUDA | 126.39（125.77–126.84） | 318.50（317.64–318.93） | 11.41 |
-| UniTB | 50,000 | 我们的纯 PyTorch | 286.52（286.25–286.79） | 1190.57（1189.47–1198.61） | 42.34 |
-| UniTB | 50,000 | cuEquivariance | 296.12（294.06–302.51） | 1234.09（1226.95–1235.87） | 36.03 |
-| UniTB | 50,000 | SO2CUDA | 198.68（198.24–199.08） | 523.09（522.41–524.35） | 28.23 |
-| UniTB | 130,000 | 我们的纯 PyTorch | 572.28（572.05–572.71） | 2608.06（2607.20–2608.53） | 109.82 |
-| UniTB | 130,000 | cuEquivariance | 541.10（540.57–545.21） | 2660.13（2656.13–2664.00） | 93.34 |
-| UniTB | 130,000 | SO2CUDA | 416.61（416.24–416.98） | 1094.53（1094.32–1096.27） | 73.08 |
-
-</details>
-
-UniTB-dense 的 EquiformerV3 为 N/A：最终边更新与节点更新的 SO(2) 输出按 l=0..6 合并后为 [151, 37, 41, 29, 13, 5, 1] 通道，最终节点更新的输入也不均匀；EquiformerV3 原版要求输入与输出各自跨 l 统一通道数。其额外 m=0 输出接口可容纳前面 dense 层的标量门控，但无法表达最终层，故完整模型列为 N/A，不补零。
-UniTB 的 EquiformerV3 为 N/A：UniTB 的 V 形隐藏通道、门控后的实际 SO(2) 输出以及最终目标层均跨 l 不均匀，EquiformerV3 原版无法直接表达，完整模型列为 N/A，不补零。
-
-SO2CUDA 与 cuEquivariance 两条路线的训练输出、推理输出和全部参数梯度均与我们的纯 PyTorch 实现比较，全部有限并通过绝对误差／相对 L2 联合判据；近零梯度使用绝对误差判据。
-
-cuEquivariance 路线以标准子模块替换 SO(2) 算子，路由器、电荷头和其余模型层共享；旋转用分块 bmm，再按描述符的原生布局执行线性层。N/A 表示该路线未提供忠实的对应实现；合成模型结果不代表物理精度或真实训练吞吐。
-
-完整计时、四分位与误差见 [模型 JSON](docs/benchmarks/MODEL_SPEED_H200.json) 和 [模型数值证据](docs/benchmarks/EQUIV_MODEL.json)。
 <!-- SO2CUDA_BENCHMARKS_END -->

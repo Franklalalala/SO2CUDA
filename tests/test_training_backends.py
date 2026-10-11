@@ -17,6 +17,24 @@ from bench_training_backends import (InitialState, batch_record, compare,
 from dptb.utils.torch_geometric import Batch, Data
 
 
+@pytest.mark.parametrize("options,method,descriptor", [
+    ([], "naive", "escn_tp_compact"),
+    (["--cueq-method", "auto"], "auto", "escn_tp_compact"),
+    (["--cueq-descriptor", "escn_tp"], "naive", "escn_tp"),
+])
+def test_real_batch_cueq_search_requires_explicit_opt_in(monkeypatch, options, method, descriptor):
+    import bench_training_backends as harness
+
+    monkeypatch.setattr(sys, "argv", ["bench_training_backends.py", "--config", "config.json",
+                                     "--out", "out", "--model", "slem", "--head", "onsite",
+                                     "--dptb-sha", "test", "--so2cuda-sha", "test", *options])
+    args = harness.arguments()
+    assert args.cueq_method == method
+    assert args.cueq_descriptor == descriptor
+    assert args.warmup >= 4 and args.iterations >= 12
+    assert args.backends == ["so2cuda", "naive", "cueq"]
+
+
 def batch(order):
     examples = [Data(pos=torch.tensor([[float(index), 0., 0.], [float(index), 1., 0.]]),
                      edge_index=torch.tensor([[0, 1], [1, 0]]),
@@ -240,7 +258,12 @@ def test_slem_all_three_tensor_products_use_ordinary_backends(monkeypatch):
     from dptb.nn.build import build_model
     from dptb.nn.tensor_product_moe_v3 import SO2_Linear
     from deeptb_speed_test import DispatchAudit, periodic_batch, select_backend
-    from cueq_baseline import cueq_execution_metadata
+    from cueq_baseline import CueqSO2Linear, cueq_execution_metadata
+
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("The explicit compact executor must not search other descriptors")
+
+    monkeypatch.setattr(CueqSO2Linear, "_select_method", unexpected_search)
 
     torch.manual_seed(623)
     config = json.loads((Path(__file__).resolve().parents[1] / "examples/configs/unitb_slem.json").read_text())

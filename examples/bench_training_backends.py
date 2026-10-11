@@ -54,8 +54,10 @@ def arguments():
                         help="Relocate the training overlap sidecar to the same corpus")
     parser.add_argument("--validation-overlap-sidecar-root", type=Path,
                         help="Relocate the validation overlap sidecar to the same corpus")
-    parser.add_argument("--cueq-method", default="auto")
-    parser.add_argument("--cueq-descriptor", choices=("escn_tp", "escn_tp_compact"), default="escn_tp")
+    parser.add_argument("--cueq-method", default="naive",
+                        help="Explicit executor for real-batch replay; auto opts into an untimed per-layer search")
+    parser.add_argument("--cueq-descriptor", choices=("escn_tp", "escn_tp_compact"), default="escn_tp_compact",
+                        help="Compact descriptor avoids construction of thousands of individual paths")
     parser.add_argument("--dptb-sha", required=True)
     parser.add_argument("--so2cuda-sha", required=True)
     parser.add_argument("--shared-gpu", action="store_true", help="For small equivalence only")
@@ -465,6 +467,8 @@ def main():
                              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                              "config_changes": changes, "TF32": False, "optimizer": "HybridMuon",
                              "optimizer_mode": "fast", "gpu_before": before,
+                             "cueq_request": {"descriptor": args.cueq_descriptor, "method": args.cueq_method,
+                                              "rotation": "pytorch", "per_layer_search": args.cueq_method == "auto"},
                              "execution_scope": "SO(2) tensor products and associated PDQ-MoE expert linears; router, nonlinearities, other layers, loss and optimizer unchanged",
                              "production_dynamic_batch": config["train_options"].get("dynamic_batch"),
                              "timing_scope": {"step": "synchronized MultiTrainer.iteration wall time, including fast HybridMuon",
