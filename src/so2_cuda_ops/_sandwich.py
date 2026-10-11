@@ -70,8 +70,12 @@ def _side(all_bases, all_ls, block_members, dim, device):
         expected_l = [l for l in range(lmax + 1) for _ in range(channels)]
         expected_b = [channels * l * l + c * (2 * l + 1)
                       for l in range(lmax + 1) for c in range(channels)]
+        # The uniform kernel addresses every positive m block through mmax.
+        # Only m=0 may be absent; sparse or overlong maps use the general path.
         if (channels % 32 == 0 and lmax <= 8 and levels == expected_l and bases == expected_b
                 and int(dim) == channels * (lmax + 1) ** 2
+                and width - 1 <= lmax
+                and all(widths[m] == channels * (lmax + 1 - m) for m in range(1, width))
                 and all(cols[k][m] == (k - m * channels if l >= m and widths[m] else -1)
                         for k, l in enumerate(levels) for m in range(width))):
             uniform = (channels, lmax)
