@@ -46,6 +46,18 @@ ptr = torch.tensor([0, 512, 1024], dtype=torch.long)
 y = grouped_gemm(x, ptr, weight)  # [1024, 64], supports autograd
 ```
 
+## How it works
+
+An SO(2) tensor product rotates each edge feature into a frame whose pole is the edge direction, applies one linear map per order $m$, and rotates the result back. The implementations compared under Performance compute the same function and differ in how they lay out the data, rotate it, and split the linear maps.
+
+![Four execution patterns](docs/figures/how_it_works_pipelines.png)
+
+*All four implementations rotate into the local frame, apply $m$-wise linear maps, and rotate back. EquiformerV3 uses dense-Wigner `bmm` calls and supports only uniform irreps; cuEquivariance (`escn_tp_compact`, `naive` method) executes each descriptor path separately; our pure PyTorch reference uses many small blockwise operations. SO2CUDA rotates and packs each edge in one thread block, runs one GEMM per $m$, and gathers and rotates back in one kernel.*
+
+![SO2CUDA routes](docs/figures/how_it_works_routes.png)
+
+*Dense layers run one pack, one GEMM per $m$ (a grouped GEMM when the layer has several weight groups), and one gather; non-uniform irreps use the same kernels with different block widths. For uniform irreps on plain layers (one weight set, no radial weights or gates) with more than 32 channels or $\ell_{\max} > 2$, pack and gather use a kernel in which each warp handles 32 channels of one degree. In a top-k mixture of experts, the K slots share one pack and one gather and run one grouped GEMM per slot; gates and output-side radial weights are applied in the gather, input-side radial weights in the pack.*
+
 <!-- SO2CUDA_BENCHMARKS_BEGIN -->
 ## Performance
 
