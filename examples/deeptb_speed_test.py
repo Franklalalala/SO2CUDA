@@ -393,7 +393,7 @@ def main():
             raise RuntimeError("The CUDA benchmark needs a CUDA device; CPU supports reference and cueq")
     counters = install_counters()
     from dptb.nn.build import build_model
-    from dptb.nn.embedding.unitb_options import unitb_options
+    from dptb.nn.embedding.unitb.options import unitb_options
     import dptb
 
     report = {
